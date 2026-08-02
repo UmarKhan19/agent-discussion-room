@@ -1,22 +1,31 @@
-import { type Message } from "../types";
+import type { DiscussionMessage } from "@/discussion/contracts";
 
-export const MessageList: React.FC<{ messages: Message[] }> = ({
+export function MessageList({
   messages,
-}) => {
+}: {
+  messages: readonly DiscussionMessage[];
+}) {
+  if (messages.length === 0) {
+    return <p>No Turns yet. The Transcript is empty.</p>;
+  }
+
   return (
-    <div className="flex flex-col space-y-4 w-full">
+    <ol className="flex flex-col gap-4 w-full">
       {messages.map((message) => (
-        <div
+        <li
           key={message.id}
           className={`p-4 rounded-lg w-3/4 ${
-            message.sender === "supporter"
-              ? "bg-blue-500 text-white self-start"
-              : "bg-green-500 text-white self-end"
+            message.speaker === "supporter"
+              ? "bg-blue-700 text-white self-start"
+              : "bg-green-700 text-white self-end"
           }`}
         >
-          {message.content}
-        </div>
+          <strong>
+            {message.speaker === "supporter" ? "Supporter" : "Opponent"}
+          </strong>
+          <p>{message.content}</p>
+        </li>
       ))}
-    </div>
+    </ol>
   );
-};
+}

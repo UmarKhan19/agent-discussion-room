@@ -33,7 +33,7 @@ function buildPrompt(input: GenerateDiscussionTurnInput): string {
     .slice(-RECENT_TRANSCRIPT_LIMIT)
     .map(
       (message) =>
-        `${message.sender === "supporter" ? "Supporter" : "Opponent"}: ${message.content}`,
+        `${message.speaker === "supporter" ? "Supporter" : "Opponent"}: ${message.content}`,
     )
     .join("\n\n");
 

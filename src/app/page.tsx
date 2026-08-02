@@ -1,80 +1,133 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import type { ServerRequestData, Message, Sender } from "./types";
+import { useState, type FormEvent } from "react";
+import {
+  DiscussionResponseSchema,
+  DiscussionTopicSchema,
+  ErrorResponseSchema,
+  TOPIC_MAX_LENGTH,
+  type DiscussionState,
+} from "@/discussion/contracts";
 import { MessageList } from "./components/message-list";
 
-const TOPIC = "Remote work is better than working from an office";
+function topicError(topic: string): string {
+  if (topic.trim().length === 0) {
+    return "Enter a Discussion Topic before starting.";
+  }
+  if (topic.length > TOPIC_MAX_LENGTH) {
+    return `Shorten the Topic to ${TOPIC_MAX_LENGTH} characters or fewer.`;
+  }
+  return "Use plain text without tabs, line breaks, or control characters.";
+}
 
 export default function Home() {
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [isActive, setIsActive] = useState<boolean>(false);
-  const [isGenerating, setIsGenerating] = useState<boolean>(false);
-  const [speaker, setSpeaker] = useState<Sender>("supporter");
+  const [topic, setTopic] = useState("");
+  const [discussion, setDiscussion] = useState<DiscussionState | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [isStarting, setIsStarting] = useState(false);
 
-  useEffect(() => {
-    const generateMessage = async () => {
-      setIsGenerating(true);
+  async function startDiscussion(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError(null);
 
-      const requestPayload: ServerRequestData = {
-        messages,
-        topic: TOPIC,
-        speaker,
-      };
-
-      try {
-        const response = await fetch("/api/chat", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(requestPayload),
-        });
-
-        if (!response.ok) {
-          throw new Error(`Error: ${response.statusText}`);
-        }
-
-        const newMessage: Message = await response.json();
-
-        setMessages((prevMessages) => [...prevMessages, newMessage]);
-
-        setSpeaker((prevSpeaker) =>
-          prevSpeaker === "supporter" ? "opponent" : "supporter",
-        );
-      } catch (error) {
-        console.error("Failed to generate message:", error);
-        setIsActive(false);
-      } finally {
-        setIsGenerating(false);
-      }
-    };
-
-    if (isActive && !isGenerating) {
-      void generateMessage();
+    const parsedTopic = DiscussionTopicSchema.safeParse(topic);
+    if (!parsedTopic.success) {
+      setError(topicError(topic));
+      return;
     }
-  }, [isActive, isGenerating, messages, speaker]);
+
+    setIsStarting(true);
+    try {
+      const response = await fetch("/api/discussions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ topic: parsedTopic.data }),
+      });
+      const payload: unknown = await response.json();
+
+      if (!response.ok) {
+        const parsedError = ErrorResponseSchema.safeParse(payload);
+        setError(
+          parsedError.success
+            ? `${parsedError.data.error.message} ${parsedError.data.error.action}`
+            : "The Discussion could not be started. Check the Topic and try again.",
+        );
+        return;
+      }
+
+      const parsedDiscussion = DiscussionResponseSchema.safeParse(payload);
+      if (!parsedDiscussion.success) {
+        setError("The server returned an invalid Discussion. Please try again.");
+        return;
+      }
+
+      setDiscussion(parsedDiscussion.data);
+    } catch {
+      setError("The Discussion could not be started. Check your connection and try again.");
+    } finally {
+      setIsStarting(false);
+    }
+  }
 
   return (
-    <main className="flex min-h-screen flex-col items-center p-24 bg-neutral-900">
-      <h1 className="text-2xl">Welcome to the Agents Discussion Room</h1>
-      <div>
-        <button onClick={() => setIsActive((prev) => !prev)} className="mt-4">
-          {isActive ? (
-            <span className="bg-red-500 text-white px-4 py-2 rounded-lg mt-4">
-              Stop Discussion
-            </span>
-          ) : (
-            <span className="bg-green-500 text-white px-4 py-2 rounded-lg mt-4">
-              Start Discussion
-            </span>
-          )}
+    <main className="mx-auto flex min-h-screen w-full max-w-4xl flex-col gap-8 px-5 py-10 sm:px-10">
+      <header>
+        <h1 className="text-3xl font-semibold">Agent Discussion Room</h1>
+        <p className="mt-2 text-neutral-600 dark:text-neutral-300">
+          Choose a permitted Topic, then explicitly start a bounded Discussion.
+        </p>
+      </header>
+
+      <form onSubmit={startDiscussion} className="flex flex-col gap-3">
+        <label htmlFor="discussion-topic" className="font-semibold">
+          Discussion Topic
+        </label>
+        <textarea
+          id="discussion-topic"
+          name="topic"
+          value={topic}
+          maxLength={TOPIC_MAX_LENGTH + 1}
+          rows={3}
+          aria-describedby="topic-help"
+          onChange={(event) => setTopic(event.target.value)}
+          className="rounded-lg border border-neutral-500 bg-transparent p-3"
+        />
+        <p id="topic-help" className="text-sm text-neutral-600 dark:text-neutral-300">
+          Enter plain text, up to {TOPIC_MAX_LENGTH} characters.
+        </p>
+        <button
+          type="submit"
+          disabled={isStarting}
+          className="min-h-11 self-start rounded-lg bg-green-700 px-5 py-2 font-semibold text-white disabled:opacity-60"
+        >
+          {isStarting ? "Starting Discussion…" : "Start Discussion"}
         </button>
-      </div>
-      <h2 className="text-xl mt-4">{TOPIC}</h2>
-      <div className="flex-1 max-h-180 overflow-auto flex flex-col items-center mt-8 max-w-4xl w-full bg-neutral-700 p-6 rounded-lg shadow-md">
-        <MessageList messages={messages} />
-      </div>
+      </form>
+
+      <p role="alert" aria-live="polite" className="min-h-6 text-red-700 dark:text-red-300">
+        {error}
+      </p>
+
+      {discussion ? (
+        <section aria-labelledby="active-topic" className="flex flex-col gap-4">
+          <div>
+            <p className="text-sm font-semibold uppercase tracking-wide">
+              Active Topic
+            </p>
+            <h2 id="active-topic" className="text-2xl font-semibold">
+              {discussion.topic}
+            </h2>
+          </div>
+          <p aria-label="Turn progress">
+            {discussion.turnCount} / {discussion.turnLimit} Turns
+          </p>
+          <div className="rounded-lg border border-neutral-500 p-6">
+            <MessageList messages={discussion.transcript} />
+          </div>
+        </section>
+      ) : (
+        <p>No active Discussion. Enter a Topic and choose Start Discussion.</p>
+      )}
     </main>
   );
 }

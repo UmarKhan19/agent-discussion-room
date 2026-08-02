@@ -1,10 +1,6 @@
-export type Speaker = "supporter" | "opponent";
+import type { DiscussionMessage, Speaker } from "./contracts";
 
-export interface DiscussionMessage {
-  id: string;
-  content: string;
-  sender: Speaker;
-}
+export type { DiscussionMessage, Speaker } from "./contracts";
 
 export interface DiscussionUsage {
   inputTokens?: number;
