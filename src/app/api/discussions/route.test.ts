@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DiscussionResponseSchema, ErrorResponseSchema } from "@/discussion/contracts";
-import { GET } from "./[id]/route";
+import { GET, POST as POST_TURN } from "./[id]/route";
 import { POST } from "./route";
 
 function expectPrivateSessionResponse(response: Response): void {
@@ -9,6 +9,34 @@ function expectPrivateSessionResponse(response: Response): void {
 }
 
 describe("Discussion routes", () => {
+  it("wires an ownership-protected next-Turn POST on the Discussion resource", async () => {
+    const created = await POST(
+      new Request("http://localhost/api/discussions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ topic: "How cities can improve public parks" }),
+      }),
+    );
+    const discussion = DiscussionResponseSchema.parse(await created.json());
+
+    const denied = await POST_TURN(
+      new Request(`http://localhost/api/discussions/${discussion.id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          requestId: "22222222-2222-4222-8222-222222222222",
+        }),
+      }),
+      { params: Promise.resolve({ id: discussion.id }) },
+    );
+
+    expect(denied.status).toBe(404);
+    expectPrivateSessionResponse(denied);
+    expect(ErrorResponseSchema.parse(await denied.json()).error.code).toBe(
+      "DISCUSSION_NOT_FOUND",
+    );
+  });
+
   it("prevents successful and denied session reads from being cached", async () => {
     const created = await POST(
       new Request("http://localhost/api/discussions", {

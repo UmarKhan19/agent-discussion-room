@@ -5,6 +5,7 @@ import {
   DiscussionResponseSchema,
   DiscussionTopicSchema,
   ErrorResponseSchema,
+  NextTurnRequestSchema,
   TOPIC_MAX_LENGTH,
   type DiscussionState,
 } from "@/discussion/contracts";
@@ -25,6 +26,49 @@ export default function Home() {
   const [discussion, setDiscussion] = useState<DiscussionState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isStarting, setIsStarting] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
+
+  async function generateFirstTurn(initialDiscussion: DiscussionState) {
+    setIsGenerating(true);
+    try {
+      const requestBody = NextTurnRequestSchema.parse({
+        requestId: crypto.randomUUID(),
+      });
+      const response = await fetch(
+        `/api/discussions/${initialDiscussion.id}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(requestBody),
+        },
+      );
+      const payload: unknown = await response.json();
+
+      if (!response.ok) {
+        const parsedError = ErrorResponseSchema.safeParse(payload);
+        setError(
+          parsedError.success
+            ? `${parsedError.data.error.message} ${parsedError.data.error.action}`
+            : "The first Turn could not be generated safely.",
+        );
+        return;
+      }
+
+      const parsedDiscussion = DiscussionResponseSchema.safeParse(payload);
+      if (!parsedDiscussion.success) {
+        setError("The server returned an invalid Discussion. Please try again.");
+        return;
+      }
+
+      setDiscussion(parsedDiscussion.data);
+    } catch {
+      setError(
+        "The first Turn could not be generated. Check your connection and try again.",
+      );
+    } finally {
+      setIsGenerating(false);
+    }
+  }
 
   async function startDiscussion(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -62,6 +106,7 @@ export default function Home() {
       }
 
       setDiscussion(parsedDiscussion.data);
+      void generateFirstTurn(parsedDiscussion.data);
     } catch {
       setError("The Discussion could not be started. Check your connection and try again.");
     } finally {
@@ -97,7 +142,7 @@ export default function Home() {
         </p>
         <button
           type="submit"
-          disabled={isStarting}
+          disabled={isStarting || isGenerating}
           className="min-h-11 self-start rounded-lg bg-green-700 px-5 py-2 font-semibold text-white disabled:opacity-60"
         >
           {isStarting ? "Starting Discussion…" : "Start Discussion"}
@@ -109,7 +154,11 @@ export default function Home() {
       </p>
 
       {discussion ? (
-        <section aria-labelledby="active-topic" className="flex flex-col gap-4">
+        <section
+          aria-labelledby="active-topic"
+          aria-busy={isGenerating}
+          className="flex flex-col gap-4"
+        >
           <div>
             <p className="text-sm font-semibold uppercase tracking-wide">
               Active Topic
@@ -121,6 +170,11 @@ export default function Home() {
           <p aria-label="Turn progress">
             {discussion.turnCount} / {discussion.turnLimit} Turns
           </p>
+          {isGenerating ? (
+            <p role="status" aria-live="polite" className="font-semibold">
+              Generating Supporter Turn…
+            </p>
+          ) : null}
           <div className="rounded-lg border border-neutral-500 p-6">
             <MessageList messages={discussion.transcript} />
           </div>

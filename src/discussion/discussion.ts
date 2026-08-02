@@ -1,12 +1,16 @@
-import type { DiscussionMessage, Speaker } from "./contracts";
+import { z } from "zod";
+import {
+  DiscussionMessageContentSchema,
+  GenerationUsageSchema,
+  type DiscussionMessage,
+  type Speaker,
+} from "./contracts";
 
-export type { DiscussionMessage, Speaker } from "./contracts";
-
-export interface DiscussionUsage {
-  inputTokens?: number;
-  outputTokens?: number;
-  totalTokens?: number;
-}
+export type {
+  DiscussionMessage,
+  GenerationUsage as DiscussionUsage,
+  Speaker,
+} from "./contracts";
 
 export interface GenerateDiscussionTurnInput {
   topic: string;
@@ -15,10 +19,16 @@ export interface GenerateDiscussionTurnInput {
   signal?: AbortSignal;
 }
 
-export interface GeneratedDiscussionTurn {
-  content: string;
-  usage?: DiscussionUsage;
-}
+export const GeneratedDiscussionTurnSchema = z
+  .object({
+    content: DiscussionMessageContentSchema,
+    usage: GenerationUsageSchema.optional(),
+  })
+  .strict();
+
+export type GeneratedDiscussionTurn = z.infer<
+  typeof GeneratedDiscussionTurnSchema
+>;
 
 /** Product-owned boundary for generating one Discussion Turn. */
 export interface Discussion {

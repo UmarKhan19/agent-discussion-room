@@ -17,6 +17,11 @@ interface OwnedDiscussion {
 export interface DiscussionStore {
   create(ownerSessionId: string, discussion: DiscussionState): void;
   readOwned(ownerSessionId: string, discussionId: string): DiscussionState | null;
+  transitionOwned(
+    ownerSessionId: string,
+    discussionId: string,
+    transition: (current: DiscussionState) => DiscussionState,
+  ): DiscussionState | null;
 }
 
 function copyDiscussion(discussion: DiscussionState): DiscussionState {
@@ -44,6 +49,21 @@ export class InMemoryDiscussionStore implements DiscussionStore {
     }
 
     return copyDiscussion(stored.state);
+  }
+
+  transitionOwned(
+    ownerSessionId: string,
+    discussionId: string,
+    transition: (current: DiscussionState) => DiscussionState,
+  ): DiscussionState | null {
+    const stored = this.discussions.get(discussionId);
+    if (!stored || stored.ownerSessionId !== ownerSessionId) {
+      return null;
+    }
+
+    const next = copyDiscussion(transition(copyDiscussion(stored.state)));
+    stored.state = next;
+    return copyDiscussion(next);
   }
 }
 

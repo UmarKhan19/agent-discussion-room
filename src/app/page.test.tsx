@@ -1,11 +1,15 @@
 // @vitest-environment jsdom
 
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { NextTurnRequestSchema } from "@/discussion/contracts";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import Home from "./page";
 
 const topic = "Should cities create more public parks?";
+const requestId = "22222222-2222-4222-8222-222222222222";
+const messageContent =
+  "Public parks give more residents access to shared green space.";
 const initialDiscussion = {
   id: "11111111-1111-4111-8111-111111111111",
   topic,
@@ -21,6 +25,32 @@ const initialDiscussion = {
   },
   transcript: [],
 };
+const discussionWithFirstTurn = {
+  ...initialDiscussion,
+  turnCount: 1,
+  transcript: [
+    {
+      id: "33333333-3333-4333-8333-333333333333",
+      content: messageContent,
+      speaker: "supporter",
+      createdAt: "2026-08-02T12:00:01.000Z",
+      turn: 1,
+      generation: {
+        requestId,
+        usage: {
+          inputTokens: 12,
+          outputTokens: 9,
+          totalTokens: 21,
+        },
+        outputPolicyOutcome: {
+          decision: "allowed",
+          category: null,
+          checkedAt: "2026-08-02T12:00:01.000Z",
+        },
+      },
+    },
+  ],
+};
 
 afterEach(() => {
   cleanup();
@@ -29,13 +59,17 @@ afterEach(() => {
 
 describe("participant-visible Discussion start", () => {
   it("waits for an explicit action, then shows Topic, empty state, and progress", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify(initialDiscussion), {
-        status: 201,
-        headers: { "Content-Type": "application/json" },
-      }),
-    );
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(initialDiscussion), {
+          status: 201,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockReturnValueOnce(new Promise<Response>(() => undefined));
     vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID: () => requestId });
     const user = userEvent.setup();
 
     render(<Home />);
@@ -55,7 +89,7 @@ describe("participant-visible Discussion start", () => {
     await user.type(topicControl, topic);
     await user.click(screen.getByRole("button", { name: "Start Discussion" }));
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
       topic,
     });
@@ -66,6 +100,58 @@ describe("participant-visible Discussion start", () => {
       "0 / 12",
     );
     expect(screen.getByText("No Turns yet. The Transcript is empty.")).toBeTruthy();
+  });
+
+  it("shows generation progress, then an explicitly labelled Supporter Turn", async () => {
+    let resolveTurn: ((response: Response) => void) | undefined;
+    const turnResponse = new Promise<Response>((resolve) => {
+      resolveTurn = resolve;
+    });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(initialDiscussion), {
+          status: 201,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockReturnValueOnce(turnResponse);
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID: () => requestId });
+    const user = userEvent.setup();
+
+    render(<Home />);
+    await user.type(
+      screen.getByRole("textbox", { name: "Discussion Topic" }),
+      topic,
+    );
+    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("status").textContent).toContain(
+      "Generating Supporter Turn",
+    );
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      `/api/discussions/${initialDiscussion.id}`,
+    );
+    const nextTurnBody = NextTurnRequestSchema.parse(
+      JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)),
+    );
+    expect(nextTurnBody).toEqual({ requestId });
+
+    resolveTurn?.(
+      new Response(JSON.stringify(discussionWithFirstTurn), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    expect(await screen.findByText(messageContent)).toBeTruthy();
+    expect(screen.getByText("Supporter")).toBeTruthy();
+    expect(screen.getByLabelText("Turn progress").textContent).toContain(
+      "1 / 12",
+    );
+    expect(screen.queryByText("Generating Supporter Turn…")).toBeNull();
   });
 
   it("rejects an excessively long Topic before making a request", async () => {

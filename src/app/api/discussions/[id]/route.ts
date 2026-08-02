@@ -1,9 +1,19 @@
 import { discussionHttpHandlers } from "../composition";
 
+type DiscussionRouteContext = { params: Promise<{ id: string }> };
+
 export async function GET(
   request: Request,
-  context: { params: Promise<{ id: string }> },
+  context: DiscussionRouteContext,
 ): Promise<Response> {
   const { id } = await context.params;
   return discussionHttpHandlers.get(request, id);
+}
+
+export async function POST(
+  request: Request,
+  context: DiscussionRouteContext,
+): Promise<Response> {
+  const { id } = await context.params;
+  return discussionHttpHandlers.postTurn(request, id);
 }

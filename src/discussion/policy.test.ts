@@ -1,8 +1,36 @@
 import { describe, expect, it } from "vitest";
-import { DiscussionPolicy } from "./policy";
+import { DiscussionOutputPolicy, DiscussionPolicy } from "./policy";
 
 const checkedAt = new Date("2026-08-02T12:00:00.000Z");
 const policy = new DiscussionPolicy(() => checkedAt);
+
+describe("output Discussion Policy", () => {
+  const outputPolicy = new DiscussionOutputPolicy(() => checkedAt);
+
+  it("blocks disallowed generated advocacy independently of agent compliance", () => {
+    expect(
+      outputPolicy.evaluate(
+        "Violence against Black people is justified and should be supported.",
+      ),
+    ).toEqual({
+      decision: "blocked",
+      category: "protected_class_violence_advocacy",
+      checkedAt: checkedAt.toISOString(),
+    });
+  });
+
+  it("allows a policy-compliant generated argument", () => {
+    expect(
+      outputPolicy.evaluate(
+        "Public parks give residents shared green space and can improve city life.",
+      ),
+    ).toEqual({
+      decision: "allowed",
+      category: null,
+      checkedAt: checkedAt.toISOString(),
+    });
+  });
+});
 
 describe("input Discussion Policy", () => {
   it.each([

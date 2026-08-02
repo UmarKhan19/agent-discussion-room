@@ -6,10 +6,12 @@ import type {
 
 export const SAFE_TOPIC_ALTERNATIVE =
   "Choose a Topic that critically examines prevention, history, consequences, or human rights without praising extremists or advocating harm.";
+export const SAFE_OUTPUT_ALTERNATIVE =
+  "Start a new Discussion with a different permitted Topic; the blocked Turn was not added to the Transcript.";
 
 interface ProhibitedCategoryRule {
   category: PolicyCategory;
-  matches(topic: string): boolean;
+  matches(text: string): boolean;
 }
 
 const EXPLICIT_ADVOCACY =
@@ -47,62 +49,80 @@ const EXTREMIST_APPROVAL =
 const EXTREMIST_PRAISE_CASE =
   /\b(?:argument|case)\s+(?:for|in\s+favou?r\s+of)\s+(?:(?:the\s+)?(?:(?:admiring|celebrating|defending|endorsing|glorifying|honouring|praising|promoting|supporting)\s+|(?:admiration|celebration|defen[cs]e|endorsement|glorification|honou?r|praise|promotion|support)\s+of\s+(?:the\s+)?))?(?:the\s+)?(?:extremist(?:s| groups?| organizations?)?|terrorist(?:s| groups?| organizations?)?|isis|isil|daesh|al[- ]qaeda|neo[- ]nazi(?:s)?|ku klux klan|kkk)\b|\bin\s+(?:favou?r|praise|support)\s+of\s+(?:the\s+)?(?:extremist(?:s| groups?| organizations?)?|terrorist(?:s| groups?| organizations?)?|isis|isil|daesh|al[- ]qaeda|neo[- ]nazi(?:s)?|ku klux klan|kkk)\b/u;
 
-/** Deliberately small, reviewable policy configuration for pre-generation checks. */
-export const PROHIBITED_TOPIC_RULES: readonly ProhibitedCategoryRule[] = [
+/** Deliberately small, reviewable rules for input and generated-output checks. */
+export const DISCUSSION_POLICY_RULES: readonly ProhibitedCategoryRule[] = [
   {
     category: "genocide_advocacy",
-    matches: (topic) =>
-      GENOCIDE.test(topic) &&
-      (EXPLICIT_ADVOCACY.test(topic) ||
-        DIRECT_GENOCIDE_DEFENSE.test(topic) ||
-        HARM_APPROVAL.test(topic) ||
-        PRESCRIPTIVE_GENOCIDE.test(topic) ||
-        PRO_GENOCIDE.test(topic)),
+    matches: (text) =>
+      GENOCIDE.test(text) &&
+      (EXPLICIT_ADVOCACY.test(text) ||
+        DIRECT_GENOCIDE_DEFENSE.test(text) ||
+        HARM_APPROVAL.test(text) ||
+        PRESCRIPTIVE_GENOCIDE.test(text) ||
+        PRO_GENOCIDE.test(text)),
   },
   {
     category: "protected_class_violence_advocacy",
-    matches: (topic) =>
-      VIOLENCE.test(topic) &&
-      PROTECTED_CLASS.test(topic) &&
-      (EXPLICIT_ADVOCACY.test(topic) ||
-        DIRECT_VIOLENCE_DEFENSE.test(topic) ||
-        HARM_APPROVAL.test(topic) ||
-        PRESCRIPTIVE_VIOLENCE.test(topic) ||
-        DIRECT_VIOLENCE_ADVOCACY.test(topic)),
+    matches: (text) =>
+      VIOLENCE.test(text) &&
+      PROTECTED_CLASS.test(text) &&
+      (EXPLICIT_ADVOCACY.test(text) ||
+        DIRECT_VIOLENCE_DEFENSE.test(text) ||
+        HARM_APPROVAL.test(text) ||
+        PRESCRIPTIVE_VIOLENCE.test(text) ||
+        DIRECT_VIOLENCE_ADVOCACY.test(text)),
   },
   {
     category: "extremist_praise",
-    matches: (topic) =>
-      EXTREMIST.test(topic) &&
-      (DIRECT_EXTREMIST_PRAISE.test(topic) ||
-        DIRECT_EXTREMIST_DEFENSE.test(topic) ||
-        EXTREMIST_APPROVAL.test(topic) ||
-        EXTREMIST_PRAISE_CASE.test(topic)),
+    matches: (text) =>
+      EXTREMIST.test(text) &&
+      (DIRECT_EXTREMIST_PRAISE.test(text) ||
+        DIRECT_EXTREMIST_DEFENSE.test(text) ||
+        EXTREMIST_APPROVAL.test(text) ||
+        EXTREMIST_PRAISE_CASE.test(text)),
   },
 ];
 
+function evaluatePolicyText(text: string, now: () => Date): PolicyOutcome {
+  const normalizedText = text.normalize("NFKC").toLowerCase();
+  const blockedRule = DISCUSSION_POLICY_RULES.find((rule) =>
+    rule.matches(normalizedText),
+  );
+  const checkedAt = now().toISOString();
+
+  if (blockedRule) {
+    return {
+      decision: "blocked",
+      category: blockedRule.category,
+      checkedAt,
+    };
+  }
+
+  return {
+    decision: "allowed",
+    category: null,
+    checkedAt,
+  };
+}
+
+/** Policy boundary for participant-authored Discussion Topics. */
 export class DiscussionPolicy {
   constructor(private readonly now: () => Date = () => new Date()) {}
 
   evaluate(topic: DiscussionTopic): PolicyOutcome {
-    const normalizedTopic = topic.normalize("NFKC").toLowerCase();
-    const blockedRule = PROHIBITED_TOPIC_RULES.find((rule) =>
-      rule.matches(normalizedTopic),
-    );
-    const checkedAt = this.now().toISOString();
+    return evaluatePolicyText(topic, this.now);
+  }
+}
 
-    if (blockedRule) {
-      return {
-        decision: "blocked",
-        category: blockedRule.category,
-        checkedAt,
-      };
-    }
+export interface DiscussionOutputPolicyEvaluator {
+  evaluate(content: string): PolicyOutcome;
+}
 
-    return {
-      decision: "allowed",
-      category: null,
-      checkedAt,
-    };
+/** Independent policy boundary for generated Turn content. */
+export class DiscussionOutputPolicy implements DiscussionOutputPolicyEvaluator {
+  constructor(private readonly now: () => Date = () => new Date()) {}
+
+  evaluate(content: string): PolicyOutcome {
+    return evaluatePolicyText(content, this.now);
   }
 }
