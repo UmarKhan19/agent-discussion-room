@@ -1,7 +1,6 @@
 # Remove the Weather sample from the production runtime
 
-Status: ready-for-agent
-
+Status: done
 ## Parent
 
 [Production hardening PRD](../PRD.md)
@@ -21,3 +20,7 @@ Keep the production runtime focused on the Discussion Room by removing unrelated
 ## Blocked by
 
 - None — can start immediately.
+
+## Comments
+
+- Sandcastle completed this ticket on branch `sandcastle/ticket/production-hardening-02/2026-08-02t12-37-43-251z-7ba6905b-a2`. Verified: `bun install --frozen-lockfile` (exit 0), `bun run lint` (exit 0), `bunx tsc --noEmit` (exit 0), `bun run test` (exit 0), `bun run build` (exit 0).
