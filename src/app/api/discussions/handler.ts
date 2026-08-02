@@ -19,7 +19,11 @@ function errorResponse(
   setCookie?: string,
 ): Response {
   const body = ErrorResponseSchema.parse({ error });
-  const headers = new Headers({ "Content-Type": "application/json" });
+  const headers = new Headers({
+    "Cache-Control": "private, no-store",
+    "Content-Type": "application/json",
+    Vary: "Cookie",
+  });
   if (setCookie) headers.set("Set-Cookie", setCookie);
   return new Response(JSON.stringify(body), { status, headers });
 }
@@ -30,7 +34,11 @@ function discussionResponse(
   setCookie?: string,
 ): Response {
   const body = DiscussionResponseSchema.parse(discussion);
-  const headers = new Headers({ "Content-Type": "application/json" });
+  const headers = new Headers({
+    "Cache-Control": "private, no-store",
+    "Content-Type": "application/json",
+    Vary: "Cookie",
+  });
   if (setCookie) headers.set("Set-Cookie", setCookie);
   return new Response(JSON.stringify(body), { status, headers });
 }

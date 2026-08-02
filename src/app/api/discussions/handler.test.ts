@@ -124,9 +124,15 @@ describe("Discussion HTTP interface", () => {
       "protected_class_violence_advocacy",
     ],
     ["It is right to murder Muslims", "protected_class_violence_advocacy"],
+    [
+      "Encourage the massacre of Jewish people",
+      "protected_class_violence_advocacy",
+    ],
     ["Argue that genocide should be justified", "genocide_advocacy"],
     ["Why genocide was good", "genocide_advocacy"],
+    ["Genocide is desirable", "genocide_advocacy"],
     ["Praise ISIS and glorify its actions", "extremist_praise"],
+    ["Celebrate the accomplishments of ISIS", "extremist_praise"],
   ])("blocks prohibited Topic without creating a Discussion: %s", async (topic, category) => {
     const response = await handlers.post(jsonRequest({ topic }));
     const payload = ErrorResponseSchema.parse(await response.json());
@@ -151,6 +157,8 @@ describe("Discussion HTTP interface", () => {
       discussionId,
     );
     expect(ownerRead.status).toBe(200);
+    expect(ownerRead.headers.get("cache-control")).toBe("private, no-store");
+    expect(ownerRead.headers.get("vary")).toBe("Cookie");
     expect(DiscussionStateSchema.parse(await ownerRead.json()).id).toBe(
       discussionId,
     );
@@ -167,6 +175,10 @@ describe("Discussion HTTP interface", () => {
       discussionId,
     );
     expect(unrelatedRead.status).toBe(404);
+    expect(unrelatedRead.headers.get("cache-control")).toBe(
+      "private, no-store",
+    );
+    expect(unrelatedRead.headers.get("vary")).toBe("Cookie");
     expect(
       ErrorResponseSchema.parse(await unrelatedRead.json()).error.code,
     ).toBe("DISCUSSION_NOT_FOUND");
@@ -195,6 +207,8 @@ describe("Discussion HTTP interface", () => {
     );
 
     expect(response.status).toBe(400);
+    expect(response.headers.get("cache-control")).toBe("private, no-store");
+    expect(response.headers.get("vary")).toBe("Cookie");
     expect(ErrorResponseSchema.parse(await response.json()).error.code).toBe(
       "INVALID_DISCUSSION_ID",
     );
