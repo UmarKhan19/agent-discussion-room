@@ -76,10 +76,13 @@ export class SignedSessionManager {
     const signature = parsed.data.slice(separator + 1);
     if (!SessionIdentifierSchema.safeParse(sessionId).success) return null;
 
-    const expected = createHmac("sha256", this.signingKey)
-      .update(sessionId)
-      .digest();
-    const received = Buffer.from(signature, "base64url");
+    const expected = Buffer.from(
+      createHmac("sha256", this.signingKey)
+        .update(sessionId)
+        .digest("base64url"),
+      "ascii",
+    );
+    const received = Buffer.from(signature, "ascii");
     if (
       expected.length !== received.length ||
       !timingSafeEqual(expected, received)

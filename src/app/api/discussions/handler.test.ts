@@ -32,6 +32,21 @@ function cookiePair(response: Response): string {
   return value.split(";", 1)[0];
 }
 
+const BASE64URL_ALPHABET =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+function nonCanonicalSignatureAlias(cookie: string): string {
+  const lastCharacter = cookie.at(-1);
+  const index = lastCharacter
+    ? BASE64URL_ALPHABET.indexOf(lastCharacter)
+    : -1;
+  if (index < 0 || index % 4 !== 0 || index >= BASE64URL_ALPHABET.length - 1) {
+    throw new Error("Expected a canonical unpadded SHA-256 signature");
+  }
+
+  return `${cookie.slice(0, -1)}${BASE64URL_ALPHABET[index + 1]}`;
+}
+
 describe("Discussion HTTP interface", () => {
   let idCalls: number;
   let sessions: SignedSessionManager;
@@ -189,11 +204,9 @@ describe("Discussion HTTP interface", () => {
     );
     expect(identifierOnlyRead.status).toBe(404);
 
-    const lastCharacter = ownerCookie.at(-1);
-    const tamperedCookie = `${ownerCookie.slice(0, -1)}${lastCharacter === "A" ? "B" : "A"}`;
     const tamperedRead = await handlers.get(
       new Request(`http://localhost/api/discussions/${discussionId}`, {
-        headers: { Cookie: tamperedCookie },
+        headers: { Cookie: nonCanonicalSignatureAlias(ownerCookie) },
       }),
       discussionId,
     );
