@@ -1,6 +1,6 @@
 # Start and read a safe, session-owned Discussion
 
-Status: ready-for-agent
+Status: done
 
 ## Parent
 
@@ -25,3 +25,7 @@ Let a participant enter a permitted Discussion Topic and explicitly create a ser
 ## Blocked by
 
 - [01 — Prefactor generation behind a testable Discussion seam](./01-prefactor-generation-seam.md)
+
+## Comments
+
+- Implemented and independently reviewed on `main`. Verified: `bun install --frozen-lockfile` (exit 0), `bun run lint` (exit 0), `bun run typecheck` (exit 0), `bun run test` (57 tests passed), and `bun run build` (exit 0).
