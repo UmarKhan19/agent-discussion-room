@@ -14,6 +14,7 @@ const initialDiscussion = {
   id: "11111111-1111-4111-8111-111111111111",
   topic,
   status: "idle",
+  terminalReason: null,
   turnLimit: 12,
   turnCount: 0,
   createdAt: "2026-08-02T12:00:00.000Z",
@@ -266,6 +267,407 @@ describe("participant-visible Discussion start", () => {
     resolveSecondTurn?.(new Response(JSON.stringify(secondCompleted), { status: 200 }));
     expect(await screen.findByText(secondContent)).toBeTruthy();
     expect(screen.getByText("Discussion completed.")).toBeTruthy();
+  });
+
+  it("stops active generation, aborts its request, and ignores a late Turn response", async () => {
+    const stoppedDiscussion = {
+      ...initialDiscussion,
+      status: "stopped",
+      terminalReason: "stop",
+    };
+    let resolveLateTurn: ((response: Response) => void) | undefined;
+    let resolveStop: ((response: Response) => void) | undefined;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(initialDiscussion), { status: 201 }),
+      )
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveLateTurn = resolve;
+        }),
+      )
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveStop = resolve;
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID: () => requestId });
+    const user = userEvent.setup();
+
+    render(<Home />);
+    await user.type(
+      screen.getByRole("textbox", { name: "Discussion Topic" }),
+      topic,
+    );
+    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    const stop = screen.getByRole("button", { name: "Stop Discussion" });
+    expect(stop).toBeTruthy();
+    const turnSignal = fetchMock.mock.calls[1]?.[1]?.signal as
+      | AbortSignal
+      | undefined;
+    expect(turnSignal?.aborted).toBe(false);
+
+    await user.click(stop);
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(fetchMock.mock.calls[2]?.[0]).toBe(
+      `/api/discussions/${initialDiscussion.id}/stop`,
+    );
+    expect(fetchMock.mock.calls[2]?.[1]).toMatchObject({ method: "POST" });
+    expect(turnSignal?.aborted).toBe(false);
+    expect(
+      screen
+        .getByRole("button", { name: "Stop Discussion" })
+        .hasAttribute("disabled"),
+    ).toBe(true);
+    expect(
+      screen
+        .getByRole("button", { name: "Start Discussion" })
+        .hasAttribute("disabled"),
+    ).toBe(true);
+
+    resolveStop?.(
+      new Response(JSON.stringify(stoppedDiscussion), { status: 200 }),
+    );
+
+    expect(await screen.findByText("Discussion stopped.")).toBeTruthy();
+    expect(turnSignal?.aborted).toBe(true);
+    expect(screen.queryByRole("button", { name: "Stop Discussion" })).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Start Discussion" }).hasAttribute(
+        "disabled",
+      ),
+    ).toBe(false);
+
+    resolveLateTurn?.(
+      new Response(JSON.stringify(discussionWithFirstTurn), { status: 200 }),
+    );
+    await waitFor(() => expect(screen.queryByText(messageContent)).toBeNull());
+    expect(screen.getByLabelText("Turn progress").textContent).toContain(
+      "0 / 12",
+    );
+    expect(screen.getByText("Discussion stopped.")).toBeTruthy();
+  });
+
+  it("keeps generation attached after failed Stop and permits a successful retry", async () => {
+    const stoppedDiscussion = {
+      ...initialDiscussion,
+      status: "stopped",
+      terminalReason: "stop",
+    };
+    let resolveLateTurn: ((response: Response) => void) | undefined;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(initialDiscussion), { status: 201 }),
+      )
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveLateTurn = resolve;
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              code: "INVALID_RESPONSE",
+              message: "The Discussion could not be stopped safely.",
+              action: "Read the current Discussion state before trying again.",
+            },
+          }),
+          { status: 500 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(stoppedDiscussion), { status: 200 }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID: () => requestId });
+    const user = userEvent.setup();
+
+    render(<Home />);
+    await user.type(
+      screen.getByRole("textbox", { name: "Discussion Topic" }),
+      topic,
+    );
+    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const turnSignal = fetchMock.mock.calls[1]?.[1]?.signal as
+      | AbortSignal
+      | undefined;
+
+    await user.click(screen.getByRole("button", { name: "Stop Discussion" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(screen.getByRole("alert").textContent).toContain(
+      "The Discussion could not be stopped safely. Read the current Discussion state before trying again.",
+    );
+    expect(turnSignal?.aborted).toBe(false);
+    const retryStop = screen.getByRole("button", { name: "Stop Discussion" });
+    expect(retryStop.hasAttribute("disabled")).toBe(false);
+
+    await user.click(retryStop);
+
+    expect(await screen.findByText("Discussion stopped.")).toBeTruthy();
+    expect(turnSignal?.aborted).toBe(true);
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "/api/discussions",
+      `/api/discussions/${initialDiscussion.id}`,
+      `/api/discussions/${initialDiscussion.id}/stop`,
+      `/api/discussions/${initialDiscussion.id}/stop`,
+    ]);
+    expect(screen.getByRole("alert").textContent).toBe("");
+
+    resolveLateTurn?.(
+      new Response(JSON.stringify(discussionWithFirstTurn), { status: 200 }),
+    );
+    await waitFor(() => expect(screen.queryByText(messageContent)).toBeNull());
+    expect(screen.getByText("Discussion stopped.")).toBeTruthy();
+  });
+
+  it("refreshes authoritative timeout state and starts fresh without stale state", async () => {
+    const timedOutDiscussion = {
+      ...initialDiscussion,
+      status: "failed",
+      terminalReason: "timeout",
+    };
+    const secondTopic = "Should libraries stay open later?";
+    const secondInitial = {
+      ...initialDiscussion,
+      id: "66666666-6666-4666-8666-666666666666",
+      topic: secondTopic,
+    };
+    const generatedIds = [
+      requestId,
+      "77777777-7777-4777-8777-777777777777",
+    ];
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(initialDiscussion), { status: 201 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              code: "GENERATION_TIMEOUT",
+              message: "The next Turn reached the server generation timeout.",
+              action: "Start a new Discussion and try again later.",
+            },
+          }),
+          { status: 504 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(timedOutDiscussion), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(secondInitial), { status: 201 }),
+      )
+      .mockReturnValueOnce(new Promise<Response>(() => undefined));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", {
+      randomUUID: () => generatedIds.shift(),
+    });
+    const user = userEvent.setup();
+
+    render(<Home />);
+    const topicControl = screen.getByRole("textbox", {
+      name: "Discussion Topic",
+    });
+    await user.type(topicControl, topic);
+    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+
+    expect(await screen.findByText("Discussion timed out.")).toBeTruthy();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(fetchMock.mock.calls.slice(0, 3).map((call) => call[0])).toEqual([
+      "/api/discussions",
+      `/api/discussions/${initialDiscussion.id}`,
+      `/api/discussions/${initialDiscussion.id}`,
+    ]);
+    expect(fetchMock.mock.calls[2]?.[1]).toMatchObject({ method: "GET" });
+    expect(screen.getByRole("alert").textContent).toContain(
+      "The next Turn reached the server generation timeout. Start a new Discussion and try again later.",
+    );
+    expect(screen.queryByRole("button", { name: "Stop Discussion" })).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Start Discussion" }).hasAttribute(
+        "disabled",
+      ),
+    ).toBe(false);
+
+    await user.clear(topicControl);
+    await user.type(topicControl, secondTopic);
+    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+
+    expect(
+      await screen.findByRole("heading", { name: secondTopic, level: 2 }),
+    ).toBeTruthy();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "/api/discussions",
+      `/api/discussions/${initialDiscussion.id}`,
+      `/api/discussions/${initialDiscussion.id}`,
+      "/api/discussions",
+      `/api/discussions/${secondInitial.id}`,
+    ]);
+    expect(screen.queryByText("Discussion timed out.")).toBeNull();
+    expect(screen.getByLabelText("Turn progress").textContent).toContain(
+      "0 / 12",
+    );
+    expect(screen.getByText("No Turns yet. The Transcript is empty.")).toBeTruthy();
+  });
+
+  it("preserves timeout guidance when authoritative refresh fails", async () => {
+    const secondTopic = "Should libraries stay open later?";
+    const secondInitial = {
+      ...initialDiscussion,
+      id: "99999999-9999-4999-8999-999999999999",
+      topic: secondTopic,
+    };
+    const generatedIds = [
+      requestId,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    ];
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(initialDiscussion), { status: 201 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              code: "GENERATION_TIMEOUT",
+              message: "The next Turn reached the server generation timeout.",
+              action: "Start a new Discussion and try again later.",
+            },
+          }),
+          { status: 504 },
+        ),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 500 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(secondInitial), { status: 201 }),
+      )
+      .mockReturnValueOnce(new Promise<Response>(() => undefined));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID: () => generatedIds.shift() });
+    const user = userEvent.setup();
+
+    render(<Home />);
+    const topicControl = screen.getByRole("textbox", {
+      name: "Discussion Topic",
+    });
+    await user.type(topicControl, topic);
+    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(screen.getByRole("alert").textContent).toContain(
+      "The next Turn reached the server generation timeout. Start a new Discussion and try again later.",
+    );
+    expect(screen.queryByText("Discussion timed out.")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Start Discussion" }).hasAttribute(
+        "disabled",
+      ),
+    ).toBe(false);
+
+    await user.clear(topicControl);
+    await user.type(topicControl, secondTopic);
+    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+
+    expect(
+      await screen.findByRole("heading", { name: secondTopic, level: 2 }),
+    ).toBeTruthy();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
+    expect(screen.queryByText("Discussion timed out.")).toBeNull();
+    expect(screen.getByRole("alert").textContent).toBe("");
+  });
+
+  it("ignores a stale timeout refresh after a fresh Discussion starts", async () => {
+    const timedOutDiscussion = {
+      ...initialDiscussion,
+      status: "failed",
+      terminalReason: "timeout",
+    };
+    const secondTopic = "Should libraries stay open later?";
+    const secondInitial = {
+      ...initialDiscussion,
+      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      topic: secondTopic,
+    };
+    const generatedIds = [
+      requestId,
+      "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    ];
+    let resolveTimeoutRefresh: ((response: Response) => void) | undefined;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(initialDiscussion), { status: 201 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              code: "GENERATION_TIMEOUT",
+              message: "The next Turn reached the server generation timeout.",
+              action: "Start a new Discussion and try again later.",
+            },
+          }),
+          { status: 504 },
+        ),
+      )
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveTimeoutRefresh = resolve;
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(secondInitial), { status: 201 }),
+      )
+      .mockReturnValueOnce(new Promise<Response>(() => undefined));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID: () => generatedIds.shift() });
+    const user = userEvent.setup();
+
+    render(<Home />);
+    const topicControl = screen.getByRole("textbox", {
+      name: "Discussion Topic",
+    });
+    await user.type(topicControl, topic);
+    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    const refreshSignal = fetchMock.mock.calls[2]?.[1]?.signal as
+      | AbortSignal
+      | undefined;
+    expect(refreshSignal?.aborted).toBe(false);
+
+    await user.clear(topicControl);
+    await user.type(topicControl, secondTopic);
+    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+
+    expect(
+      await screen.findByRole("heading", { name: secondTopic, level: 2 }),
+    ).toBeTruthy();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
+    expect(refreshSignal?.aborted).toBe(true);
+
+    resolveTimeoutRefresh?.(
+      new Response(JSON.stringify(timedOutDiscussion), { status: 200 }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole("heading", { name: secondTopic, level: 2 }),
+      ).toBeTruthy(),
+    );
+    expect(screen.queryByText("Discussion timed out.")).toBeNull();
+    expect(screen.getByRole("alert").textContent).toBe("");
   });
 
   it("rejects an excessively long Topic before making a request", async () => {

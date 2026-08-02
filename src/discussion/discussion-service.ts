@@ -122,6 +122,7 @@ export class DiscussionService {
       id: this.createId(),
       topic,
       status: "idle",
+      terminalReason: null,
       turnLimit: this.turnLimit,
       turnCount: 0,
       createdAt: timestamp,

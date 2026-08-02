@@ -25,6 +25,11 @@ export const DiscussionStatusSchema = z.enum([
   "stopped",
   "failed",
 ]);
+export const DiscussionTerminalReasonSchema = z.enum([
+  "stop",
+  "disconnect",
+  "timeout",
+]);
 export const DiscussionIdentifierSchema = z.uuid();
 export const SessionIdentifierSchema = z.uuid();
 export const RequestIdentifierSchema = z.uuid();
@@ -113,6 +118,7 @@ export const DiscussionStateSchema = z
     id: DiscussionIdentifierSchema,
     topic: DiscussionTopicSchema,
     status: DiscussionStatusSchema,
+    terminalReason: DiscussionTerminalReasonSchema.nullable().default(null),
     turnLimit: z.number().int().positive().max(HARD_DISCUSSION_TURN_LIMIT),
     turnCount: z.number().int().nonnegative(),
     createdAt: z.string().datetime({ offset: true }),
@@ -150,6 +156,28 @@ export const DiscussionStateSchema = z
       path: ["transcript"],
     },
   )
+  .refine(
+    (discussion) =>
+      discussion.status === "stopped"
+        ? discussion.terminalReason === "stop" ||
+          discussion.terminalReason === "disconnect"
+        : discussion.terminalReason !== "stop" &&
+          discussion.terminalReason !== "disconnect",
+    {
+      message: "Stopped Discussions require a Stop or disconnect reason",
+      path: ["terminalReason"],
+    },
+  )
+  .refine(
+    (discussion) =>
+      discussion.terminalReason === "timeout"
+        ? discussion.status === "failed"
+        : true,
+    {
+      message: "Timeout is valid only for a failed Discussion",
+      path: ["terminalReason"],
+    },
+  )
   .superRefine((discussion, context) => {
     discussion.transcript.forEach((message, index) => {
       if (message.turn !== index + 1) {
@@ -173,8 +201,10 @@ export const ProductErrorCodeSchema = z.enum([
   "DISCUSSION_NOT_FOUND",
   "INVALID_DISCUSSION_STATE",
   "DISCUSSION_COMPLETED",
+  "DISCUSSION_STOPPED",
   "OUTPUT_BLOCKED",
   "GENERATION_FAILED",
+  "GENERATION_TIMEOUT",
   "INVALID_RESPONSE",
 ]);
 
@@ -203,6 +233,9 @@ export type SessionIdentifier = z.infer<typeof SessionIdentifierSchema>;
 export type RequestIdentifier = z.infer<typeof RequestIdentifierSchema>;
 export type Speaker = z.infer<typeof SpeakerSchema>;
 export type DiscussionStatus = z.infer<typeof DiscussionStatusSchema>;
+export type DiscussionTerminalReason = z.infer<
+  typeof DiscussionTerminalReasonSchema
+>;
 export type PolicyCategory = z.infer<typeof PolicyCategorySchema>;
 export type PolicyOutcome = z.infer<typeof PolicyOutcomeSchema>;
 export type AllowedPolicyOutcome = z.infer<typeof AllowedPolicyOutcomeSchema>;

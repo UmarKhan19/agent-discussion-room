@@ -5,6 +5,7 @@ import {
   SessionIdentifierSchema,
   speakerForTurn,
   type DiscussionState,
+  type DiscussionTerminalReason,
   type PolicyOutcome,
 } from "./contracts";
 import {
@@ -17,6 +18,8 @@ import {
   type DiscussionOutputPolicyEvaluator,
 } from "./policy";
 
+export const DEFAULT_GENERATION_TIMEOUT_MS = 30_000;
+
 export class DiscussionInvalidStateError extends Error {
   constructor() {
     super("Discussion is not eligible for another Turn");
@@ -28,6 +31,20 @@ export class DiscussionCompletedError extends Error {
   constructor() {
     super("Discussion has completed its configured Turn limit");
     this.name = "DiscussionCompletedError";
+  }
+}
+
+export class DiscussionStoppedError extends Error {
+  constructor() {
+    super("Discussion generation was stopped");
+    this.name = "DiscussionStoppedError";
+  }
+}
+
+export class DiscussionGenerationTimeoutError extends Error {
+  constructor() {
+    super("Discussion generation reached its hard timeout");
+    this.name = "DiscussionGenerationTimeoutError";
   }
 }
 
@@ -60,6 +77,7 @@ export interface DiscussionRunnerOptions {
   outputPolicy?: DiscussionOutputPolicyEvaluator;
   now?: () => Date;
   createMessageId?: () => string;
+  generationTimeoutMs?: number;
 }
 
 function isRunnerError(
@@ -104,6 +122,24 @@ function selectGenerationTranscript(
   return selected;
 }
 
+interface ActiveGeneration {
+  ownerSessionId: string;
+  discussionId: string;
+  controller: AbortController;
+  cancellation: Promise<never>;
+  rejectCancellation: (error: Error) => void;
+  reason: DiscussionTerminalReason | null;
+  timeout?: ReturnType<typeof setTimeout>;
+  disconnectSignal?: AbortSignal;
+  onDisconnect?: () => void;
+}
+
+function cancellationError(reason: DiscussionTerminalReason): Error {
+  return reason === "timeout"
+    ? new DiscussionGenerationTimeoutError()
+    : new DiscussionStoppedError();
+}
+
 /** Sole authority for next-Turn lifecycle, Speaker selection, policy, and commit. */
 export class DiscussionRunner {
   private readonly store: DiscussionStore;
@@ -111,6 +147,8 @@ export class DiscussionRunner {
   private readonly outputPolicy: DiscussionOutputPolicyEvaluator;
   private readonly now: () => Date;
   private readonly createMessageId: () => string;
+  private readonly generationTimeoutMs: number;
+  private readonly activeGenerations = new Map<string, ActiveGeneration>();
 
   constructor(options: DiscussionRunnerOptions) {
     this.store = options.store;
@@ -120,6 +158,42 @@ export class DiscussionRunner {
     this.now = options.now ?? (() => new Date());
     this.createMessageId =
       options.createMessageId ?? (() => crypto.randomUUID());
+    this.generationTimeoutMs =
+      options.generationTimeoutMs ?? DEFAULT_GENERATION_TIMEOUT_MS;
+
+    if (
+      !Number.isFinite(this.generationTimeoutMs) ||
+      this.generationTimeoutMs <= 0
+    ) {
+      throw new RangeError("Generation timeout must be a positive number");
+    }
+  }
+
+  stop(ownerSessionId: string, discussionId: string): DiscussionState | null {
+    const sessionId = SessionIdentifierSchema.parse(ownerSessionId);
+    const id = DiscussionIdentifierSchema.parse(discussionId);
+    const stopped = this.store.transitionOwned(sessionId, id, (current) => {
+      if (current.status === "stopped") return current;
+      if (current.status !== "generating") {
+        throw new DiscussionInvalidStateError();
+      }
+
+      return {
+        ...current,
+        status: "stopped",
+        terminalReason: "stop",
+        updatedAt: this.now().toISOString(),
+      };
+    });
+
+    if (!stopped) return null;
+
+    const active = this.activeGenerations.get(id);
+    if (active?.ownerSessionId === sessionId) {
+      this.abortPersistedGeneration(active, stopped.terminalReason ?? "stop");
+    }
+
+    return stopped;
   }
 
   async nextTurn(
@@ -146,6 +220,7 @@ export class DiscussionRunner {
         return {
           ...current,
           status: "generating",
+          terminalReason: null,
           updatedAt: this.now().toISOString(),
         };
       },
@@ -153,6 +228,7 @@ export class DiscussionRunner {
 
     if (!generating) return null;
 
+    const active = this.createActiveGeneration(sessionId, id, signal);
     const turn = generating.turnCount + 1;
     const speaker = speakerForTurn(turn);
     const generationTranscript = selectGenerationTranscript(
@@ -160,14 +236,21 @@ export class DiscussionRunner {
     );
 
     try {
+      const generated = active.controller.signal.aborted
+        ? active.cancellation
+        : this.discussion.generateTurn({
+            topic: generating.topic,
+            speaker,
+            transcript: generationTranscript,
+            signal: active.controller.signal,
+          });
       const generatedResult = GeneratedDiscussionTurnSchema.safeParse(
-        await this.discussion.generateTurn({
-          topic: generating.topic,
-          speaker,
-          transcript: generationTranscript,
-          signal,
-        }),
+        await Promise.race([generated, active.cancellation]),
       );
+
+      if (active.controller.signal.aborted) {
+        throw cancellationError(active.reason ?? "disconnect");
+      }
       if (!generatedResult.success) {
         throw new DiscussionInvalidGeneratedTurnError();
       }
@@ -203,6 +286,7 @@ export class DiscussionRunner {
         id,
         (current) => {
           if (
+            active.controller.signal.aborted ||
             current.status !== "generating" ||
             current.turnCount !== turn - 1
           ) {
@@ -212,6 +296,7 @@ export class DiscussionRunner {
           return {
             ...current,
             status: turn === current.turnLimit ? "completed" : "idle",
+            terminalReason: null,
             turnCount: turn,
             updatedAt: timestamp,
             transcript: [...current.transcript, messageResult.data],
@@ -225,9 +310,105 @@ export class DiscussionRunner {
 
       return completedTurn;
     } catch (error) {
+      if (active.reason === "timeout") {
+        throw new DiscussionGenerationTimeoutError();
+      }
+      if (active.reason === "stop" || active.reason === "disconnect") {
+        throw new DiscussionStoppedError();
+      }
+
       this.markGeneratingAsFailed(sessionId, id);
       if (isRunnerError(error)) throw error;
       throw new DiscussionGenerationFailedError();
+    } finally {
+      this.releaseActiveGeneration(active);
+    }
+  }
+
+  private createActiveGeneration(
+    ownerSessionId: string,
+    discussionId: string,
+    disconnectSignal?: AbortSignal,
+  ): ActiveGeneration {
+    const controller = new AbortController();
+    let rejectCancellation!: (error: Error) => void;
+    const cancellation = new Promise<never>((_resolve, reject) => {
+      rejectCancellation = reject;
+    });
+    const active: ActiveGeneration = {
+      ownerSessionId,
+      discussionId,
+      controller,
+      cancellation,
+      rejectCancellation,
+      reason: null,
+      ...(disconnectSignal ? { disconnectSignal } : {}),
+    };
+
+    active.timeout = setTimeout(() => {
+      this.cancelActiveGeneration(active, "timeout");
+    }, this.generationTimeoutMs);
+    if (disconnectSignal) {
+      active.onDisconnect = () => {
+        this.cancelActiveGeneration(active, "disconnect");
+      };
+      disconnectSignal.addEventListener("abort", active.onDisconnect, {
+        once: true,
+      });
+    }
+    this.activeGenerations.set(discussionId, active);
+
+    if (disconnectSignal?.aborted) {
+      this.cancelActiveGeneration(active, "disconnect");
+    }
+
+    return active;
+  }
+
+  private cancelActiveGeneration(
+    active: ActiveGeneration,
+    reason: Extract<DiscussionTerminalReason, "disconnect" | "timeout">,
+  ): void {
+    if (this.activeGenerations.get(active.discussionId) !== active) return;
+
+    const terminal = this.store.transitionOwned(
+      active.ownerSessionId,
+      active.discussionId,
+      (current) => {
+        if (current.status !== "generating") return current;
+
+        return {
+          ...current,
+          status: reason === "timeout" ? "failed" : "stopped",
+          terminalReason: reason,
+          updatedAt: this.now().toISOString(),
+        };
+      },
+    );
+
+    if (terminal?.terminalReason === reason) {
+      this.abortPersistedGeneration(active, reason);
+    }
+  }
+
+  private abortPersistedGeneration(
+    active: ActiveGeneration,
+    reason: DiscussionTerminalReason,
+  ): void {
+    if (active.reason === null) {
+      active.reason = reason;
+      active.rejectCancellation(cancellationError(reason));
+    }
+    active.controller.abort();
+  }
+
+  private releaseActiveGeneration(active: ActiveGeneration): void {
+    if (active.timeout !== undefined) clearTimeout(active.timeout);
+    if (active.disconnectSignal && active.onDisconnect) {
+      active.disconnectSignal.removeEventListener("abort", active.onDisconnect);
+    }
+    if (this.activeGenerations.get(active.discussionId) === active) {
+      this.activeGenerations.delete(active.discussionId);
     }
   }
 
@@ -241,6 +422,7 @@ export class DiscussionRunner {
       return {
         ...current,
         status: "failed",
+        terminalReason: null,
         updatedAt: this.now().toISOString(),
       };
     });

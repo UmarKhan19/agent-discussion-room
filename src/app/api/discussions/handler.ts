@@ -10,9 +10,11 @@ import {
 import {
   DiscussionCompletedError,
   DiscussionGenerationFailedError,
+  DiscussionGenerationTimeoutError,
   DiscussionInvalidGeneratedTurnError,
   DiscussionInvalidStateError,
   DiscussionOutputPolicyBlockedError,
+  DiscussionStoppedError,
   type DiscussionRunner,
 } from "@/discussion/discussion-runner";
 import {
@@ -283,6 +285,30 @@ export function createDiscussionHttpHandlers(
           );
         }
 
+        if (error instanceof DiscussionGenerationTimeoutError) {
+          return errorResponse(
+            504,
+            {
+              code: "GENERATION_TIMEOUT",
+              message: "The next Turn reached the server generation timeout.",
+              action: "Start a new Discussion and try again later.",
+            },
+            session.setCookie,
+          );
+        }
+
+        if (error instanceof DiscussionStoppedError) {
+          return errorResponse(
+            409,
+            {
+              code: "DISCUSSION_STOPPED",
+              message: "The Discussion was stopped before the next Turn completed.",
+              action: "Start a new Discussion to continue with a fresh Topic and Transcript.",
+            },
+            session.setCookie,
+          );
+        }
+
         if (error instanceof DiscussionGenerationFailedError) {
           return errorResponse(
             502,
@@ -300,6 +326,60 @@ export function createDiscussionHttpHandlers(
           {
             code: "INVALID_RESPONSE",
             message: "The Discussion could not be advanced safely.",
+            action: "Read the current Discussion state before trying again.",
+          },
+          session.setCookie,
+        );
+      }
+    },
+
+    async postStop(
+      request: Request,
+      untrustedId: string,
+    ): Promise<Response> {
+      const parsedId = DiscussionIdentifierSchema.safeParse(untrustedId);
+      if (!parsedId.success) {
+        return errorResponse(400, {
+          code: "INVALID_DISCUSSION_ID",
+          message: "The Discussion identifier is malformed.",
+          action: "Use the UUID returned when the Discussion was started.",
+        });
+      }
+
+      const session = sessions.authenticate(request);
+      try {
+        const discussion = runner.stop(session.id, parsedId.data);
+        if (!discussion) {
+          return errorResponse(
+            404,
+            {
+              code: "DISCUSSION_NOT_FOUND",
+              message: "This Discussion is not available in the current session.",
+              action: "Start a new Discussion in this session or return to the session that created it.",
+            },
+            session.setCookie,
+          );
+        }
+
+        return discussionResponse(discussion, 200, session.setCookie);
+      } catch (error) {
+        if (error instanceof DiscussionInvalidStateError) {
+          return errorResponse(
+            409,
+            {
+              code: "INVALID_DISCUSSION_STATE",
+              message: "This Discussion has no active generation to stop.",
+              action: "Read the current Discussion state before trying to stop it.",
+            },
+            session.setCookie,
+          );
+        }
+
+        return errorResponse(
+          500,
+          {
+            code: "INVALID_RESPONSE",
+            message: "The Discussion could not be stopped safely.",
             action: "Read the current Discussion state before trying again.",
           },
           session.setCookie,

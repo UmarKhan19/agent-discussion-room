@@ -56,6 +56,7 @@ function jsonRequest(
   body: unknown,
   cookie?: string,
   url = "http://localhost/api/discussions",
+  signal?: AbortSignal,
 ): Request {
   return new Request(url, {
     method: "POST",
@@ -64,6 +65,7 @@ function jsonRequest(
       ...(cookie ? { Cookie: cookie } : {}),
     },
     body: JSON.stringify(body),
+    signal,
   });
 }
 
@@ -97,7 +99,10 @@ describe("Discussion HTTP interface", () => {
   let fakeDiscussion: FakeDiscussion;
   let handlers: ReturnType<typeof createDiscussionHttpHandlers>;
 
-  function useDiscussion(discussion: Discussion): void {
+  function useDiscussion(
+    discussion: Discussion,
+    generationTimeoutMs?: number,
+  ): void {
     const runner = new DiscussionRunner({
       store,
       discussion,
@@ -107,6 +112,7 @@ describe("Discussion HTTP interface", () => {
         messageIdCalls += 1;
         return turnMessageId(messageIdCalls);
       },
+      ...(generationTimeoutMs === undefined ? {} : { generationTimeoutMs }),
     });
     handlers = createDiscussionHttpHandlers(service, sessions, runner);
   }
@@ -129,6 +135,17 @@ describe("Discussion HTTP interface", () => {
   function useFake(outcomes: readonly FakeDiscussionOutcome[]): void {
     fakeDiscussion = new FakeDiscussion(outcomes);
     useDiscussion(fakeDiscussion);
+  }
+
+  async function waitForFakeCall(): Promise<void> {
+    for (
+      let attempt = 0;
+      attempt < 10 && fakeDiscussion.calls.length === 0;
+      attempt += 1
+    ) {
+      await Promise.resolve();
+    }
+    expect(fakeDiscussion.calls).toHaveLength(1);
   }
 
   afterEach(() => {
@@ -161,6 +178,7 @@ describe("Discussion HTTP interface", () => {
       id: discussionId,
       topic: "Should cities create more public parks?",
       status: "idle",
+      terminalReason: null,
       turnLimit: 6,
       turnCount: 0,
       createdAt: now.toISOString(),
@@ -290,6 +308,292 @@ describe("Discussion HTTP interface", () => {
     });
   });
 
+  it("stops active generation promptly, stays idempotent, and rejects a late result", async () => {
+    vi.useFakeTimers();
+    useFake([
+      {
+        type: "success",
+        result: generatedTurn,
+        delayMs: 100,
+        ignoreAbort: true,
+      },
+    ]);
+    const created = await handlers.post(
+      jsonRequest({ topic: "Should cities create more public parks?" }),
+    );
+    const ownerCookie = cookiePair(created);
+    const pendingTurn = handlers.postTurn(
+      jsonRequest({ requestId }, ownerCookie),
+      discussionId,
+    );
+    await waitForFakeCall();
+
+    const stopResponse = await handlers.postStop(
+      new Request(`http://localhost/api/discussions/${discussionId}/stop`, {
+        method: "POST",
+        headers: { Cookie: ownerCookie },
+      }),
+      discussionId,
+    );
+    const stopped = DiscussionStateSchema.parse(await stopResponse.json());
+
+    expect(stopResponse.status).toBe(200);
+    expect(stopped).toMatchObject({
+      status: "stopped",
+      terminalReason: "stop",
+      turnCount: 0,
+      transcript: [],
+    });
+    expect(fakeDiscussion.calls[0]?.signal?.aborted).toBe(true);
+
+    const turnResponse = await pendingTurn;
+    expect(turnResponse.status).toBe(409);
+    expect(
+      ErrorResponseSchema.parse(await turnResponse.json()).error.code,
+    ).toBe("DISCUSSION_STOPPED");
+
+    const repeatedStop = await handlers.postStop(
+      new Request(`http://localhost/api/discussions/${discussionId}/stop`, {
+        method: "POST",
+        headers: { Cookie: ownerCookie },
+      }),
+      discussionId,
+    );
+    expect(repeatedStop.status).toBe(200);
+    expect(DiscussionStateSchema.parse(await repeatedStop.json())).toEqual(
+      stopped,
+    );
+
+    await vi.advanceTimersByTimeAsync(100);
+    const persisted = await handlers.get(
+      new Request(`http://localhost/api/discussions/${discussionId}`, {
+        headers: { Cookie: ownerCookie },
+      }),
+      discussionId,
+    );
+    expect(DiscussionStateSchema.parse(await persisted.json())).toEqual(
+      stopped,
+    );
+  });
+
+  it("treats client disconnect as terminal cancellation", async () => {
+    vi.useFakeTimers();
+    useFake([
+      {
+        type: "success",
+        result: generatedTurn,
+        delayMs: 100,
+        ignoreAbort: true,
+      },
+    ]);
+    const created = await handlers.post(
+      jsonRequest({ topic: "Should cities create more public parks?" }),
+    );
+    const ownerCookie = cookiePair(created);
+    const disconnect = new AbortController();
+    const pendingTurn = handlers.postTurn(
+      jsonRequest(
+        { requestId },
+        ownerCookie,
+        `http://localhost/api/discussions/${discussionId}`,
+        disconnect.signal,
+      ),
+      discussionId,
+    );
+    await waitForFakeCall();
+
+    disconnect.abort();
+
+    const response = await pendingTurn;
+    expect(response.status).toBe(409);
+    expect(
+      ErrorResponseSchema.parse(await response.json()).error.code,
+    ).toBe("DISCUSSION_STOPPED");
+    expect(fakeDiscussion.calls[0]?.signal?.aborted).toBe(true);
+
+    const persisted = await handlers.get(
+      new Request(`http://localhost/api/discussions/${discussionId}`, {
+        headers: { Cookie: ownerCookie },
+      }),
+      discussionId,
+    );
+    const stopped = DiscussionStateSchema.parse(await persisted.json());
+    expect(stopped).toMatchObject({
+      status: "stopped",
+      terminalReason: "disconnect",
+      turnCount: 0,
+      transcript: [],
+    });
+
+    await vi.advanceTimersByTimeAsync(100);
+    const afterLateResult = await handlers.get(
+      new Request(`http://localhost/api/discussions/${discussionId}`, {
+        headers: { Cookie: ownerCookie },
+      }),
+      discussionId,
+    );
+    expect(
+      DiscussionStateSchema.parse(await afterLateResult.json()),
+    ).toEqual(stopped);
+  });
+
+  it("returns a stable timeout while discarding a provider result that arrives late", async () => {
+    vi.useFakeTimers();
+    fakeDiscussion = new FakeDiscussion([
+      {
+        type: "success",
+        result: generatedTurn,
+        delayMs: 100,
+        ignoreAbort: true,
+      },
+    ]);
+    useDiscussion(fakeDiscussion, 50);
+    const created = await handlers.post(
+      jsonRequest({ topic: "Should cities create more public parks?" }),
+    );
+    const ownerCookie = cookiePair(created);
+    const pendingTurn = handlers.postTurn(
+      jsonRequest({ requestId }, ownerCookie),
+      discussionId,
+    );
+    await waitForFakeCall();
+
+    await vi.advanceTimersByTimeAsync(49);
+    let settled = false;
+    void pendingTurn.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    const response = await pendingTurn;
+    expect(response.status).toBe(504);
+    expect(
+      ErrorResponseSchema.parse(await response.json()).error.code,
+    ).toBe("GENERATION_TIMEOUT");
+    expect(fakeDiscussion.calls[0]?.signal?.aborted).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(50);
+    const persisted = await handlers.get(
+      new Request(`http://localhost/api/discussions/${discussionId}`, {
+        headers: { Cookie: ownerCookie },
+      }),
+      discussionId,
+    );
+    expect(DiscussionStateSchema.parse(await persisted.json())).toMatchObject({
+      status: "failed",
+      terminalReason: "timeout",
+      turnCount: 0,
+      transcript: [],
+    });
+  });
+
+  it("rejects Stop when no stoppable work exists", async () => {
+    const created = await handlers.post(
+      jsonRequest({ topic: "Should cities create more public parks?" }),
+    );
+    const ownerCookie = cookiePair(created);
+
+    const idleStop = await handlers.postStop(
+      new Request(`http://localhost/api/discussions/${discussionId}/stop`, {
+        method: "POST",
+        headers: { Cookie: ownerCookie },
+      }),
+      discussionId,
+    );
+    expect(idleStop.status).toBe(409);
+    expect(
+      ErrorResponseSchema.parse(await idleStop.json()).error.code,
+    ).toBe("INVALID_DISCUSSION_STATE");
+
+    configureService(1);
+    useFake([{ type: "success", result: generatedTurn }]);
+    const oneTurnCreated = await handlers.post(
+      jsonRequest({ topic: "A permitted Topic" }),
+    );
+    const oneTurnCookie = cookiePair(oneTurnCreated);
+    const completed = await handlers.postTurn(
+      jsonRequest({ requestId }, oneTurnCookie),
+      discussionId,
+    );
+    expect(
+      DiscussionStateSchema.parse(await completed.clone().json()).status,
+    ).toBe("completed");
+    const completedStop = await handlers.postStop(
+      new Request(`http://localhost/api/discussions/${discussionId}/stop`, {
+        method: "POST",
+        headers: { Cookie: oneTurnCookie },
+      }),
+      discussionId,
+    );
+    expect(completedStop.status).toBe(409);
+
+    configureService(6);
+    useFake([{ type: "failure", error: new Error("controlled") }]);
+    const failedCreated = await handlers.post(
+      jsonRequest({ topic: "Another permitted Topic" }),
+    );
+    const failedCookie = cookiePair(failedCreated);
+    await handlers.postTurn(
+      jsonRequest({ requestId }, failedCookie),
+      discussionId,
+    );
+    const failedStop = await handlers.postStop(
+      new Request(`http://localhost/api/discussions/${discussionId}/stop`, {
+        method: "POST",
+        headers: { Cookie: failedCookie },
+      }),
+      discussionId,
+    );
+    expect(failedStop.status).toBe(409);
+  });
+
+  it("does not disclose or cancel another session's active Discussion", async () => {
+    vi.useFakeTimers();
+    useFake([
+      {
+        type: "success",
+        result: generatedTurn,
+        delayMs: 100,
+        ignoreAbort: true,
+      },
+    ]);
+    const created = await handlers.post(
+      jsonRequest({ topic: "Should cities create more public parks?" }),
+    );
+    const ownerCookie = cookiePair(created);
+    const pendingTurn = handlers.postTurn(
+      jsonRequest({ requestId }, ownerCookie),
+      discussionId,
+    );
+    await waitForFakeCall();
+    const unrelatedToken = sessions.createToken(
+      "22222222-2222-4222-8222-222222222222",
+    );
+
+    const denied = await handlers.postStop(
+      new Request(`http://localhost/api/discussions/${discussionId}/stop`, {
+        method: "POST",
+        headers: {
+          Cookie: `${DISCUSSION_SESSION_COOKIE}=${unrelatedToken}`,
+        },
+      }),
+      discussionId,
+    );
+    expect(denied.status).toBe(404);
+    expect(fakeDiscussion.calls[0]?.signal?.aborted).toBe(false);
+
+    await handlers.postStop(
+      new Request(`http://localhost/api/discussions/${discussionId}/stop`, {
+        method: "POST",
+        headers: { Cookie: ownerCookie },
+      }),
+      discussionId,
+    );
+    await pendingTurn;
+  });
+
   it.each([
     {},
     { requestId: "not-a-uuid" },
@@ -375,7 +679,8 @@ describe("Discussion HTTP interface", () => {
       speaker: "supporter",
       transcript: [],
     });
-    expect(fakeDiscussion.calls[0]?.signal).toBe(turnRequest.signal);
+    expect(fakeDiscussion.calls[0]?.signal).not.toBe(turnRequest.signal);
+    expect(fakeDiscussion.calls[0]?.signal?.aborted).toBe(false);
 
     const persisted = await handlers.get(
       new Request(`http://localhost/api/discussions/${discussionId}`, {

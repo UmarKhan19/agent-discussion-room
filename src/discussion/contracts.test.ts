@@ -16,6 +16,7 @@ describe("external Discussion contracts", () => {
       id: "11111111-1111-4111-8111-111111111111",
       topic: "Should cities create more public parks?",
       status: "idle",
+      terminalReason: null,
       turnLimit: 12,
       turnCount: 0,
       createdAt: timestamp,
@@ -32,6 +33,56 @@ describe("external Discussion contracts", () => {
     expect(
       DiscussionStateSchema.safeParse({ ...initialState, turnCount: 1 }).success,
     ).toBe(false);
+  });
+
+  it("enforces terminal cancellation reasons against lifecycle state", () => {
+    const initialState = {
+      id: "11111111-1111-4111-8111-111111111111",
+      topic: "Should cities create more public parks?",
+      status: "idle",
+      terminalReason: null,
+      turnLimit: 12,
+      turnCount: 0,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      policyOutcome: {
+        decision: "allowed",
+        category: null,
+        checkedAt: timestamp,
+      },
+      transcript: [],
+    };
+
+    expect(
+      DiscussionStateSchema.safeParse({
+        ...initialState,
+        status: "stopped",
+        terminalReason: "stop",
+      }).success,
+    ).toBe(true);
+    expect(
+      DiscussionStateSchema.safeParse({
+        ...initialState,
+        status: "stopped",
+        terminalReason: "disconnect",
+      }).success,
+    ).toBe(true);
+    expect(
+      DiscussionStateSchema.safeParse({
+        ...initialState,
+        status: "failed",
+        terminalReason: "timeout",
+      }).success,
+    ).toBe(true);
+
+    for (const invalidState of [
+      { ...initialState, status: "idle", terminalReason: "stop" },
+      { ...initialState, status: "failed", terminalReason: "disconnect" },
+      { ...initialState, status: "stopped", terminalReason: "timeout" },
+      { ...initialState, status: "stopped", terminalReason: null },
+    ]) {
+      expect(DiscussionStateSchema.safeParse(invalidState).success).toBe(false);
+    }
   });
 
   it("accepts only a stable request identity for the next Turn", () => {
@@ -76,6 +127,7 @@ describe("external Discussion contracts", () => {
       id: "11111111-1111-4111-8111-111111111111",
       topic: "Should cities create more public parks?",
       status: "idle",
+      terminalReason: null,
       turnLimit: 12,
       turnCount: 1,
       createdAt: timestamp,

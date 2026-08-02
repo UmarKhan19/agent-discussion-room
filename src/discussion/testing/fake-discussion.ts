@@ -7,6 +7,8 @@ import {
 
 interface FakeOutcomeOptions {
   delayMs?: number;
+  /** Simulates a provider that accepts a signal but still resolves after abort. */
+  ignoreAbort?: boolean;
 }
 
 export type FakeDiscussionOutcome =
@@ -73,9 +75,15 @@ export class FakeDiscussion implements Discussion {
       throw new Error("No fake Discussion outcome was configured");
     }
 
-    await wait(outcome.delayMs ?? 0, input.signal);
+    await wait(
+      outcome.delayMs ?? 0,
+      outcome.ignoreAbort ? undefined : input.signal,
+    );
 
-    if (input.signal?.aborted || outcome.type === "cancellation") {
+    if (
+      (!outcome.ignoreAbort && input.signal?.aborted) ||
+      outcome.type === "cancellation"
+    ) {
       throw cancellationError();
     }
 
