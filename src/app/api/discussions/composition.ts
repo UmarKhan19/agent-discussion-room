@@ -1,6 +1,9 @@
 import { randomBytes } from "node:crypto";
 import { DiscussionRunner } from "@/discussion/discussion-runner";
-import { DiscussionService, InMemoryDiscussionStore } from "@/discussion/discussion-service";
+import {
+  DiscussionService,
+  InMemoryDiscussionStore,
+} from "@/discussion/discussion-service";
 import { SignedSessionManager } from "@/discussion/signed-session";
 import { discussion } from "@/mastra";
 import { createDiscussionHttpHandlers } from "./handler";
@@ -13,7 +16,13 @@ const processState = globalThis as typeof globalThis & {
 
 function createProcessHandlers(): DiscussionHttpHandlers {
   const store = new InMemoryDiscussionStore();
-  const service = new DiscussionService({ store, turnLimit: 12 });
+  const configuredTurnLimit = process.env.DISCUSSION_TURN_LIMIT;
+  const service = new DiscussionService({
+    store,
+    ...(configuredTurnLimit === undefined
+      ? {}
+      : { turnLimit: Number(configuredTurnLimit) }),
+  });
   const runner = new DiscussionRunner({ store, discussion });
   const processSigningKey =
     process.env.DISCUSSION_SESSION_SECRET ??

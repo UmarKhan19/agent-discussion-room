@@ -7,7 +7,9 @@ import {
   ErrorResponseSchema,
   NextTurnRequestSchema,
   TOPIC_MAX_LENGTH,
+  speakerForTurn,
   type DiscussionState,
+  type Speaker,
 } from "@/discussion/contracts";
 import { MessageList } from "./components/message-list";
 
@@ -58,36 +60,48 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [isStarting, setIsStarting] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [generatingSpeaker, setGeneratingSpeaker] = useState<Speaker | null>(
+    null,
+  );
 
-  async function generateFirstTurn(initialDiscussion: DiscussionState) {
+  async function advanceDiscussion(initialDiscussion: DiscussionState) {
     setIsGenerating(true);
+    let current = initialDiscussion;
+
     try {
-      const requestBody = NextTurnRequestSchema.parse({
-        requestId: crypto.randomUUID(),
-      });
-      const response = await fetch(
-        `/api/discussions/${initialDiscussion.id}`,
-        {
+      while (
+        current.status === "idle" &&
+        current.turnCount < current.turnLimit
+      ) {
+        const nextSpeaker = speakerForTurn(current.turnCount + 1);
+        setGeneratingSpeaker(nextSpeaker);
+
+        const requestBody = NextTurnRequestSchema.parse({
+          requestId: crypto.randomUUID(),
+        });
+        const response = await fetch(`/api/discussions/${current.id}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(requestBody),
-        },
-      );
-      const result = await readDiscussionResponse(
-        response,
-        "The first Turn could not be generated safely.",
-      );
-      if (!result.ok) {
-        setError(result.error);
-        return;
-      }
+        });
+        const result = await readDiscussionResponse(
+          response,
+          "The next Turn could not be generated safely.",
+        );
+        if (!result.ok) {
+          setError(result.error);
+          return;
+        }
 
-      setDiscussion(result.discussion);
+        current = result.discussion;
+        setDiscussion(current);
+      }
     } catch {
       setError(
-        "The first Turn could not be generated. Check your connection and try again.",
+        "The next Turn could not be generated. Check your connection and try again.",
       );
     } finally {
+      setGeneratingSpeaker(null);
       setIsGenerating(false);
     }
   }
@@ -102,6 +116,8 @@ export default function Home() {
       return;
     }
 
+    setDiscussion(null);
+    setGeneratingSpeaker(null);
     setIsStarting(true);
     try {
       const response = await fetch("/api/discussions", {
@@ -119,7 +135,7 @@ export default function Home() {
       }
 
       setDiscussion(result.discussion);
-      void generateFirstTurn(result.discussion);
+      void advanceDiscussion(result.discussion);
     } catch {
       setError("The Discussion could not be started. Check your connection and try again.");
     } finally {
@@ -183,9 +199,14 @@ export default function Home() {
           <p aria-label="Turn progress">
             {discussion.turnCount} / {discussion.turnLimit} Turns
           </p>
-          {isGenerating ? (
+          {isGenerating && generatingSpeaker ? (
             <p role="status" aria-live="polite" className="font-semibold">
-              Generating Supporter Turn…
+              Generating {generatingSpeaker === "supporter" ? "Supporter" : "Opponent"} Turn…
+            </p>
+          ) : null}
+          {discussion.status === "completed" ? (
+            <p role="status" aria-live="polite" className="font-semibold">
+              Discussion completed.
             </p>
           ) : null}
           <div className="rounded-lg border border-neutral-500 p-6">

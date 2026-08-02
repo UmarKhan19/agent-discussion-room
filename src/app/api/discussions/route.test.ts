@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { DiscussionResponseSchema, ErrorResponseSchema } from "@/discussion/contracts";
 import { GET, POST as POST_TURN } from "./[id]/route";
 import { POST } from "./route";
@@ -9,6 +9,31 @@ function expectPrivateSessionResponse(response: Response): void {
 }
 
 describe("Discussion routes", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    delete (globalThis as { discussionHttpHandlers?: unknown })
+      .discussionHttpHandlers;
+  });
+
+  it("uses a lower server-configured Turn limit", async () => {
+    vi.stubEnv("DISCUSSION_TURN_LIMIT", "2");
+    delete (globalThis as { discussionHttpHandlers?: unknown })
+      .discussionHttpHandlers;
+    vi.resetModules();
+    const { POST: configuredPost } = await import("./route");
+
+    const created = await configuredPost(
+      new Request("http://localhost/api/discussions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ topic: "How cities can improve public parks" }),
+      }),
+    );
+    const discussion = DiscussionResponseSchema.parse(await created.json());
+
+    expect(discussion.turnLimit).toBe(2);
+  });
+
   it("wires an ownership-protected next-Turn POST on the Discussion resource", async () => {
     const created = await POST(
       new Request("http://localhost/api/discussions", {

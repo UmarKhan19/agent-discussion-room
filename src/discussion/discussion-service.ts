@@ -1,5 +1,7 @@
 import { z } from "zod";
 import {
+  DEFAULT_DISCUSSION_TURN_LIMIT,
+  HARD_DISCUSSION_TURN_LIMIT,
   DiscussionStateSchema,
   DiscussionTopicSchema,
   SessionIdentifierSchema,
@@ -82,7 +84,11 @@ export interface DiscussionServiceOptions {
   createId?: () => string;
 }
 
-const TurnLimitSchema = z.number().int().positive().max(100);
+const TurnLimitSchema = z
+  .number()
+  .int()
+  .positive()
+  .max(HARD_DISCUSSION_TURN_LIMIT);
 
 /** Owns creation and ownership-aware reads of Discussion state. */
 export class DiscussionService {
@@ -95,7 +101,9 @@ export class DiscussionService {
   constructor(options: DiscussionServiceOptions = {}) {
     this.store = options.store ?? new InMemoryDiscussionStore();
     this.policy = options.policy ?? new DiscussionPolicy(options.now);
-    this.turnLimit = TurnLimitSchema.parse(options.turnLimit ?? 12);
+    this.turnLimit = TurnLimitSchema.parse(
+      options.turnLimit ?? DEFAULT_DISCUSSION_TURN_LIMIT,
+    );
     this.now = options.now ?? (() => new Date());
     this.createId = options.createId ?? (() => crypto.randomUUID());
   }

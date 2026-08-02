@@ -26,11 +26,8 @@ export interface MastraDiscussionAgent {
 
 export type MastraDiscussionAgents = Record<Speaker, MastraDiscussionAgent>;
 
-const RECENT_TRANSCRIPT_LIMIT = 8;
-
 function buildPrompt(input: GenerateDiscussionTurnInput): string {
   const transcript = input.transcript
-    .slice(-RECENT_TRANSCRIPT_LIMIT)
     .map(
       (message) =>
         `${message.speaker === "supporter" ? "Supporter" : "Opponent"}: ${message.content}`,

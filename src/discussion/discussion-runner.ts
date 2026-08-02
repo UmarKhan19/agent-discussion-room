@@ -3,6 +3,7 @@ import {
   DiscussionMessageSchema,
   RequestIdentifierSchema,
   SessionIdentifierSchema,
+  speakerForTurn,
   type DiscussionState,
   type PolicyOutcome,
 } from "./contracts";
@@ -18,8 +19,15 @@ import {
 
 export class DiscussionInvalidStateError extends Error {
   constructor() {
-    super("Discussion is not eligible for its first Turn");
+    super("Discussion is not eligible for another Turn");
     this.name = "DiscussionInvalidStateError";
+  }
+}
+
+export class DiscussionCompletedError extends Error {
+  constructor() {
+    super("Discussion has completed its configured Turn limit");
+    this.name = "DiscussionCompletedError";
   }
 }
 
@@ -57,17 +65,46 @@ export interface DiscussionRunnerOptions {
 function isRunnerError(
   error: unknown,
 ): error is
+  | DiscussionCompletedError
   | DiscussionInvalidStateError
   | DiscussionOutputPolicyBlockedError
   | DiscussionInvalidGeneratedTurnError {
   return (
+    error instanceof DiscussionCompletedError ||
     error instanceof DiscussionInvalidStateError ||
     error instanceof DiscussionOutputPolicyBlockedError ||
     error instanceof DiscussionInvalidGeneratedTurnError
   );
 }
 
-/** Sole authority for first-Turn lifecycle, Speaker selection, policy, and commit. */
+const RECENT_TRANSCRIPT_TURN_LIMIT = 8;
+const TRANSCRIPT_CHARACTER_BUDGET = 32_000;
+
+function selectGenerationTranscript(
+  transcript: DiscussionState["transcript"],
+): DiscussionState["transcript"] {
+  const selected = [] as DiscussionState["transcript"];
+  let characterCount = 0;
+
+  for (
+    let index = transcript.length - 1;
+    index >= 0 && selected.length < RECENT_TRANSCRIPT_TURN_LIMIT;
+    index -= 1
+  ) {
+    const message = transcript[index];
+    if (!message) continue;
+    if (characterCount + message.content.length > TRANSCRIPT_CHARACTER_BUDGET) {
+      break;
+    }
+
+    selected.unshift(message);
+    characterCount += message.content.length;
+  }
+
+  return selected;
+}
+
+/** Sole authority for next-Turn lifecycle, Speaker selection, policy, and commit. */
 export class DiscussionRunner {
   private readonly store: DiscussionStore;
   private readonly discussion: Discussion;
@@ -99,7 +136,10 @@ export class DiscussionRunner {
       sessionId,
       id,
       (current) => {
-        if (current.status !== "idle" || current.turnCount !== 0) {
+        if (current.status === "completed") {
+          throw new DiscussionCompletedError();
+        }
+        if (current.status !== "idle" || current.turnCount >= current.turnLimit) {
           throw new DiscussionInvalidStateError();
         }
 
@@ -113,12 +153,18 @@ export class DiscussionRunner {
 
     if (!generating) return null;
 
+    const turn = generating.turnCount + 1;
+    const speaker = speakerForTurn(turn);
+    const generationTranscript = selectGenerationTranscript(
+      generating.transcript,
+    );
+
     try {
       const generatedResult = GeneratedDiscussionTurnSchema.safeParse(
         await this.discussion.generateTurn({
           topic: generating.topic,
-          speaker: "supporter",
-          transcript: generating.transcript,
+          speaker,
+          transcript: generationTranscript,
           signal,
         }),
       );
@@ -137,9 +183,9 @@ export class DiscussionRunner {
       const messageResult = DiscussionMessageSchema.safeParse({
         id: this.createMessageId(),
         content: generatedResult.data.content,
-        speaker: "supporter",
+        speaker,
         createdAt: timestamp,
-        turn: 1,
+        turn,
         generation: {
           requestId: stableRequestId,
           ...(generatedResult.data.usage
@@ -156,16 +202,19 @@ export class DiscussionRunner {
         sessionId,
         id,
         (current) => {
-          if (current.status !== "generating" || current.turnCount !== 0) {
+          if (
+            current.status !== "generating" ||
+            current.turnCount !== turn - 1
+          ) {
             throw new DiscussionInvalidStateError();
           }
 
           return {
             ...current,
-            status: "idle",
-            turnCount: 1,
+            status: turn === current.turnLimit ? "completed" : "idle",
+            turnCount: turn,
             updatedAt: timestamp,
-            transcript: [messageResult.data],
+            transcript: [...current.transcript, messageResult.data],
           };
         },
       );

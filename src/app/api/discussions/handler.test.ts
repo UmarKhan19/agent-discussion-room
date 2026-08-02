@@ -25,6 +25,23 @@ const discussionId = "11111111-1111-4111-8111-111111111111";
 const requestId = "22222222-2222-4222-8222-222222222222";
 const secondRequestId = "44444444-4444-4444-8444-444444444444";
 const messageId = "33333333-3333-4333-8333-333333333333";
+
+function turnRequestId(turn: number): string {
+  return `22222222-2222-4222-8222-${String(turn).padStart(12, "0")}`;
+}
+
+function turnMessageId(turn: number): string {
+  return turn === 1
+    ? messageId
+    : `33333333-3333-4333-8333-${String(turn).padStart(12, "0")}`;
+}
+
+function successfulOutcomes(contents: readonly string[]): FakeDiscussionOutcome[] {
+  return contents.map((content) => ({
+    type: "success",
+    result: { content },
+  }));
+}
 const signingKey = "test-signing-key-that-is-at-least-32-characters";
 const generatedTurn = {
   content: "Public parks give more residents access to shared green space.",
@@ -73,6 +90,7 @@ function nonCanonicalSignatureAlias(cookie: string): string {
 
 describe("Discussion HTTP interface", () => {
   let idCalls: number;
+  let messageIdCalls: number;
   let sessions: SignedSessionManager;
   let store: InMemoryDiscussionStore;
   let service: DiscussionService;
@@ -85,9 +103,27 @@ describe("Discussion HTTP interface", () => {
       discussion,
       outputPolicy: new DiscussionOutputPolicy(() => now),
       now: () => now,
-      createMessageId: () => messageId,
+      createMessageId: () => {
+        messageIdCalls += 1;
+        return turnMessageId(messageIdCalls);
+      },
     });
     handlers = createDiscussionHttpHandlers(service, sessions, runner);
+  }
+
+  function configureService(turnLimit?: number): void {
+    store = new InMemoryDiscussionStore();
+    const policy = new DiscussionPolicy(() => now);
+    service = new DiscussionService({
+      store,
+      policy,
+      ...(turnLimit === undefined ? {} : { turnLimit }),
+      now: () => now,
+      createId: () => {
+        idCalls += 1;
+        return discussionId;
+      },
+    });
   }
 
   function useFake(outcomes: readonly FakeDiscussionOutcome[]): void {
@@ -101,20 +137,15 @@ describe("Discussion HTTP interface", () => {
 
   beforeEach(() => {
     idCalls = 0;
+    messageIdCalls = 0;
     sessions = new SignedSessionManager(signingKey);
-    store = new InMemoryDiscussionStore();
-    const policy = new DiscussionPolicy(() => now);
-    service = new DiscussionService({
-      store,
-      policy,
-      turnLimit: 6,
-      now: () => now,
-      createId: () => {
-        idCalls += 1;
-        return discussionId;
-      },
-    });
+    configureService(6);
     useFake([{ type: "success", result: generatedTurn }]);
+  });
+
+  it("enforces the server configuration range of 1 through 12 Turns", () => {
+    expect(() => configureService(0)).toThrow();
+    expect(() => configureService(13)).toThrow();
   });
 
   it("creates a server-owned, runtime-valid initial Discussion", async () => {
@@ -156,6 +187,7 @@ describe("Discussion HTTP interface", () => {
       { topic: "A Topic", speaker: "supporter", messages: [] },
       "INVALID_REQUEST",
     ],
+    [{ topic: "A Topic", turnLimit: 100 }, "INVALID_REQUEST"],
   ])("rejects invalid input %# before creating state", async (body, code) => {
     const response = await handlers.post(jsonRequest(body));
     const payload = ErrorResponseSchema.parse(await response.json());
@@ -354,34 +386,118 @@ describe("Discussion HTTP interface", () => {
     expect(DiscussionStateSchema.parse(await persisted.json())).toEqual(payload);
   });
 
-  it("rejects another next-Turn request from an ineligible state", async () => {
+  it("derives alternating Speakers and appends Turns from persisted state", async () => {
+    useFake(successfulOutcomes(["Turn one", "Turn two", "Turn three"]));
     const created = await handlers.post(
       jsonRequest({ topic: "Should cities create more public parks?" }),
     );
     const ownerCookie = cookiePair(created);
-    const firstTurn = await handlers.postTurn(
-      jsonRequest(
-        { requestId },
-        ownerCookie,
-        `http://localhost/api/discussions/${discussionId}`,
-      ),
+
+    let state = DiscussionStateSchema.parse(await created.clone().json());
+    for (let turn = 1; turn <= 3; turn += 1) {
+      const response = await handlers.postTurn(
+        jsonRequest(
+          { requestId: turnRequestId(turn) },
+          ownerCookie,
+          `http://localhost/api/discussions/${discussionId}`,
+        ),
+        discussionId,
+      );
+      state = DiscussionStateSchema.parse(await response.json());
+    }
+
+    expect(state.transcript.map(({ turn, speaker, content }) => ({
+      turn,
+      speaker,
+      content,
+    }))).toEqual([
+      { turn: 1, speaker: "supporter", content: "Turn one" },
+      { turn: 2, speaker: "opponent", content: "Turn two" },
+      { turn: 3, speaker: "supporter", content: "Turn three" },
+    ]);
+    expect(fakeDiscussion.calls.map((call) => call.speaker)).toEqual([
+      "supporter",
+      "opponent",
+      "supporter",
+    ]);
+    expect(fakeDiscussion.calls.map((call) => call.transcript.map((message) => message.turn))).toEqual([
+      [],
+      [1],
+      [1, 2],
+    ]);
+  });
+
+  it("sends only the newest eight completed Turns in chronological order", async () => {
+    configureService(12);
+    useFake(successfulOutcomes(Array.from({ length: 11 }, (_, index) => `Turn ${index + 1}`)));
+    const created = await handlers.post(jsonRequest({ topic: "A permitted Topic" }));
+    const ownerCookie = cookiePair(created);
+
+    for (let turn = 1; turn <= 11; turn += 1) {
+      const response = await handlers.postTurn(
+        jsonRequest({ requestId: turnRequestId(turn) }, ownerCookie),
+        discussionId,
+      );
+      expect(response.status).toBe(200);
+    }
+
+    expect(fakeDiscussion.calls[10]?.transcript.map((message) => message.turn)).toEqual([
+      3, 4, 5, 6, 7, 8, 9, 10,
+    ]);
+  });
+
+  it("drops oldest whole Turns until the 32,000-character context budget fits", async () => {
+    configureService(6);
+    const contents = [
+      `one-${"a".repeat(9_996)}`,
+      `two-${"b".repeat(9_996)}`,
+      `three-${"c".repeat(9_994)}`,
+      `four-${"d".repeat(9_995)}`,
+      "final",
+    ];
+    useFake(successfulOutcomes(contents));
+    const created = await handlers.post(jsonRequest({ topic: "A permitted Topic" }));
+    const ownerCookie = cookiePair(created);
+
+    for (let turn = 1; turn <= 5; turn += 1) {
+      const response = await handlers.postTurn(
+        jsonRequest({ requestId: turnRequestId(turn) }, ownerCookie),
+        discussionId,
+      );
+      expect(response.status).toBe(200);
+    }
+
+    const boundedTranscript = fakeDiscussion.calls[4]?.transcript ?? [];
+    expect(boundedTranscript.map((message) => message.turn)).toEqual([2, 3, 4]);
+    expect(boundedTranscript.reduce((total, message) => total + message.content.length, 0)).toBe(30_000);
+    expect(boundedTranscript.map((message) => message.content)).toEqual(contents.slice(1, 4));
+  });
+
+  it("completes at the default 12-Turn limit and terminally rejects a thirteenth generation", async () => {
+    configureService();
+    useFake(successfulOutcomes(Array.from({ length: 13 }, (_, index) => `Turn ${index + 1}`)));
+    const created = await handlers.post(jsonRequest({ topic: "A permitted Topic" }));
+    const ownerCookie = cookiePair(created);
+
+    let state = DiscussionStateSchema.parse(await created.clone().json());
+    for (let turn = 1; turn <= 12; turn += 1) {
+      const response = await handlers.postTurn(
+        jsonRequest({ requestId: turnRequestId(turn) }, ownerCookie),
+        discussionId,
+      );
+      state = DiscussionStateSchema.parse(await response.json());
+      expect(state.status).toBe(turn === 12 ? "completed" : "idle");
+      expect(state.turnCount).toBe(turn);
+    }
+
+    const terminalResponse = await handlers.postTurn(
+      jsonRequest({ requestId: turnRequestId(13) }, ownerCookie),
       discussionId,
     );
-    expect(firstTurn.status).toBe(200);
-
-    const response = await handlers.postTurn(
-      jsonRequest(
-        { requestId: secondRequestId },
-        ownerCookie,
-        `http://localhost/api/discussions/${discussionId}`,
-      ),
-      discussionId,
-    );
-    const payload = ErrorResponseSchema.parse(await response.json());
-
-    expect(response.status).toBe(409);
-    expect(payload.error.code).toBe("INVALID_DISCUSSION_STATE");
-    expect(fakeDiscussion.calls).toHaveLength(1);
+    const terminalError = ErrorResponseSchema.parse(await terminalResponse.json());
+    expect(terminalResponse.status).toBe(409);
+    expect(terminalError.error.code).toBe("DISCUSSION_COMPLETED");
+    expect(fakeDiscussion.calls).toHaveLength(12);
 
     const persisted = await handlers.get(
       new Request(`http://localhost/api/discussions/${discussionId}`, {
@@ -389,10 +505,34 @@ describe("Discussion HTTP interface", () => {
       }),
       discussionId,
     );
-    expect(DiscussionStateSchema.parse(await persisted.json())).toMatchObject({
+    expect(DiscussionStateSchema.parse(await persisted.json())).toEqual(state);
+  });
+
+  it("completes exactly at a lower server-configured limit", async () => {
+    configureService(2);
+    useFake(successfulOutcomes(["First", "Second", "Unused"]));
+    const created = await handlers.post(jsonRequest({ topic: "A permitted Topic" }));
+    const ownerCookie = cookiePair(created);
+
+    const first = await handlers.postTurn(
+      jsonRequest({ requestId }, ownerCookie),
+      discussionId,
+    );
+    expect(DiscussionStateSchema.parse(await first.json())).toMatchObject({
       status: "idle",
+      turnLimit: 2,
       turnCount: 1,
     });
+    const second = await handlers.postTurn(
+      jsonRequest({ requestId: secondRequestId }, ownerCookie),
+      discussionId,
+    );
+    expect(DiscussionStateSchema.parse(await second.json())).toMatchObject({
+      status: "completed",
+      turnLimit: 2,
+      turnCount: 2,
+    });
+    expect(fakeDiscussion.calls).toHaveLength(2);
   });
 
   it("rejects an invalid generated response without exposing internal fields", async () => {

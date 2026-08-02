@@ -8,6 +8,7 @@ import {
   type ProductError,
 } from "@/discussion/contracts";
 import {
+  DiscussionCompletedError,
   DiscussionGenerationFailedError,
   DiscussionInvalidGeneratedTurnError,
   DiscussionInvalidStateError,
@@ -233,12 +234,24 @@ export function createDiscussionHttpHandlers(
 
         return discussionResponse(discussion, 200, session.setCookie);
       } catch (error) {
+        if (error instanceof DiscussionCompletedError) {
+          return errorResponse(
+            409,
+            {
+              code: "DISCUSSION_COMPLETED",
+              message: "This Discussion has completed its configured Turn limit.",
+              action: "Start a new Discussion to continue with a fresh Topic and Transcript.",
+            },
+            session.setCookie,
+          );
+        }
+
         if (error instanceof DiscussionInvalidStateError) {
           return errorResponse(
             409,
             {
               code: "INVALID_DISCUSSION_STATE",
-              message: "This Discussion is not eligible for its first Turn.",
+              message: "This Discussion is not eligible for another Turn.",
               action: "Read the current Discussion state before requesting another Turn.",
             },
             session.setCookie,
@@ -275,7 +288,7 @@ export function createDiscussionHttpHandlers(
             502,
             {
               code: "GENERATION_FAILED",
-              message: "The first Turn could not be generated safely.",
+              message: "The next Turn could not be generated safely.",
               action: "Start a new Discussion or try again later.",
             },
             session.setCookie,
