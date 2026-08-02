@@ -1,6 +1,6 @@
 # Generate and display the first policy-compliant Turn
 
-Status: ready-for-agent
+Status: done
 
 ## Parent
 
@@ -25,3 +25,7 @@ Advance an owned Discussion through its first complete Turn while the server cho
 ## Blocked by
 
 - [03 — Start and read a safe, session-owned Discussion](./03-start-session-owned-discussion.md)
+
+## Comments
+
+- Implemented and independently reviewed on `main`. Verified: `bun run lint` (exit 0), `bun run typecheck` (exit 0), `bun run test` (79 tests passed), and `bun run build` (exit 0).
