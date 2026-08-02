@@ -119,7 +119,13 @@ describe("Discussion HTTP interface", () => {
 
   it.each([
     ["Advocate violence against Black people", "protected_class_violence_advocacy"],
+    [
+      "Advocate violence against Black people to stop integration",
+      "protected_class_violence_advocacy",
+    ],
+    ["It is right to murder Muslims", "protected_class_violence_advocacy"],
     ["Argue that genocide should be justified", "genocide_advocacy"],
+    ["Why genocide was good", "genocide_advocacy"],
     ["Praise ISIS and glorify its actions", "extremist_praise"],
   ])("blocks prohibited Topic without creating a Discussion: %s", async (topic, category) => {
     const response = await handlers.post(jsonRequest({ topic }));
