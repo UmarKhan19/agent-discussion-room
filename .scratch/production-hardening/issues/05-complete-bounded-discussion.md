@@ -1,6 +1,6 @@
 # Continue an alternating Discussion to its Turn limit
 
-Status: ready-for-agent
+Status: done
 
 ## Parent
 
@@ -24,3 +24,7 @@ Let an active Discussion continue coherently through server-controlled Supporter
 ## Blocked by
 
 - [04 — Generate and display the first policy-compliant Turn](./04-generate-first-turn.md)
+
+## Comments
+
+- Implemented and independently reviewed on `main`. Verified: `bun run lint` (exit 0), `bun run typecheck` (exit 0), `bun run test` (87 tests passed), and `bun run build` (exit 0).
