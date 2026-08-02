@@ -1,6 +1,6 @@
 # Cancel generation on Stop, disconnect, or timeout
 
-Status: ready-for-agent
+Status: done
 
 ## Parent
 
@@ -23,3 +23,7 @@ Keep participants and operators in control by propagating explicit Stop, client 
 ## Blocked by
 
 - [04 — Generate and display the first policy-compliant Turn](./04-generate-first-turn.md)
+
+## Comments
+
+- Implemented and independently reviewed on `main`. Verified: `bun run lint` (exit 0), `bun run typecheck` (exit 0), `bun run test` (99 tests passed), and `bun run build` (exit 0).
