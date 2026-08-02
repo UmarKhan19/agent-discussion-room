@@ -13,6 +13,8 @@ import {
   DiscussionGenerationTimeoutError,
   DiscussionInvalidGeneratedTurnError,
   DiscussionInvalidStateError,
+  DiscussionRequestInProgressError,
+  DiscussionTurnInProgressError,
   DiscussionOutputPolicyBlockedError,
   DiscussionStoppedError,
   type DiscussionRunner,
@@ -27,12 +29,18 @@ import {
 } from "@/discussion/policy";
 import type { SignedSessionManager } from "@/discussion/signed-session";
 
+type ProductErrorInput = Omit<ProductError, "retryable"> & {
+  retryable?: boolean;
+};
+
 function errorResponse(
   status: number,
-  error: ProductError,
+  error: ProductErrorInput,
   setCookie?: string,
 ): Response {
-  const body = ErrorResponseSchema.parse({ error });
+  const body = ErrorResponseSchema.parse({
+    error: { ...error, retryable: error.retryable ?? false },
+  });
   const headers = new Headers({
     "Cache-Control": "private, no-store",
     "Content-Type": "application/json",
@@ -57,7 +65,7 @@ function discussionResponse(
   return new Response(JSON.stringify(body), { status, headers });
 }
 
-function invalidNextTurnRequest(body: unknown): ProductError {
+function invalidNextTurnRequest(body: unknown): ProductErrorInput {
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     return {
       code: "INVALID_REQUEST",
@@ -82,7 +90,7 @@ function invalidNextTurnRequest(body: unknown): ProductError {
   };
 }
 
-function invalidStartRequest(body: unknown): ProductError {
+function invalidStartRequest(body: unknown): ProductErrorInput {
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     return {
       code: "INVALID_REQUEST",
@@ -179,6 +187,7 @@ export function createDiscussionHttpHandlers(
             code: "INVALID_RESPONSE",
             message: "The Discussion could not be created safely.",
             action: "Try again with the same Topic.",
+            retryable: true,
           },
           session.setCookie,
         );
@@ -236,6 +245,32 @@ export function createDiscussionHttpHandlers(
 
         return discussionResponse(discussion, 200, session.setCookie);
       } catch (error) {
+        if (error instanceof DiscussionRequestInProgressError) {
+          return errorResponse(
+            409,
+            {
+              code: "REQUEST_IN_PROGRESS",
+              message: "This next-Turn request is already being generated.",
+              action: "Wait for the active request to finish, then retry with the same requestId.",
+              retryable: true,
+            },
+            session.setCookie,
+          );
+        }
+
+        if (error instanceof DiscussionTurnInProgressError) {
+          return errorResponse(
+            409,
+            {
+              code: "TURN_IN_PROGRESS",
+              message: "Another next-Turn request is already being generated for this Discussion.",
+              action: "Wait for the active Turn to finish before requesting another Turn.",
+              retryable: true,
+            },
+            session.setCookie,
+          );
+        }
+
         if (error instanceof DiscussionCompletedError) {
           return errorResponse(
             409,
@@ -267,7 +302,7 @@ export function createDiscussionHttpHandlers(
               code: "OUTPUT_BLOCKED",
               message: "The generated Turn did not pass the Discussion output policy.",
               action: SAFE_OUTPUT_ALTERNATIVE,
-              category: error.outcome.category,
+              category: error.category,
             },
             session.setCookie,
           );
@@ -315,7 +350,10 @@ export function createDiscussionHttpHandlers(
             {
               code: "GENERATION_FAILED",
               message: "The next Turn could not be generated safely.",
-              action: "Start a new Discussion or try again later.",
+              action: error.retryable
+                ? "Retry this Turn with the same request identity."
+                : "Start a new Discussion or try again later.",
+              retryable: error.retryable,
             },
             session.setCookie,
           );
@@ -381,6 +419,7 @@ export function createDiscussionHttpHandlers(
             code: "INVALID_RESPONSE",
             message: "The Discussion could not be stopped safely.",
             action: "Read the current Discussion state before trying again.",
+            retryable: true,
           },
           session.setCookie,
         );

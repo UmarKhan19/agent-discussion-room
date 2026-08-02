@@ -184,6 +184,100 @@ describe("participant-visible Discussion start", () => {
     )).toEqual([firstRequestId, secondRequestId]);
   });
 
+  it("retries a retryable server failure with the same logical request identity", async () => {
+    const boundedInitial = { ...initialDiscussion, turnLimit: 1 };
+    const completed = {
+      ...discussionWithFirstTurn,
+      status: "completed",
+      turnLimit: 1,
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(boundedInitial), { status: 201 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              code: "GENERATION_FAILED",
+              message: "The next Turn could not be generated safely.",
+              action: "Retry this Turn with the same request identity.",
+              retryable: true,
+            },
+          }),
+          { status: 502 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(completed), { status: 200 }),
+      );
+    const randomUUID = vi.fn(() => requestId);
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID });
+    const user = userEvent.setup();
+
+    render(<Home />);
+    await user.type(
+      screen.getByRole("textbox", { name: "Discussion Topic" }),
+      topic,
+    );
+    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+
+    const retry = await screen.findByRole("button", { name: "Retry Turn" });
+    expect(screen.getByRole("alert").textContent).toContain(
+      "Retry this Turn with the same request identity.",
+    );
+    await user.click(retry);
+
+    expect(await screen.findByText("Discussion completed.")).toBeTruthy();
+    expect(randomUUID).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls.slice(1).map((call) =>
+      NextTurnRequestSchema.parse(JSON.parse(String(call[1]?.body))).requestId,
+    )).toEqual([requestId, requestId]);
+  });
+
+  it("retries an ambiguous network failure with the same logical request identity", async () => {
+    const boundedInitial = { ...initialDiscussion, turnLimit: 1 };
+    const completed = {
+      ...discussionWithFirstTurn,
+      status: "completed",
+      turnLimit: 1,
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(boundedInitial), { status: 201 }),
+      )
+      .mockRejectedValueOnce(new Error("connection reset after commit status unknown"))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(completed), { status: 200 }),
+      );
+    const randomUUID = vi.fn(() => requestId);
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID });
+    const user = userEvent.setup();
+
+    render(<Home />);
+    await user.type(
+      screen.getByRole("textbox", { name: "Discussion Topic" }),
+      topic,
+    );
+    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+
+    const retry = await screen.findByRole("button", { name: "Retry Turn" });
+    expect(screen.getByRole("alert").textContent).toContain(
+      "Check your connection and try again.",
+    );
+    await user.click(retry);
+
+    expect(await screen.findByText("Discussion completed.")).toBeTruthy();
+    expect(randomUUID).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls.slice(1).map((call) =>
+      NextTurnRequestSchema.parse(JSON.parse(String(call[1]?.body))).requestId,
+    )).toEqual([requestId, requestId]);
+  });
+
   it("starts a fresh Discussion without reusing prior lifecycle state", async () => {
     const secondTopic = "Should libraries stay open later?";
     const secondDiscussionId = "66666666-6666-4666-8666-666666666666";
@@ -377,6 +471,7 @@ describe("participant-visible Discussion start", () => {
               code: "INVALID_RESPONSE",
               message: "The Discussion could not be stopped safely.",
               action: "Read the current Discussion state before trying again.",
+              retryable: true,
             },
           }),
           { status: 500 },
@@ -457,6 +552,7 @@ describe("participant-visible Discussion start", () => {
               code: "GENERATION_TIMEOUT",
               message: "The next Turn reached the server generation timeout.",
               action: "Start a new Discussion and try again later.",
+              retryable: false,
             },
           }),
           { status: 504 },
@@ -545,6 +641,7 @@ describe("participant-visible Discussion start", () => {
               code: "GENERATION_TIMEOUT",
               message: "The next Turn reached the server generation timeout.",
               action: "Start a new Discussion and try again later.",
+              retryable: false,
             },
           }),
           { status: 504 },
@@ -618,6 +715,7 @@ describe("participant-visible Discussion start", () => {
               code: "GENERATION_TIMEOUT",
               message: "The next Turn reached the server generation timeout.",
               action: "Start a new Discussion and try again later.",
+              retryable: false,
             },
           }),
           { status: 504 },

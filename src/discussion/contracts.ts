@@ -199,6 +199,8 @@ export const ProductErrorCodeSchema = z.enum([
   "TOPIC_BLOCKED",
   "INVALID_DISCUSSION_ID",
   "DISCUSSION_NOT_FOUND",
+  "REQUEST_IN_PROGRESS",
+  "TURN_IN_PROGRESS",
   "INVALID_DISCUSSION_STATE",
   "DISCUSSION_COMPLETED",
   "DISCUSSION_STOPPED",
@@ -213,6 +215,7 @@ export const ProductErrorSchema = z
     code: ProductErrorCodeSchema,
     message: z.string().min(1),
     action: z.string().min(1),
+    retryable: z.boolean(),
     category: PolicyCategorySchema.optional(),
   })
   .strict();

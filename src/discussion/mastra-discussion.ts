@@ -49,6 +49,47 @@ ${
     `.trim();
 }
 
+const RETRYABLE_PROVIDER_CODES = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "EAI_AGAIN",
+  "ETIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_SOCKET",
+]);
+
+function isRetryableProviderError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+
+  try {
+    const candidate = error as Record<string, unknown>;
+    if (candidate.isRetryable === true) return true;
+
+    const status =
+      typeof candidate.status === "number"
+        ? candidate.status
+        : typeof candidate.statusCode === "number"
+          ? candidate.statusCode
+          : undefined;
+    if (
+      status === 408 ||
+      status === 425 ||
+      status === 429 ||
+      (status !== undefined && status >= 500 && status <= 599)
+    ) {
+      return true;
+    }
+
+    return (
+      typeof candidate.code === "string" &&
+      RETRYABLE_PROVIDER_CODES.has(candidate.code)
+    );
+  } catch {
+    return false;
+  }
+}
+
 function normalizeUsage(
   usage: MastraGenerationResponse["usage"],
 ): DiscussionUsage | undefined {
@@ -98,7 +139,10 @@ export class MastraDiscussion implements Discussion {
         throw new DiscussionCancelledError();
       }
 
-      throw new DiscussionGenerationError(error);
+      throw new DiscussionGenerationError(
+        error,
+        isRetryableProviderError(error),
+      );
     }
   }
 }

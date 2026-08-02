@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DiscussionStateSchema, ErrorResponseSchema } from "@/discussion/contracts";
 import { DiscussionRunner } from "@/discussion/discussion-runner";
-import type { Discussion } from "@/discussion/discussion";
+import {
+  DiscussionGenerationError,
+  type Discussion,
+} from "@/discussion/discussion";
 import {
   DiscussionService,
   InMemoryDiscussionStore,
@@ -306,6 +309,220 @@ describe("Discussion HTTP interface", () => {
       status: "idle",
       turnCount: 1,
     });
+  });
+
+  it("rejects an active duplicate request identity without a second generation", async () => {
+    vi.useFakeTimers();
+    useFake([{ type: "success", result: generatedTurn, delayMs: 100 }]);
+    const created = await handlers.post(
+      jsonRequest({ topic: "Should cities create more public parks?" }),
+    );
+    const ownerCookie = cookiePair(created);
+
+    const pendingTurn = handlers.postTurn(
+      jsonRequest({ requestId }, ownerCookie),
+      discussionId,
+    );
+    await waitForFakeCall();
+
+    const duplicate = await handlers.postTurn(
+      jsonRequest({ requestId }, ownerCookie),
+      discussionId,
+    );
+    const duplicateError = ErrorResponseSchema.parse(await duplicate.json());
+
+    expect(duplicate.status).toBe(409);
+    expect(duplicateError.error).toMatchObject({
+      code: "REQUEST_IN_PROGRESS",
+      retryable: true,
+    });
+    expect(fakeDiscussion.calls).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(100);
+    expect((await pendingTurn).status).toBe(200);
+  });
+
+  it("rejects a competing request identity across Runner instances sharing one store", async () => {
+    vi.useFakeTimers();
+    useFake([{ type: "success", result: generatedTurn, delayMs: 100 }]);
+    const created = await handlers.post(
+      jsonRequest({ topic: "Should cities create more public parks?" }),
+    );
+    const ownerCookie = cookiePair(created);
+    const pendingTurn = handlers.postTurn(
+      jsonRequest({ requestId }, ownerCookie),
+      discussionId,
+    );
+    await waitForFakeCall();
+
+    const competingRunner = new DiscussionRunner({
+      store,
+      discussion: fakeDiscussion,
+      outputPolicy: new DiscussionOutputPolicy(() => now),
+      now: () => now,
+      createMessageId: () => messageId,
+    });
+    const competingHandlers = createDiscussionHttpHandlers(
+      service,
+      sessions,
+      competingRunner,
+    );
+    const competing = await competingHandlers.postTurn(
+      jsonRequest({ requestId: secondRequestId }, ownerCookie),
+      discussionId,
+    );
+    const competingError = ErrorResponseSchema.parse(await competing.json());
+
+    expect(competing.status).toBe(409);
+    expect(competingError.error).toMatchObject({
+      code: "TURN_IN_PROGRESS",
+      retryable: true,
+    });
+    expect(fakeDiscussion.calls).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(100);
+    expect((await pendingTurn).status).toBe(200);
+  });
+
+  it("replays a committed request through a reconstructed Runner without generating again", async () => {
+    const created = await handlers.post(
+      jsonRequest({ topic: "Should cities create more public parks?" }),
+    );
+    const ownerCookie = cookiePair(created);
+    const first = await handlers.postTurn(
+      jsonRequest({ requestId }, ownerCookie),
+      discussionId,
+    );
+    const committed = DiscussionStateSchema.parse(await first.json());
+
+    const reconstructedRunner = new DiscussionRunner({
+      store,
+      discussion: fakeDiscussion,
+      outputPolicy: new DiscussionOutputPolicy(() => now),
+      now: () => now,
+      createMessageId: () => {
+        throw new Error("Replay must not create a Message identifier");
+      },
+    });
+    const reconstructedHandlers = createDiscussionHttpHandlers(
+      service,
+      sessions,
+      reconstructedRunner,
+    );
+    const replay = await reconstructedHandlers.postTurn(
+      jsonRequest({ requestId }, ownerCookie),
+      discussionId,
+    );
+
+    expect(replay.status).toBe(200);
+    expect(DiscussionStateSchema.parse(await replay.json())).toEqual(committed);
+    expect(fakeDiscussion.calls).toHaveLength(1);
+  });
+
+  it("retries a transient failure with the same identity and then replays the one committed Turn", async () => {
+    const secret = "sk-secret-provider-credential";
+    useFake([
+      {
+        type: "failure",
+        error: new DiscussionGenerationError(
+          new Error(`provider stack ${secret}`),
+          true,
+        ),
+      },
+      { type: "success", result: generatedTurn },
+    ]);
+    const created = await handlers.post(
+      jsonRequest({ topic: "Should cities create more public parks?" }),
+    );
+    const ownerCookie = cookiePair(created);
+
+    const failed = await handlers.postTurn(
+      jsonRequest({ requestId }, ownerCookie),
+      discussionId,
+    );
+    const serializedFailure = await failed.text();
+    const failure = ErrorResponseSchema.parse(JSON.parse(serializedFailure));
+    expect(failed.status).toBe(502);
+    expect(failure.error).toMatchObject({
+      code: "GENERATION_FAILED",
+      retryable: true,
+    });
+    expect(serializedFailure).not.toContain(secret);
+
+    const retried = await handlers.postTurn(
+      jsonRequest({ requestId }, ownerCookie),
+      discussionId,
+    );
+    const committed = DiscussionStateSchema.parse(await retried.json());
+    expect(retried.status).toBe(200);
+    expect(committed).toMatchObject({ turnCount: 1, status: "idle" });
+    expect(committed.transcript).toHaveLength(1);
+
+    const replay = await handlers.postTurn(
+      jsonRequest({ requestId }, ownerCookie),
+      discussionId,
+    );
+    expect(replay.status).toBe(200);
+    expect(DiscussionStateSchema.parse(await replay.json())).toEqual(committed);
+    expect(fakeDiscussion.calls).toHaveLength(2);
+  });
+
+  it("lets a reconstructed Runner stop an attempt and rejects its late result", async () => {
+    vi.useFakeTimers();
+    useFake([
+      {
+        type: "success",
+        result: generatedTurn,
+        delayMs: 100,
+        ignoreAbort: true,
+      },
+    ]);
+    const created = await handlers.post(
+      jsonRequest({ topic: "Should cities create more public parks?" }),
+    );
+    const ownerCookie = cookiePair(created);
+    const pendingTurn = handlers.postTurn(
+      jsonRequest({ requestId }, ownerCookie),
+      discussionId,
+    );
+    await waitForFakeCall();
+
+    const reconstructedRunner = new DiscussionRunner({
+      store,
+      discussion: fakeDiscussion,
+      outputPolicy: new DiscussionOutputPolicy(() => now),
+      now: () => now,
+    });
+    const reconstructedHandlers = createDiscussionHttpHandlers(
+      service,
+      sessions,
+      reconstructedRunner,
+    );
+    const stoppedResponse = await reconstructedHandlers.postStop(
+      new Request(`http://localhost/api/discussions/${discussionId}/stop`, {
+        method: "POST",
+        headers: { Cookie: ownerCookie },
+      }),
+      discussionId,
+    );
+    const stopped = DiscussionStateSchema.parse(await stoppedResponse.json());
+    expect(stopped.status).toBe("stopped");
+
+    await vi.advanceTimersByTimeAsync(100);
+    const late = await pendingTurn;
+    expect(late.status).toBe(409);
+    expect(ErrorResponseSchema.parse(await late.json()).error).toMatchObject({
+      code: "DISCUSSION_STOPPED",
+      retryable: false,
+    });
+
+    const persisted = await handlers.get(
+      new Request(`http://localhost/api/discussions/${discussionId}`, {
+        headers: { Cookie: ownerCookie },
+      }),
+      discussionId,
+    );
+    expect(DiscussionStateSchema.parse(await persisted.json())).toEqual(stopped);
   });
 
   it("stops active generation promptly, stays idempotent, and rejects a late result", async () => {
@@ -954,10 +1171,24 @@ describe("Discussion HTTP interface", () => {
     const payload = ErrorResponseSchema.parse(JSON.parse(serializedError));
 
     expect(response.status).toBe(502);
-    expect(payload.error.code).toBe("GENERATION_FAILED");
+    expect(payload.error).toMatchObject({
+      code: "GENERATION_FAILED",
+      retryable: false,
+    });
     expect(serializedError).not.toContain("provider stack");
     expect(serializedError).not.toContain("sk-secret-provider-credential");
     expect(serializedError).not.toContain("internal prompt");
+
+    const repeated = await handlers.postTurn(
+      jsonRequest({ requestId }, ownerCookie),
+      discussionId,
+    );
+    expect(repeated.status).toBe(502);
+    expect(ErrorResponseSchema.parse(await repeated.json()).error).toMatchObject({
+      code: "GENERATION_FAILED",
+      retryable: false,
+    });
+    expect(fakeDiscussion.calls).toHaveLength(1);
 
     const persisted = await handlers.get(
       new Request(`http://localhost/api/discussions/${discussionId}`, {

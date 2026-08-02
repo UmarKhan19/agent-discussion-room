@@ -26,7 +26,12 @@ function topicError(topic: string): string {
 
 type DiscussionRequestResult =
   | { ok: true; discussion: DiscussionState }
-  | { ok: false; error: string; code?: ProductErrorCode };
+  | {
+      ok: false;
+      error: string;
+      retryable: boolean;
+      code?: ProductErrorCode;
+    };
 
 async function readDiscussionResponse(
   response: Response,
@@ -41,10 +46,11 @@ async function readDiscussionResponse(
         ok: false,
         code: parsedError.data.error.code,
         error: `${parsedError.data.error.message} ${parsedError.data.error.action}`,
+        retryable: parsedError.data.error.retryable,
       };
     }
 
-    return { ok: false, error: fallbackError };
+    return { ok: false, error: fallbackError, retryable: false };
   }
 
   const parsedDiscussion = DiscussionResponseSchema.safeParse(payload);
@@ -52,6 +58,7 @@ async function readDiscussionResponse(
     return {
       ok: false,
       error: "The server returned an invalid Discussion. Please try again.",
+      retryable: false,
     };
   }
 
@@ -65,17 +72,23 @@ export default function Home() {
   const [isStarting, setIsStarting] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
+  const [canRetryTurn, setCanRetryTurn] = useState(false);
   const [generatingSpeaker, setGeneratingSpeaker] = useState<Speaker | null>(
     null,
   );
   const generationControllerRef = useRef<AbortController | null>(null);
   const generationRunRef = useRef(0);
+  const pendingTurnRef = useRef<{
+    discussionId: string;
+    requestId: string;
+  } | null>(null);
 
   useEffect(() => {
     return () => {
       generationRunRef.current += 1;
       generationControllerRef.current?.abort();
       generationControllerRef.current = null;
+      pendingTurnRef.current = null;
     };
   }, []);
 
@@ -115,6 +128,7 @@ export default function Home() {
 
     const controller = new AbortController();
     generationControllerRef.current = controller;
+    setCanRetryTurn(false);
     setIsGenerating(true);
     let current = initialDiscussion;
 
@@ -126,9 +140,16 @@ export default function Home() {
         const nextSpeaker = speakerForTurn(current.turnCount + 1);
         setGeneratingSpeaker(nextSpeaker);
 
-        const requestBody = NextTurnRequestSchema.parse({
-          requestId: crypto.randomUUID(),
-        });
+        const pendingRequest = pendingTurnRef.current;
+        const requestId =
+          pendingRequest?.discussionId === current.id
+            ? pendingRequest.requestId
+            : crypto.randomUUID();
+        pendingTurnRef.current = {
+          discussionId: current.id,
+          requestId,
+        };
+        const requestBody = NextTurnRequestSchema.parse({ requestId });
         const response = await fetch(`/api/discussions/${current.id}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -144,6 +165,7 @@ export default function Home() {
         if (generationRunRef.current !== runId) return;
         if (!result.ok) {
           setError(result.error);
+          setCanRetryTurn(result.retryable);
           if (result.code === "GENERATION_TIMEOUT") {
             setGeneratingSpeaker(null);
             setIsGenerating(false);
@@ -158,11 +180,13 @@ export default function Home() {
               persistedDiscussion
             ) {
               setDiscussion(persistedDiscussion);
+              pendingTurnRef.current = null;
             }
           }
           return;
         }
 
+        pendingTurnRef.current = null;
         current = result.discussion;
         setDiscussion(current);
       }
@@ -176,6 +200,7 @@ export default function Home() {
       setError(
         "The next Turn could not be generated. Check your connection and try again.",
       );
+      setCanRetryTurn(true);
     } finally {
       if (generationRunRef.current === runId) {
         generationControllerRef.current = null;
@@ -183,6 +208,21 @@ export default function Home() {
         setIsGenerating(false);
       }
     }
+  }
+
+  function retryTurn() {
+    if (
+      !discussion ||
+      !pendingTurnRef.current ||
+      pendingTurnRef.current.discussionId !== discussion.id ||
+      isGenerating ||
+      isStopping
+    ) {
+      return;
+    }
+
+    setError(null);
+    void advanceDiscussion(discussion, generationRunRef.current);
   }
 
   async function startDiscussion(event: FormEvent<HTMLFormElement>) {
@@ -200,6 +240,8 @@ export default function Home() {
     generationControllerRef.current?.abort();
     generationControllerRef.current = null;
     setDiscussion(null);
+    pendingTurnRef.current = null;
+    setCanRetryTurn(false);
     setGeneratingSpeaker(null);
     setIsGenerating(false);
     setIsStarting(true);
@@ -272,6 +314,8 @@ export default function Home() {
 
       generationRunRef.current = activeRunId + 1;
       setDiscussion(result.discussion);
+      pendingTurnRef.current = null;
+      setCanRetryTurn(false);
       setError(null);
       setGeneratingSpeaker(null);
       setIsGenerating(false);
@@ -364,6 +408,16 @@ export default function Home() {
               className="min-h-11 self-start rounded-lg bg-red-700 px-5 py-2 font-semibold text-white disabled:opacity-60"
             >
               Stop Discussion
+            </button>
+          ) : null}
+          {canRetryTurn && !isGenerating ? (
+            <button
+              type="button"
+              onClick={retryTurn}
+              disabled={isStopping}
+              className="min-h-11 self-start rounded-lg bg-green-700 px-5 py-2 font-semibold text-white disabled:opacity-60"
+            >
+              Retry Turn
             </button>
           ) : null}
           {discussion.status === "completed" ? (

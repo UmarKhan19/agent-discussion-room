@@ -40,7 +40,7 @@ export interface Discussion {
 export class DiscussionGenerationError extends Error {
   readonly cause: unknown;
 
-  constructor(cause: unknown) {
+  constructor(cause: unknown, readonly retryable = false) {
     super("Discussion generation failed");
     this.name = "DiscussionGenerationError";
     this.cause = cause;

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DiscussionCancelledError,
+  DiscussionGenerationError,
   type Discussion,
   type GenerateDiscussionTurnInput,
   type GeneratedDiscussionTurn,
@@ -54,6 +55,35 @@ describe.each(implementations)("Discussion generation contract: $name", ({ creat
     await expect(create().generateTurn(request)).resolves.toEqual(
       controlledResult,
     );
+  });
+});
+
+describe("MastraDiscussion provider error normalization", () => {
+  it.each([
+    [{ status: 503, secret: "sk-secret" }, true],
+    [{ code: "ECONNRESET", rawResponse: "provider body" }, true],
+    [new Error("unclassified provider failure"), false],
+  ])("classifies retryability without changing the stable adapter error", async (providerError, retryable) => {
+    const agent = {
+      generate: async () => {
+        throw providerError;
+      },
+    };
+    const discussion = new MastraDiscussion({
+      supporter: agent,
+      opponent: agent,
+    });
+
+    try {
+      await discussion.generateTurn(request);
+      throw new Error("Expected generation to fail");
+    } catch (error) {
+      expect(error).toBeInstanceOf(DiscussionGenerationError);
+      expect(error).toMatchObject({
+        message: "Discussion generation failed",
+        retryable,
+      });
+    }
   });
 });
 

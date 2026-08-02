@@ -179,8 +179,18 @@ describe("external Discussion contracts", () => {
           code: "TOPIC_REQUIRED",
           message: "Topic cannot be empty.",
           action: "Enter a Topic.",
+          retryable: false,
         },
       }).success,
     ).toBe(true);
+    expect(
+      ErrorResponseSchema.safeParse({
+        error: {
+          code: "TOPIC_REQUIRED",
+          message: "Topic cannot be empty.",
+          action: "Enter a Topic.",
+        },
+      }).success,
+    ).toBe(false);
   });
 });
