@@ -2,11 +2,17 @@
   "name": "agent-discussion-room",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "bun@1.3.14",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:sandcastle": "bun test ./.sandcastle/tests/*.test.ts",
+    "sandcastle:build": "bun .sandcastle/build-image.ts",
+    "sandcastle:plan": "bun .sandcastle/main.ts --dry-run",
+    "sandcastle:run": "bun .sandcastle/main.ts",
+    "sandcastle:resume": "bun .sandcastle/main.ts --resume"
   },
   "dependencies": {
     "@mastra/core": "^1.55.0",
@@ -22,7 +28,9 @@
     "zod": "^4"
   },
   "devDependencies": {
+    "@ai-hero/sandcastle": "0.12.0",
     "@tailwindcss/postcss": "^4",
+    "@types/bun": "1.3.14",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
