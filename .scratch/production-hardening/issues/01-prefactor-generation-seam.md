@@ -1,7 +1,6 @@
 # Prefactor generation behind a testable Discussion seam
 
-Status: ready-for-agent
-
+Status: done
 ## Parent
 
 [Production hardening PRD](../PRD.md)
@@ -22,3 +21,7 @@ Give maintainers one testable Discussion-generation seam before changing product
 ## Blocked by
 
 - None — can start immediately.
+
+## Comments
+
+- Sandcastle completed this ticket on branch `sandcastle/ticket/production-hardening-01/2026-08-02t12-37-43-251z-7ba6905b-a1`. Verified: `bun install --frozen-lockfile` (exit 0), `bun run lint` (exit 0), `bunx tsc --noEmit` (exit 0), `bun run test` (exit 0), `bun run build` (exit 0).

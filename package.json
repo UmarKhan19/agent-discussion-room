@@ -8,6 +8,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
     "test:sandcastle": "bun test ./.sandcastle/tests/*.test.ts",
     "sandcastle:build": "bun .sandcastle/build-image.ts",
     "sandcastle:plan": "bun .sandcastle/main.ts --dry-run",
@@ -37,7 +39,8 @@
     "eslint": "^9",
     "eslint-config-next": "16.2.12",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^4.1.10"
   },
   "ignoreScripts": [
     "sharp",

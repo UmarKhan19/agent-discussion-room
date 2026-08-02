@@ -1,10 +1,10 @@
-export type Sender = "supporter" | "opponent";
+import type {
+  DiscussionMessage,
+  Speaker,
+} from "@/discussion/discussion";
 
-export interface Message {
-  id: string;
-  content: string;
-  sender: Sender;
-}
+export type Sender = Speaker;
+export type Message = DiscussionMessage;
 
 export interface ServerRequestData {
   topic: string;

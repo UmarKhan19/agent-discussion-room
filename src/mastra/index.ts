@@ -10,6 +10,7 @@ import { weatherWorkflow } from "./workflows/weather-workflow";
 import { weatherAgent } from "./agents/weather-agent";
 import { supporterAgent } from "./agents/supporter";
 import { opponentAgent } from "./agents/opponent";
+import { MastraDiscussion } from "@/discussion/mastra-discussion";
 
 export const mastra = new Mastra({
   workflows: { weatherWorkflow },
@@ -32,4 +33,9 @@ export const mastra = new Mastra({
       },
     },
   }),
+});
+
+export const discussion = new MastraDiscussion({
+  supporter: mastra.getAgentById("supporter-agent"),
+  opponent: mastra.getAgentById("opponent-agent"),
 });
