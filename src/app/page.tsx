@@ -21,6 +21,37 @@ function topicError(topic: string): string {
   return "Use plain text without tabs, line breaks, or control characters.";
 }
 
+type DiscussionRequestResult =
+  | { ok: true; discussion: DiscussionState }
+  | { ok: false; error: string };
+
+async function readDiscussionResponse(
+  response: Response,
+  fallbackError: string,
+): Promise<DiscussionRequestResult> {
+  const payload: unknown = await response.json();
+
+  if (!response.ok) {
+    const parsedError = ErrorResponseSchema.safeParse(payload);
+    return {
+      ok: false,
+      error: parsedError.success
+        ? `${parsedError.data.error.message} ${parsedError.data.error.action}`
+        : fallbackError,
+    };
+  }
+
+  const parsedDiscussion = DiscussionResponseSchema.safeParse(payload);
+  if (!parsedDiscussion.success) {
+    return {
+      ok: false,
+      error: "The server returned an invalid Discussion. Please try again.",
+    };
+  }
+
+  return { ok: true, discussion: parsedDiscussion.data };
+}
+
 export default function Home() {
   const [topic, setTopic] = useState("");
   const [discussion, setDiscussion] = useState<DiscussionState | null>(null);
@@ -42,25 +73,16 @@ export default function Home() {
           body: JSON.stringify(requestBody),
         },
       );
-      const payload: unknown = await response.json();
-
-      if (!response.ok) {
-        const parsedError = ErrorResponseSchema.safeParse(payload);
-        setError(
-          parsedError.success
-            ? `${parsedError.data.error.message} ${parsedError.data.error.action}`
-            : "The first Turn could not be generated safely.",
-        );
+      const result = await readDiscussionResponse(
+        response,
+        "The first Turn could not be generated safely.",
+      );
+      if (!result.ok) {
+        setError(result.error);
         return;
       }
 
-      const parsedDiscussion = DiscussionResponseSchema.safeParse(payload);
-      if (!parsedDiscussion.success) {
-        setError("The server returned an invalid Discussion. Please try again.");
-        return;
-      }
-
-      setDiscussion(parsedDiscussion.data);
+      setDiscussion(result.discussion);
     } catch {
       setError(
         "The first Turn could not be generated. Check your connection and try again.",
@@ -87,26 +109,17 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ topic: parsedTopic.data }),
       });
-      const payload: unknown = await response.json();
-
-      if (!response.ok) {
-        const parsedError = ErrorResponseSchema.safeParse(payload);
-        setError(
-          parsedError.success
-            ? `${parsedError.data.error.message} ${parsedError.data.error.action}`
-            : "The Discussion could not be started. Check the Topic and try again.",
-        );
+      const result = await readDiscussionResponse(
+        response,
+        "The Discussion could not be started. Check the Topic and try again.",
+      );
+      if (!result.ok) {
+        setError(result.error);
         return;
       }
 
-      const parsedDiscussion = DiscussionResponseSchema.safeParse(payload);
-      if (!parsedDiscussion.success) {
-        setError("The server returned an invalid Discussion. Please try again.");
-        return;
-      }
-
-      setDiscussion(parsedDiscussion.data);
-      void generateFirstTurn(parsedDiscussion.data);
+      setDiscussion(result.discussion);
+      void generateFirstTurn(result.discussion);
     } catch {
       setError("The Discussion could not be started. Check your connection and try again.");
     } finally {
