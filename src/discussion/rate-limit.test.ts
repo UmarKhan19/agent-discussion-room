@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { FixedWindowRateLimiter } from "./rate-limit";
+import {
+  FixedWindowRateLimiter,
+  MAX_RATE_LIMIT_BUCKETS,
+} from "./rate-limit";
 
 describe("FixedWindowRateLimiter", () => {
   let nowMs: number;
@@ -109,6 +112,23 @@ describe("FixedWindowRateLimiter", () => {
     limiter.sweepExpired();
 
     expect(limiter.check("caller").allowed).toBe(true);
+  });
+
+  it("bounds the bucket table at capacity by evicting one window", () => {
+    const limiter = new FixedWindowRateLimiter({
+      limit: 1,
+      windowMs: 60_000,
+      now: clock,
+    });
+
+    for (let index = 0; index < MAX_RATE_LIMIT_BUCKETS + 100; index += 1) {
+      limiter.check(`caller-${index}`);
+    }
+
+    expect(limiter.size).toBeLessThanOrEqual(MAX_RATE_LIMIT_BUCKETS);
+    // A brand-new caller still gets a fresh window at capacity.
+    expect(limiter.check("fresh-caller").allowed).toBe(true);
+    expect(limiter.size).toBeLessThanOrEqual(MAX_RATE_LIMIT_BUCKETS);
   });
 
   it("rejects invalid configuration", () => {

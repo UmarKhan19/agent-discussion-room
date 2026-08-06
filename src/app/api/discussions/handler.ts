@@ -216,7 +216,7 @@ export function createDiscussionHttpHandlers(
   });
 
   /** Applies network then per-session limits; returns a 429 response when blocked. */
-  function rateLimited(
+  function applyRateLimits(
     session: AuthenticatedSession,
     request: Request,
   ): Response | null {
@@ -227,10 +227,18 @@ export function createDiscussionHttpHandlers(
     return null;
   }
 
-  /** Guards the request before body parsing; returns a 400-series response when blocked. */
-  async function jsonBodyGuard(
+  type AuthenticatedRequest =
+    | { response: Response }
+    | { session: AuthenticatedSession; text: string };
+
+  /**
+   * Applies content-type, body-size, session, and rate-limit guards and
+   * returns either a rejection response or an authenticated session with
+   * the bounded raw body text (empty when the request carries no body).
+   */
+  async function authenticateRequest(
     request: Request,
-  ): Promise<{ response: Response } | { text: string }> {
+  ): Promise<AuthenticatedRequest> {
     if (request.body !== null && !hasJsonContentType(request)) {
       return {
         response: errorResponse(415, {
@@ -250,7 +258,10 @@ export function createDiscussionHttpHandlers(
         }),
       };
     }
-    return { text: bounded.text };
+    const session = sessions.authenticate(request);
+    const limited = applyRateLimits(session, request);
+    if (limited) return { response: limited };
+    return { session, text: bounded.text };
   }
 
   function invalidIdentifierResponse(): Response {
@@ -261,14 +272,28 @@ export function createDiscussionHttpHandlers(
     });
   }
 
+  type ParsedDiscussionIdentifier =
+    | { ok: true; id: string }
+    | { ok: false; response: Response };
+
+  function parseDiscussionIdentifier(
+    untrustedId: string,
+  ): ParsedDiscussionIdentifier {
+    if (untrustedId.length > MAX_DISCUSSION_IDENTIFIER_LENGTH) {
+      return { ok: false, response: invalidIdentifierResponse() };
+    }
+    const parsed = DiscussionIdentifierSchema.safeParse(untrustedId);
+    if (!parsed.success) {
+      return { ok: false, response: invalidIdentifierResponse() };
+    }
+    return { ok: true, id: parsed.data };
+  }
+
   return {
     async post(request: Request): Promise<Response> {
-      const guarded = await jsonBodyGuard(request);
+      const guarded = await authenticateRequest(request);
       if ("response" in guarded) return guarded.response;
-
-      const session = sessions.authenticate(request);
-      const limited = rateLimited(session, request);
-      if (limited) return limited;
+      const { session } = guarded;
 
       let body: unknown;
       try {
@@ -320,20 +345,12 @@ export function createDiscussionHttpHandlers(
       request: Request,
       untrustedId: string,
     ): Promise<Response> {
-      if (untrustedId.length > MAX_DISCUSSION_IDENTIFIER_LENGTH) {
-        return invalidIdentifierResponse();
-      }
-      const parsedId = DiscussionIdentifierSchema.safeParse(untrustedId);
-      if (!parsedId.success) {
-        return invalidIdentifierResponse();
-      }
+      const parsedId = parseDiscussionIdentifier(untrustedId);
+      if (!parsedId.ok) return parsedId.response;
 
-      const guarded = await jsonBodyGuard(request);
+      const guarded = await authenticateRequest(request);
       if ("response" in guarded) return guarded.response;
-
-      const session = sessions.authenticate(request);
-      const limited = rateLimited(session, request);
-      if (limited) return limited;
+      const { session } = guarded;
 
       let body: unknown;
       try {
@@ -354,7 +371,7 @@ export function createDiscussionHttpHandlers(
       try {
         const discussion = await runner.nextTurn(
           session.id,
-          parsedId.data,
+          parsedId.id,
           parsedRequest.data.requestId,
           request.signal,
         );
@@ -502,23 +519,15 @@ export function createDiscussionHttpHandlers(
       request: Request,
       untrustedId: string,
     ): Promise<Response> {
-      if (untrustedId.length > MAX_DISCUSSION_IDENTIFIER_LENGTH) {
-        return invalidIdentifierResponse();
-      }
-      const parsedId = DiscussionIdentifierSchema.safeParse(untrustedId);
-      if (!parsedId.success) {
-        return invalidIdentifierResponse();
-      }
+      const parsedId = parseDiscussionIdentifier(untrustedId);
+      if (!parsedId.ok) return parsedId.response;
 
-      const guarded = await jsonBodyGuard(request);
+      const guarded = await authenticateRequest(request);
       if ("response" in guarded) return guarded.response;
-
-      const session = sessions.authenticate(request);
-      const limited = rateLimited(session, request);
-      if (limited) return limited;
+      const { session } = guarded;
 
       try {
-        const discussion = runner.stop(session.id, parsedId.data);
+        const discussion = runner.stop(session.id, parsedId.id);
         if (!discussion) {
           return errorResponse(
             404,
@@ -559,19 +568,14 @@ export function createDiscussionHttpHandlers(
     },
 
     async get(request: Request, untrustedId: string): Promise<Response> {
-      if (untrustedId.length > MAX_DISCUSSION_IDENTIFIER_LENGTH) {
-        return invalidIdentifierResponse();
-      }
-      const parsedId = DiscussionIdentifierSchema.safeParse(untrustedId);
-      if (!parsedId.success) {
-        return invalidIdentifierResponse();
-      }
+      const parsedId = parseDiscussionIdentifier(untrustedId);
+      if (!parsedId.ok) return parsedId.response;
 
-      const session = sessions.authenticate(request);
-      const limited = rateLimited(session, request);
-      if (limited) return limited;
+      const guarded = await authenticateRequest(request);
+      if ("response" in guarded) return guarded.response;
+      const { session } = guarded;
 
-      const discussion = service.read(session.id, parsedId.data);
+      const discussion = service.read(session.id, parsedId.id);
       if (!discussion) {
         return errorResponse(
           404,

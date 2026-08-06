@@ -26,6 +26,12 @@ export const MAX_RATE_LIMIT_BUCKETS = 10_000;
  * that waits past the window recovers automatically. Keys are caller
  * identifiers (signed-session IDs or client network addresses) — never
  * session tokens or other secrets.
+ *
+ * Memory is hard-bounded: when the bucket table is at capacity, expired
+ * windows are swept and a single active window is evicted so a fresh key
+ * always fits. Under sustained spoofed-key pressure the eviction keeps the
+ * table at MAX_RATE_LIMIT_BUCKETS, and the eviction path runs only while
+ * the table stays at capacity.
  */
 export class FixedWindowRateLimiter {
   private readonly limit: number;
@@ -45,10 +51,23 @@ export class FixedWindowRateLimiter {
     this.now = options.now ?? Date.now;
   }
 
+  /** Number of tracked caller windows; diagnostics aid for capacity checks. */
+  get size(): number {
+    return this.buckets.size;
+  }
+
   check(key: string): RateLimitDecision {
     const nowMs = this.now();
     if (this.buckets.size >= MAX_RATE_LIMIT_BUCKETS) {
       this.sweepExpired(nowMs);
+      if (this.buckets.size >= MAX_RATE_LIMIT_BUCKETS) {
+        // Still at capacity: drop one window so new callers are never
+        // rejected by table exhaustion rather than by the rate limit.
+        const oldestKey = this.buckets.keys().next().value;
+        if (oldestKey !== undefined && oldestKey !== key) {
+          this.buckets.delete(oldestKey);
+        }
+      }
     }
 
     const current = this.buckets.get(key);
