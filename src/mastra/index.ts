@@ -2,19 +2,14 @@ import { Mastra } from "@mastra/core/mastra";
 import { LibSQLStore } from "@mastra/libsql";
 import { PinoLogger } from "@mastra/loggers";
 import {
-  Observability,
-  MastraStorageExporter,
-  MastraPlatformExporter,
-  SensitiveDataFilter,
-} from "@mastra/observability";
-import {
   deriveMastraStorageUrl,
   ensureStorageDirectory,
   resolveDiscussionEnvironment,
 } from "@/config/environment";
-import { supporterAgent } from "./agents/supporter";
-import { opponentAgent } from "./agents/opponent";
 import { MastraDiscussion } from "@/discussion/mastra-discussion";
+import { createMastraObservability } from "@/observability/mastra-observability";
+import { OPPONENT_MODEL_ID, opponentAgent } from "./agents/opponent";
+import { SUPPORTER_MODEL_ID, supporterAgent } from "./agents/supporter";
 
 const environment = resolveDiscussionEnvironment(process.env);
 
@@ -44,23 +39,18 @@ export const mastra = new Mastra({
     name: "Mastra",
     level: "info",
   }),
-  observability: new Observability({
-    configs: {
-      default: {
-        serviceName: "mastra",
-        exporters: [
-          new MastraStorageExporter(), // Persists observability events to Mastra Storage
-          new MastraPlatformExporter(), // Sends observability events to Mastra Platform (if MASTRA_PLATFORM_ACCESS_TOKEN is set)
-        ],
-        spanOutputProcessors: [
-          new SensitiveDataFilter(), // Redacts sensitive data like passwords, tokens, keys
-        ],
-      },
-    },
-  }),
+  // Privacy-safe observability: spans are conversation-redacted before any
+  // exporter sees them, and external platform export is opt-in only.
+  observability: createMastraObservability(environment),
 });
 
 export const discussion = new MastraDiscussion({
-  supporter: mastra.getAgentById("supporter-agent"),
-  opponent: mastra.getAgentById("opponent-agent"),
+  supporter: {
+    modelId: SUPPORTER_MODEL_ID,
+    generate: (prompt, options) => supporterAgent.generate(prompt, options),
+  },
+  opponent: {
+    modelId: OPPONENT_MODEL_ID,
+    generate: (prompt, options) => opponentAgent.generate(prompt, options),
+  },
 });

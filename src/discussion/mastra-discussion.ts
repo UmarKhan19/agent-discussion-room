@@ -19,6 +19,11 @@ interface MastraGenerationResponse {
 }
 
 export interface MastraDiscussionAgent {
+  /**
+   * Stable provider/model identifier, reported through operational
+   * telemetry for cost and reliability investigation.
+   */
+  readonly modelId: string;
   generate(
     prompt: string,
     options: {
@@ -165,6 +170,7 @@ export class MastraDiscussion implements Discussion {
       return {
         content: response.text,
         usage: normalizeUsage(response.usage),
+        model: this.agents[input.speaker].modelId,
       };
     } catch (error) {
       if (error instanceof DiscussionGenerationOutputLimitError) {

@@ -33,6 +33,12 @@ export const GeneratedDiscussionTurnSchema = z
   .object({
     content: DiscussionMessageContentSchema,
     usage: GenerationUsageSchema.optional(),
+    /**
+     * Stable provider/model identifier reported through operational
+     * telemetry for cost and reliability investigation. Never persisted in
+     * the Discussion system of record.
+     */
+    model: z.string().trim().min(1).optional(),
   })
   .strict();
 

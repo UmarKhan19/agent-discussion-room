@@ -28,11 +28,13 @@ const controlledResult: GeneratedDiscussionTurn = {
 const implementations: Array<{
   name: string;
   create: () => Discussion;
+  expected: GeneratedDiscussionTurn;
 }> = [
   {
     name: "Mastra adapter",
     create: () => {
       const agent = {
+        modelId: "test-model",
         generate: async () => ({
           text: controlledResult.content,
           usage: controlledResult.usage,
@@ -41,6 +43,7 @@ const implementations: Array<{
 
       return new MastraDiscussion({ supporter: agent, opponent: agent });
     },
+    expected: { ...controlledResult, model: "test-model" },
   },
   {
     name: "deterministic fake",
@@ -48,16 +51,18 @@ const implementations: Array<{
       new FakeDiscussion([
         { type: "success", result: controlledResult },
       ]),
+    expected: controlledResult,
   },
 ];
 
-describe.each(implementations)("Discussion generation contract: $name", ({ create }) => {
-  it("returns generated content and normalized usage", async () => {
-    await expect(create().generateTurn(request)).resolves.toEqual(
-      controlledResult,
-    );
-  });
-});
+describe.each(implementations)(
+  "Discussion generation contract: $name",
+  ({ create, expected }) => {
+    it("returns generated content, normalized usage, and the model identifier", async () => {
+      await expect(create().generateTurn(request)).resolves.toEqual(expected);
+    });
+  },
+);
 
 describe("MastraDiscussion provider error normalization", () => {
   const cyclicCause: { cause?: unknown } = {};
@@ -78,6 +83,7 @@ describe("MastraDiscussion provider error normalization", () => {
     [new Error("unclassified provider failure"), false],
   ])("classifies retryability without changing the stable adapter error", async (providerError, retryable) => {
     const agent = {
+      modelId: "test-model",
       generate: async () => {
         throw providerError;
       },
@@ -106,6 +112,7 @@ describe("MastraDiscussion output budgets", () => {
       | { abortSignal?: AbortSignal; modelSettings?: { maxOutputTokens?: number } }
       | undefined;
     const agent = {
+      modelId: "test-model",
       generate: async (
         _prompt: string,
         options: {
@@ -133,6 +140,7 @@ describe("MastraDiscussion output budgets", () => {
 
   it("enforces the output-character ceiling with a stable non-retryable error", async () => {
     const agent = {
+      modelId: "test-model",
       generate: async () => ({ text: "x".repeat(100) }),
     };
     const discussion = new MastraDiscussion({
@@ -147,6 +155,7 @@ describe("MastraDiscussion output budgets", () => {
 
   it("accepts output exactly at the character ceiling", async () => {
     const agent = {
+      modelId: "test-model",
       generate: async () => ({ text: "y".repeat(50) }),
     };
     const discussion = new MastraDiscussion({
@@ -156,7 +165,7 @@ describe("MastraDiscussion output budgets", () => {
 
     await expect(
       discussion.generateTurn({ ...request, maxOutputCharacters: 50 }),
-    ).resolves.toEqual({ content: "y".repeat(50) });
+    ).resolves.toMatchObject({ content: "y".repeat(50) });
   });
 });
 

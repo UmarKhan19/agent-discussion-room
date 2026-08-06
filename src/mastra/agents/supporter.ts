@@ -1,5 +1,8 @@
 import { Agent } from "@mastra/core/agent";
 
+/** Stable provider/model identifier used by telemetry and cost investigation. */
+export const SUPPORTER_MODEL_ID = "opencode/deepseek-v4-flash-free";
+
 const INSTRUCTIONS = `
 You are Agent 1 in a two-agent discussion.
 
@@ -29,5 +32,5 @@ export const supporterAgent = new Agent({
   id: "supporter-agent",
   name: "Supporter Agent",
   instructions: INSTRUCTIONS,
-  model: "opencode/deepseek-v4-flash-free",
+  model: SUPPORTER_MODEL_ID,
 });

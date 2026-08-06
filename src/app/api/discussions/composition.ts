@@ -19,6 +19,7 @@ import {
 } from "@/discussion/request-protection";
 import { SignedSessionManager } from "@/discussion/signed-session";
 import { discussion } from "@/mastra";
+import { JsonLineTelemetry } from "@/observability/telemetry";
 import {
   DEFAULT_NETWORK_RATE_LIMIT,
   DEFAULT_NETWORK_RATE_WINDOW_MS,
@@ -124,7 +125,11 @@ function createProcessHandlers(): DiscussionHttpHandlers {
       DEFAULT_DISCUSSION_BUDGETS.sessionGenerationQuota,
     ),
   });
-  const runner = new DiscussionRunner({ store, discussion, budgets });
+  // Structured, privacy-safe operational telemetry: JSON lines on stdout.
+  // Conversation content is structurally impossible to record; see
+  // src/observability/telemetry.ts and docs/observability-privacy.md.
+  const telemetry = new JsonLineTelemetry();
+  const runner = new DiscussionRunner({ store, discussion, budgets, telemetry });
   const processSigningKey =
     environment.sessionSecret ??
     randomBytes(32).toString("base64url");
@@ -151,7 +156,14 @@ function createProcessHandlers(): DiscussionHttpHandlers {
       DEFAULT_NETWORK_RATE_WINDOW_MS,
     ),
   };
-  return createDiscussionHttpHandlers(service, sessions, runner, protection, ready);
+  return createDiscussionHttpHandlers(
+    service,
+    sessions,
+    runner,
+    protection,
+    ready,
+    telemetry,
+  );
 }
 
 export const discussionHttpHandlers =

@@ -63,14 +63,40 @@ import type {
   AuthenticatedSession,
   SignedSessionManager,
 } from "@/discussion/signed-session";
+import {
+  noopTelemetry,
+  type DiscussionTelemetry,
+  type TelemetryOperation,
+} from "@/observability/telemetry";
 
 type ProductErrorInput = Omit<ProductError, "retryable"> & {
   retryable?: boolean;
 };
 
+/**
+ * Per-request telemetry context: the operation identity, a monotonic start
+ * reading, and the identifiers known so far (the request identity for
+ * next-Turn calls, the Discussion identifier when it could be parsed).
+ */
+interface RequestMeta {
+  operation: TelemetryOperation;
+  startedAt: number;
+  requestId?: string;
+  discussionId?: string;
+}
+
+function requestMeta(operation: TelemetryOperation): RequestMeta {
+  return {
+    operation,
+    startedAt: performance.now(),
+  };
+}
+
 function errorResponse(
+  telemetry: DiscussionTelemetry,
   status: number,
   error: ProductErrorInput,
+  meta: RequestMeta,
   setCookie?: string,
   retryAfterSeconds?: number,
 ): Response {
@@ -86,14 +112,29 @@ function errorResponse(
   if (retryAfterSeconds !== undefined) {
     headers.set("Retry-After", String(retryAfterSeconds));
   }
+  telemetry.record({
+    event: "request",
+    operation: meta.operation,
+    outcome: "failure",
+    durationMs: performance.now() - meta.startedAt,
+    statusCode: status,
+    errorClass: error.code,
+    retryable: error.retryable ?? false,
+    category: error.category,
+    requestId: meta.requestId,
+    discussionId: meta.discussionId,
+  });
   return new Response(JSON.stringify(body), { status, headers });
 }
 
 function rateLimitedResponse(
+  telemetry: DiscussionTelemetry,
   session: AuthenticatedSession,
   decision: Extract<RateLimitDecision, { allowed: false }>,
+  meta: RequestMeta,
 ): Response {
   return errorResponse(
+    telemetry,
     429,
     {
       code: "RATE_LIMITED",
@@ -102,14 +143,17 @@ function rateLimitedResponse(
       retryable: true,
       retryAfterSeconds: decision.retryAfterSeconds,
     },
+    meta,
     session.setCookie,
     decision.retryAfterSeconds,
   );
 }
 
 function discussionResponse(
+  telemetry: DiscussionTelemetry,
   discussion: unknown,
   status: number,
+  meta: RequestMeta,
   setCookie?: string,
 ): Response {
   const body = DiscussionResponseSchema.parse(discussion);
@@ -119,6 +163,15 @@ function discussionResponse(
     Vary: "Cookie",
   });
   if (setCookie) headers.set("Set-Cookie", setCookie);
+  telemetry.record({
+    event: "request",
+    operation: meta.operation,
+    outcome: "success",
+    durationMs: performance.now() - meta.startedAt,
+    statusCode: status,
+    requestId: meta.requestId,
+    discussionId: meta.discussionId,
+  });
   return new Response(JSON.stringify(body), { status, headers });
 }
 
@@ -203,6 +256,7 @@ export function createDiscussionHttpHandlers(
   runner: DiscussionRunner,
   protection: DiscussionHttpProtection = {},
   ready: Promise<void> = Promise.resolve(),
+  telemetry: DiscussionTelemetry = noopTelemetry,
 ) {
   const maxBodyBytes =
     protection.maxBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES;
@@ -223,11 +277,12 @@ export function createDiscussionHttpHandlers(
   function applyRateLimits(
     session: AuthenticatedSession,
     request: Request,
+    meta: RequestMeta,
   ): Response | null {
     const network = networkLimiter.check(clientNetworkKey(request));
-    if (!network.allowed) return rateLimitedResponse(session, network);
+    if (!network.allowed) return rateLimitedResponse(telemetry, session, network, meta);
     const perSession = sessionLimiter.check(session.id);
-    if (!perSession.allowed) return rateLimitedResponse(session, perSession);
+    if (!perSession.allowed) return rateLimitedResponse(telemetry, session, perSession, meta);
     return null;
   }
 
@@ -242,38 +297,56 @@ export function createDiscussionHttpHandlers(
    */
   async function authenticateRequest(
     request: Request,
+    meta: RequestMeta,
   ): Promise<AuthenticatedRequest> {
     if (request.body !== null && !hasJsonContentType(request)) {
       return {
-        response: errorResponse(415, {
-          code: "CONTENT_TYPE_UNSUPPORTED",
-          message: "Discussion requests must be sent as JSON.",
-          action: 'Send the request with "Content-Type: application/json".',
-        }),
+        response: errorResponse(
+          telemetry,
+          415,
+          {
+            code: "CONTENT_TYPE_UNSUPPORTED",
+            message: "Discussion requests must be sent as JSON.",
+            action: 'Send the request with "Content-Type: application/json".',
+          },
+          meta,
+        ),
       };
     }
     const bounded = await readBoundedBody(request, maxBodyBytes);
     if (!bounded.ok) {
       return {
-        response: errorResponse(413, {
-          code: "BODY_TOO_LARGE",
-          message: `The request body exceeds the ${maxBodyBytes}-byte limit.`,
-          action: "Send only the required fields in a compact JSON body.",
-        }),
+        response: errorResponse(
+          telemetry,
+          413,
+          {
+            code: "BODY_TOO_LARGE",
+            message: `The request body exceeds the ${maxBodyBytes}-byte limit.`,
+            action: "Send only the required fields in a compact JSON body.",
+          },
+          meta,
+        ),
       };
     }
     const session = sessions.authenticate(request);
-    const limited = applyRateLimits(session, request);
+    const limited = applyRateLimits(session, request, meta);
     if (limited) return { response: limited };
     return { session, text: bounded.text };
   }
 
-  function invalidIdentifierResponse(): Response {
-    return errorResponse(400, {
-      code: "INVALID_DISCUSSION_ID",
-      message: "The Discussion identifier is malformed or too long.",
-      action: "Use the UUID returned when the Discussion was started.",
-    });
+  function invalidIdentifierResponse(
+    meta: RequestMeta,
+  ): Response {
+    return errorResponse(
+      telemetry,
+      400,
+      {
+        code: "INVALID_DISCUSSION_ID",
+        message: "The Discussion identifier is malformed or too long.",
+        action: "Use the UUID returned when the Discussion was started.",
+      },
+      meta,
+    );
   }
 
   type ParsedDiscussionIdentifier =
@@ -282,13 +355,14 @@ export function createDiscussionHttpHandlers(
 
   function parseDiscussionIdentifier(
     untrustedId: string,
+    meta: RequestMeta,
   ): ParsedDiscussionIdentifier {
     if (untrustedId.length > MAX_DISCUSSION_IDENTIFIER_LENGTH) {
-      return { ok: false, response: invalidIdentifierResponse() };
+      return { ok: false, response: invalidIdentifierResponse(meta) };
     }
     const parsed = DiscussionIdentifierSchema.safeParse(untrustedId);
     if (!parsed.success) {
-      return { ok: false, response: invalidIdentifierResponse() };
+      return { ok: false, response: invalidIdentifierResponse(meta) };
     }
     return { ok: true, id: parsed.data };
   }
@@ -298,26 +372,34 @@ export function createDiscussionHttpHandlers(
    * null to proceed. Production startup validates configuration before any
    * request is served; this covers store failures after process start.
    */
-  async function storageReadyResponse(): Promise<Response | null> {
+  async function storageReadyResponse(
+    meta: RequestMeta,
+  ): Promise<Response | null> {
     try {
       await ready;
       return null;
     } catch {
-      return errorResponse(500, {
-        code: "STORAGE_UNAVAILABLE",
-        message: "Discussion storage is not available; the server is still starting or storage is misconfigured.",
-        action: "Wait briefly and retry; check the server logs for storage errors.",
-        retryable: true,
-      });
+      return errorResponse(
+        telemetry,
+        500,
+        {
+          code: "STORAGE_UNAVAILABLE",
+          message: "Discussion storage is not available; the server is still starting or storage is misconfigured.",
+          action: "Wait briefly and retry; check the server logs for storage errors.",
+          retryable: true,
+        },
+        meta,
+      );
     }
   }
 
   return {
     async post(request: Request): Promise<Response> {
-      const storageBlocked = await storageReadyResponse();
+      const meta = requestMeta("start");
+      const storageBlocked = await storageReadyResponse(meta);
       if (storageBlocked) return storageBlocked;
 
-      const guarded = await authenticateRequest(request);
+      const guarded = await authenticateRequest(request, meta);
       if ("response" in guarded) return guarded.response;
       const { session } = guarded;
 
@@ -325,24 +407,31 @@ export function createDiscussionHttpHandlers(
       try {
         body = JSON.parse(guarded.text);
       } catch {
-        return errorResponse(400, {
+        return errorResponse(telemetry, 400, {
           code: "MALFORMED_REQUEST",
           message: "The request body is not valid JSON.",
           action: "Send a JSON object in the form {\"topic\": \"Your Topic\"}.",
-        });
+          },
+          meta,
+        );
       }
 
       const parsedRequest = StartDiscussionRequestSchema.safeParse(body);
       if (!parsedRequest.success) {
-        return errorResponse(400, invalidStartRequest(body));
+        return errorResponse(telemetry, 400, invalidStartRequest(body), meta);
       }
 
       try {
-        const discussion = await service.start(session.id, parsedRequest.data.topic);
-        return discussionResponse(discussion, 201, session.setCookie);
+        const discussion = await service.start(
+          session.id,
+          parsedRequest.data.topic,
+        );
+        meta.discussionId = discussion.id;
+        return discussionResponse(telemetry, discussion, 201, meta, session.setCookie);
       } catch (error) {
         if (error instanceof DiscussionPolicyBlockedError) {
           return errorResponse(
+            telemetry,
             422,
             {
               code: "TOPIC_BLOCKED",
@@ -350,11 +439,13 @@ export function createDiscussionHttpHandlers(
               action: SAFE_TOPIC_ALTERNATIVE,
               category: error.outcome.category,
             },
+            meta,
             session.setCookie,
           );
         }
 
         return errorResponse(
+          telemetry,
           500,
           {
             code: "INVALID_RESPONSE",
@@ -362,6 +453,7 @@ export function createDiscussionHttpHandlers(
             action: "Try again with the same Topic.",
             retryable: true,
           },
+          meta,
           session.setCookie,
         );
       }
@@ -371,13 +463,16 @@ export function createDiscussionHttpHandlers(
       request: Request,
       untrustedId: string,
     ): Promise<Response> {
-      const storageBlocked = await storageReadyResponse();
+      const meta = requestMeta("next-turn");
+
+      const parsedId = parseDiscussionIdentifier(untrustedId, meta);
+      if (!parsedId.ok) return parsedId.response;
+      meta.discussionId = parsedId.id;
+
+      const storageBlocked = await storageReadyResponse(meta);
       if (storageBlocked) return storageBlocked;
 
-      const parsedId = parseDiscussionIdentifier(untrustedId);
-      if (!parsedId.ok) return parsedId.response;
-
-      const guarded = await authenticateRequest(request);
+      const guarded = await authenticateRequest(request, meta);
       if ("response" in guarded) return guarded.response;
       const { session } = guarded;
 
@@ -385,17 +480,20 @@ export function createDiscussionHttpHandlers(
       try {
         body = JSON.parse(guarded.text);
       } catch {
-        return errorResponse(400, {
+        return errorResponse(telemetry, 400, {
           code: "MALFORMED_REQUEST",
           message: "The request body is not valid JSON.",
           action: "Send an object in the form {\"requestId\": \"UUID\"}.",
-        });
+          },
+          meta,
+        );
       }
 
       const parsedRequest = NextTurnRequestSchema.safeParse(body);
       if (!parsedRequest.success) {
-        return errorResponse(400, invalidNextTurnRequest(body));
+        return errorResponse(telemetry, 400, invalidNextTurnRequest(body), meta);
       }
+      meta.requestId = parsedRequest.data.requestId;
 
       try {
         const discussion = await runner.nextTurn(
@@ -406,20 +504,23 @@ export function createDiscussionHttpHandlers(
         );
         if (!discussion) {
           return errorResponse(
+            telemetry,
             404,
             {
               code: "DISCUSSION_NOT_FOUND",
               message: "This Discussion is not available in the current session.",
               action: "Start a new Discussion in this session or return to the session that created it.",
             },
+            meta,
             session.setCookie,
           );
         }
 
-        return discussionResponse(discussion, 200, session.setCookie);
+        return discussionResponse(telemetry, discussion, 200, meta, session.setCookie);
       } catch (error) {
         if (error instanceof DiscussionRequestInProgressError) {
           return errorResponse(
+            telemetry,
             409,
             {
               code: "REQUEST_IN_PROGRESS",
@@ -427,12 +528,14 @@ export function createDiscussionHttpHandlers(
               action: "Wait for the active request to finish, then retry with the same requestId.",
               retryable: true,
             },
+            meta,
             session.setCookie,
           );
         }
 
         if (error instanceof DiscussionTurnInProgressError) {
           return errorResponse(
+            telemetry,
             409,
             {
               code: "TURN_IN_PROGRESS",
@@ -440,24 +543,28 @@ export function createDiscussionHttpHandlers(
               action: "Wait for the active Turn to finish before requesting another Turn.",
               retryable: true,
             },
+            meta,
             session.setCookie,
           );
         }
 
         if (error instanceof DiscussionSessionQuotaExceededError) {
           return errorResponse(
+            telemetry,
             429,
             {
               code: "SESSION_QUOTA_EXCEEDED",
               message: "This session has reached its generation quota.",
               action: "Start a fresh session, or try again later.",
             },
+            meta,
             session.setCookie,
           );
         }
 
         if (error instanceof DiscussionGenerationCapacityError) {
           return errorResponse(
+            telemetry,
             503,
             {
               code: "GENERATION_CAPACITY_EXCEEDED",
@@ -465,36 +572,42 @@ export function createDiscussionHttpHandlers(
               action: "Wait for an active generation to finish, then retry with the same request identity.",
               retryable: true,
             },
+            meta,
             session.setCookie,
           );
         }
 
         if (error instanceof DiscussionCompletedError) {
           return errorResponse(
+            telemetry,
             409,
             {
               code: "DISCUSSION_COMPLETED",
               message: "This Discussion has completed its configured Turn limit.",
               action: "Start a new Discussion to continue with a fresh Topic and Transcript.",
             },
+            meta,
             session.setCookie,
           );
         }
 
         if (error instanceof DiscussionInvalidStateError) {
           return errorResponse(
+            telemetry,
             409,
             {
               code: "INVALID_DISCUSSION_STATE",
               message: "This Discussion is not eligible for another Turn.",
               action: "Read the current Discussion state before requesting another Turn.",
             },
+            meta,
             session.setCookie,
           );
         }
 
         if (error instanceof DiscussionOutputPolicyBlockedError) {
           return errorResponse(
+            telemetry,
             422,
             {
               code: "OUTPUT_BLOCKED",
@@ -502,60 +615,70 @@ export function createDiscussionHttpHandlers(
               action: SAFE_OUTPUT_ALTERNATIVE,
               category: error.category,
             },
+            meta,
             session.setCookie,
           );
         }
 
         if (error instanceof DiscussionInvalidGeneratedTurnError) {
           return errorResponse(
+            telemetry,
             502,
             {
               code: "INVALID_RESPONSE",
               message: "The generated Turn did not match the safe response contract.",
               action: "Start a new Discussion or try again later.",
             },
+            meta,
             session.setCookie,
           );
         }
 
         if (error instanceof DiscussionGenerationOutputLimitError) {
           return errorResponse(
+            telemetry,
             502,
             {
               code: "OUTPUT_LIMIT_EXCEEDED",
               message: "The generated Turn exceeded the configured output limit.",
               action: "Start a new Discussion or try again later.",
             },
+            meta,
             session.setCookie,
           );
         }
 
         if (error instanceof DiscussionGenerationTimeoutError) {
           return errorResponse(
+            telemetry,
             504,
             {
               code: "GENERATION_TIMEOUT",
               message: "The next Turn reached the server generation timeout.",
               action: "Start a new Discussion and try again later.",
             },
+            meta,
             session.setCookie,
           );
         }
 
         if (error instanceof DiscussionStoppedError) {
           return errorResponse(
+            telemetry,
             409,
             {
               code: "DISCUSSION_STOPPED",
               message: "The Discussion was stopped before the next Turn completed.",
               action: "Start a new Discussion to continue with a fresh Topic and Transcript.",
             },
+            meta,
             session.setCookie,
           );
         }
 
         if (error instanceof DiscussionGenerationFailedError) {
           return errorResponse(
+            telemetry,
             502,
             {
               code: "GENERATION_FAILED",
@@ -565,17 +688,20 @@ export function createDiscussionHttpHandlers(
                 : "Start a new Discussion or try again later.",
               retryable: error.retryable,
             },
+            meta,
             session.setCookie,
           );
         }
 
         return errorResponse(
+          telemetry,
           500,
           {
             code: "INVALID_RESPONSE",
             message: "The Discussion could not be advanced safely.",
             action: "Read the current Discussion state before trying again.",
           },
+          meta,
           session.setCookie,
         );
       }
@@ -585,13 +711,16 @@ export function createDiscussionHttpHandlers(
       request: Request,
       untrustedId: string,
     ): Promise<Response> {
-      const storageBlocked = await storageReadyResponse();
+      const meta = requestMeta("stop");
+
+      const parsedId = parseDiscussionIdentifier(untrustedId, meta);
+      if (!parsedId.ok) return parsedId.response;
+      meta.discussionId = parsedId.id;
+
+      const storageBlocked = await storageReadyResponse(meta);
       if (storageBlocked) return storageBlocked;
 
-      const parsedId = parseDiscussionIdentifier(untrustedId);
-      if (!parsedId.ok) return parsedId.response;
-
-      const guarded = await authenticateRequest(request);
+      const guarded = await authenticateRequest(request, meta);
       if ("response" in guarded) return guarded.response;
       const { session } = guarded;
 
@@ -599,31 +728,36 @@ export function createDiscussionHttpHandlers(
         const discussion = await runner.stop(session.id, parsedId.id);
         if (!discussion) {
           return errorResponse(
+            telemetry,
             404,
             {
               code: "DISCUSSION_NOT_FOUND",
               message: "This Discussion is not available in the current session.",
               action: "Start a new Discussion in this session or return to the session that created it.",
             },
+            meta,
             session.setCookie,
           );
         }
 
-        return discussionResponse(discussion, 200, session.setCookie);
+        return discussionResponse(telemetry, discussion, 200, meta, session.setCookie);
       } catch (error) {
         if (error instanceof DiscussionInvalidStateError) {
           return errorResponse(
+            telemetry,
             409,
             {
               code: "INVALID_DISCUSSION_STATE",
               message: "This Discussion has no active generation to stop.",
               action: "Read the current Discussion state before trying to stop it.",
             },
+            meta,
             session.setCookie,
           );
         }
 
         return errorResponse(
+          telemetry,
           500,
           {
             code: "INVALID_RESPONSE",
@@ -631,36 +765,42 @@ export function createDiscussionHttpHandlers(
             action: "Read the current Discussion state before trying again.",
             retryable: true,
           },
+          meta,
           session.setCookie,
         );
       }
     },
 
     async get(request: Request, untrustedId: string): Promise<Response> {
-      const storageBlocked = await storageReadyResponse();
+      const meta = requestMeta("read");
+
+      const parsedId = parseDiscussionIdentifier(untrustedId, meta);
+      if (!parsedId.ok) return parsedId.response;
+      meta.discussionId = parsedId.id;
+
+      const storageBlocked = await storageReadyResponse(meta);
       if (storageBlocked) return storageBlocked;
 
-      const parsedId = parseDiscussionIdentifier(untrustedId);
-      if (!parsedId.ok) return parsedId.response;
-
-      const guarded = await authenticateRequest(request);
+      const guarded = await authenticateRequest(request, meta);
       if ("response" in guarded) return guarded.response;
       const { session } = guarded;
 
       const discussion = await service.read(session.id, parsedId.id);
       if (!discussion) {
         return errorResponse(
+          telemetry,
           404,
           {
             code: "DISCUSSION_NOT_FOUND",
             message: "This Discussion is not available in the current session.",
             action: "Start a new Discussion in this session or return to the session that created it.",
           },
+          meta,
           session.setCookie,
         );
       }
 
-      return discussionResponse(discussion, 200, session.setCookie);
+      return discussionResponse(telemetry, discussion, 200, meta, session.setCookie);
     },
   };
 }

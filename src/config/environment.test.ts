@@ -5,6 +5,8 @@ import {
   DISCUSSION_STORE_AUTH_TOKEN_ENV,
   DISCUSSION_STORE_URL_ENV,
   EnvironmentValidationError,
+  MASTRA_PLATFORM_ACCESS_TOKEN_ENV,
+  OBSERVABILITY_EXPORT_ENABLED_ENV,
   PROVIDER_KEY_ENV,
   resolveDiscussionEnvironment,
 } from "./environment";
@@ -184,6 +186,7 @@ describe("resolveDiscussionEnvironment", () => {
       storage: { kind: "in-memory" },
       sessionSecret: null,
       providerKey: null,
+      observabilityExportEnabled: false,
     });
   });
 
@@ -230,6 +233,59 @@ describe("resolveDiscussionEnvironment", () => {
         ).storage,
       ).toMatchObject({ kind: "durable", url });
     }
+  });
+
+  describe("external observability export", () => {
+    const TOKEN = "mastra-platform-token";
+
+    it("is disabled by default even in production", () => {
+      expect(
+        resolveDiscussionEnvironment(environment()).observabilityExportEnabled,
+      ).toBe(false);
+    });
+
+    it("enables only for the exact value true alongside platform credentials", () => {
+      const resolved = resolveDiscussionEnvironment(
+        environment({
+          [OBSERVABILITY_EXPORT_ENABLED_ENV]: "true",
+          [MASTRA_PLATFORM_ACCESS_TOKEN_ENV]: TOKEN,
+        }),
+      );
+
+      expect(resolved.observabilityExportEnabled).toBe(true);
+    });
+
+    it.each(["TRUE", "True", "1", "yes", "enabled"])(
+      "rejects any enablement value other than the exact string true: %s",
+      (value) => {
+        const problems = problemsOf(
+          environment({ [OBSERVABILITY_EXPORT_ENABLED_ENV]: value }),
+        );
+
+        expect(problems.join("\n")).toContain(OBSERVABILITY_EXPORT_ENABLED_ENV);
+      },
+    );
+
+    it("requires platform credentials in production when export is enabled", () => {
+      const problems = problemsOf(
+        environment({ [OBSERVABILITY_EXPORT_ENABLED_ENV]: "true" }),
+      );
+
+      expect(problems.join("\n")).toContain(MASTRA_PLATFORM_ACCESS_TOKEN_ENV);
+      expect(problems.join("\n")).toContain("export");
+      expect(problems.join("\n")).not.toContain(TOKEN);
+    });
+
+    it("keeps local behavior functional when export is enabled without credentials outside production", () => {
+      const resolved = resolveDiscussionEnvironment(
+        environment({
+          NODE_ENV: "development",
+          [OBSERVABILITY_EXPORT_ENABLED_ENV]: "true",
+        }),
+      );
+
+      expect(resolved.observabilityExportEnabled).toBe(true);
+    });
   });
 });
 

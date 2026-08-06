@@ -30,6 +30,18 @@ export const DISCUSSION_STORE_AUTH_TOKEN_ENV = "DISCUSSION_STORE_AUTH_TOKEN";
 export const DISCUSSION_SESSION_SECRET_ENV = "DISCUSSION_SESSION_SECRET";
 export const PROVIDER_KEY_ENV = "OPENCODE_API_KEY";
 
+/**
+ * External observability export switch. Export is disabled unless this is
+ * exactly the string `true`; any other present value is a misconfiguration
+ * and fails startup. See docs/observability-privacy.md for the retention and
+ * privacy contract.
+ */
+export const OBSERVABILITY_EXPORT_ENABLED_ENV =
+  "DISCUSSION_OBSERVABILITY_EXPORT_ENABLED";
+
+/** Platform credential consumed by the Mastra platform exporter. */
+export const MASTRA_PLATFORM_ACCESS_TOKEN_ENV = "MASTRA_PLATFORM_ACCESS_TOKEN";
+
 export const SESSION_SECRET_MIN_LENGTH = 32;
 
 export type NodeEnvironment = "development" | "test" | "production";
@@ -52,6 +64,13 @@ export interface DiscussionEnvironment {
    * was supplied (development/test only). Never included in errors.
    */
   providerKey: string | null;
+  /**
+   * Whether external observability export is explicitly enabled. False by
+   * default; enabled only by the exact value `true` for
+   * `DISCUSSION_OBSERVABILITY_EXPORT_ENABLED` (with platform credentials
+   * required in production). Local telemetry never depends on this flag.
+   */
+  observabilityExportEnabled: boolean;
 }
 
 /** Raised when required runtime values are absent or invalid. */
@@ -212,6 +231,32 @@ export function resolveDiscussionEnvironment(
     problems.push(...validateProviderKey(env[PROVIDER_KEY_ENV]));
   }
 
+  // External observability export is opt-in only: the exact string "true"
+  // enables it, any other present value is a misconfiguration, and an enabled
+  // production deployment must supply platform credentials or the export
+  // would silently stay disabled while operators believe it is on.
+  const observabilityExportRaw = env[OBSERVABILITY_EXPORT_ENABLED_ENV];
+  let observabilityExportEnabled = false;
+  if (
+    observabilityExportRaw !== undefined &&
+    observabilityExportRaw !== "true"
+  ) {
+    problems.push(
+      `${OBSERVABILITY_EXPORT_ENABLED_ENV} must be exactly "true" or unset; any other value is a misconfiguration and export stays disabled.`,
+    );
+  } else {
+    observabilityExportEnabled = observabilityExportRaw === "true";
+  }
+  if (
+    isProduction &&
+    observabilityExportEnabled &&
+    (env[MASTRA_PLATFORM_ACCESS_TOKEN_ENV] ?? "").trim().length === 0
+  ) {
+    problems.push(
+      `${MASTRA_PLATFORM_ACCESS_TOKEN_ENV} is required in production when ${OBSERVABILITY_EXPORT_ENABLED_ENV}=true; without it external export would silently stay disabled.`,
+    );
+  }
+
   if (problems.length > 0) {
     throw new EnvironmentValidationError(problems);
   }
@@ -222,5 +267,6 @@ export function resolveDiscussionEnvironment(
     storage,
     sessionSecret: env[DISCUSSION_SESSION_SECRET_ENV] ?? null,
     providerKey: env[PROVIDER_KEY_ENV] ?? null,
+    observabilityExportEnabled,
   };
 }

@@ -15,6 +15,12 @@ import {
   type Discussion,
 } from "./discussion";
 
+import {
+  noopTelemetry,
+  type DiscussionTelemetry,
+  type TelemetryEvent,
+} from "@/observability/telemetry";
+
 export { DiscussionGenerationOutputLimitError } from "./discussion";
 import {
   DEFAULT_DISCUSSION_BUDGETS,
@@ -123,6 +129,8 @@ export interface DiscussionRunnerOptions {
    * any budget.
    */
   budgets?: Partial<DiscussionBudgets>;
+  /** Privacy-safe operational telemetry; defaults to a no-op recorder. */
+  telemetry?: DiscussionTelemetry;
 }
 
 /**
@@ -151,6 +159,8 @@ interface ActiveGeneration {
   requestId: string;
   attemptId: string;
   turn: number;
+  /** Monotonic clock reading when this generation was claimed. */
+  startedAt: number;
   controller: AbortController;
   cancellation: Promise<never>;
   rejectCancellation: (error: Error) => void;
@@ -223,6 +233,7 @@ export class DiscussionRunner {
   private readonly createMessageId: () => string;
   private readonly createAttemptId: () => string;
   private readonly budgets: DiscussionBudgets;
+  private readonly telemetry: DiscussionTelemetry;
   private readonly capacity: GenerationCapacity;
   private readonly activeGenerations = new Map<string, ActiveGeneration>();
   /**
@@ -248,6 +259,7 @@ export class DiscussionRunner {
       ...DEFAULT_DISCUSSION_BUDGETS,
       ...options.budgets,
     });
+    this.telemetry = options.telemetry ?? noopTelemetry;
     this.capacity = new GenerationCapacity(
       this.budgets.maxConcurrentGenerations,
     );
@@ -421,7 +433,15 @@ export class DiscussionRunner {
           message: messageResult.data,
           updatedAt: timestamp,
         });
-        if (completed.kind === "updated") return completed.discussion;
+        if (completed.kind === "updated") {
+          this.generationTelemetry(active, {
+            outcome: "success",
+            model: generatedResult.data.model,
+            usage: generatedResult.data.usage,
+            completed: completed.discussion.status === "completed",
+          });
+          return completed.discussion;
+        }
         if (completed.kind === "stale") {
           throw errorForTerminalState(completed.discussion) ??
             new DiscussionInvalidStateError();
@@ -429,9 +449,19 @@ export class DiscussionRunner {
         throw new DiscussionInvalidGeneratedTurnError();
       } catch (error) {
         if (active.reason === "timeout") {
+          this.generationTelemetry(active, {
+            outcome: "cancelled",
+            errorClass: "GENERATION_TIMEOUT",
+            cancellationReason: "timeout",
+          });
           throw new DiscussionGenerationTimeoutError();
         }
         if (active.reason === "stop" || active.reason === "disconnect") {
+          this.generationTelemetry(active, {
+            outcome: "cancelled",
+            errorClass: "DISCUSSION_STOPPED",
+            cancellationReason: active.reason,
+          });
           throw new DiscussionStoppedError();
         }
 
@@ -454,6 +484,10 @@ export class DiscussionRunner {
         if (failed.kind === "not_found") {
           throw new DiscussionInvalidGeneratedTurnError();
         }
+        this.generationTelemetry(
+          active,
+          this.generationTelemetryForFailure(failure),
+        );
         throw errorForFailure(failure);
       } finally {
         this.releaseActiveGeneration(active);
@@ -512,6 +546,7 @@ export class DiscussionRunner {
       requestId: input.requestId,
       attemptId: input.attemptId,
       turn: input.turn,
+      startedAt: performance.now(),
       controller,
       cancellation,
       rejectCancellation,
@@ -558,14 +593,17 @@ export class DiscussionRunner {
         reason,
         updatedAt: this.now().toISOString(),
       });
-    } catch (error) {
+    } catch {
       // The store could not record the cancellation. The in-flight Turn is
       // left running; its own completion path will surface the store failure
-      // to the participant instead of crashing the process.
-      console.error(
-        `[discussion] Failed to persist ${reason} cancellation for Discussion ${active.discussionId}`,
-        error,
-      );
+      // to the participant instead of crashing the process. The failure is
+      // reported through structured telemetry only — never the raw error,
+      // which could carry provider payloads.
+      this.generationTelemetry(active, {
+        outcome: "failure",
+        errorClass: "INTERNAL",
+        retryable: true,
+      });
       return;
     }
 
@@ -597,6 +635,71 @@ export class DiscussionRunner {
     }
     if (this.activeGenerations.get(active.discussionId) === active) {
       this.activeGenerations.delete(active.discussionId);
+    }
+  }
+
+  /**
+   * Records one generation-level telemetry event bound to the active
+   * generation's request identity, Turn, and elapsed duration. Only
+   * identifier, outcome, and metadata fields are ever passed — never the
+   * Topic, Transcript, prompt, output, or provider payload.
+   */
+  private generationTelemetry(
+    active: ActiveGeneration,
+    partial: Omit<
+      Extract<TelemetryEvent, { event: "generation" }>,
+      "event" | "operation" | "durationMs" | "turn" | "requestId" | "discussionId"
+    >,
+  ): void {
+    this.telemetry.record({
+      event: "generation",
+      operation: "next-turn",
+      durationMs: performance.now() - active.startedAt,
+      turn: active.turn,
+      requestId: active.requestId,
+      discussionId: active.discussionId,
+      ...partial,
+    });
+  }
+
+  private generationTelemetryForFailure(
+    failure: TurnFailure,
+  ): Omit<
+    Extract<TelemetryEvent, { event: "generation" }>,
+    "event" | "operation" | "durationMs" | "turn" | "requestId" | "discussionId"
+  > {
+    switch (failure.kind) {
+      case "output_blocked":
+        return {
+          outcome: "failure",
+          errorClass: "OUTPUT_BLOCKED",
+          category: failure.category,
+        };
+      case "invalid_response":
+        return { outcome: "failure", errorClass: "INVALID_RESPONSE" };
+      case "output_limit_exceeded":
+        return {
+          outcome: "failure",
+          errorClass: "OUTPUT_LIMIT_EXCEEDED",
+        };
+      case "generation_failed":
+        return {
+          outcome: "failure",
+          errorClass: "GENERATION_FAILED",
+          retryable: failure.retryable,
+        };
+      case "timeout":
+        return {
+          outcome: "cancelled",
+          errorClass: "GENERATION_TIMEOUT",
+          cancellationReason: "timeout",
+        };
+      case "stopped":
+        return {
+          outcome: "cancelled",
+          errorClass: "DISCUSSION_STOPPED",
+          cancellationReason: "stop",
+        };
     }
   }
 }
