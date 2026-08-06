@@ -1,6 +1,6 @@
 # Make Turn requests concurrency-safe and retryable
 
-Status: ready-for-agent
+Status: done
 
 ## Parent
 
@@ -24,3 +24,7 @@ Make repeated clicks, network retries, and simultaneous next-Turn requests safe 
 ## Blocked by
 
 - [04 — Generate and display the first policy-compliant Turn](./04-generate-first-turn.md)
+
+## Comments
+
+- Implemented and independently reviewed on `main` (commit `6e14d30` plus follow-up hardening of `isRetryableProviderError` and staleness-guard deduplication). Verified: `bun run lint` (exit 0), `bun run typecheck` (exit 0), `bun run test` (112 tests passed), and `bun run build` (exit 0).
