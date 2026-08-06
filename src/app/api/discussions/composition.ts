@@ -1,5 +1,9 @@
 import { randomBytes } from "node:crypto";
 import {
+  ensureStorageDirectory,
+  resolveDiscussionEnvironment,
+} from "@/config/environment";
+import {
   DEFAULT_DISCUSSION_BUDGETS,
   DiscussionBudgetSchema,
 } from "@/discussion/budgets";
@@ -7,7 +11,9 @@ import { DiscussionRunner } from "@/discussion/discussion-runner";
 import {
   DiscussionService,
   InMemoryDiscussionStore,
+  isDurableDiscussionStore,
 } from "@/discussion/discussion-service";
+import { LibSQLDiscussionStore } from "@/discussion/libsql-discussion-store";
 import {
   DEFAULT_MAX_REQUEST_BODY_BYTES,
 } from "@/discussion/request-protection";
@@ -48,7 +54,39 @@ function envBudgetInt(name: string, fallback: number): number {
 }
 
 function createProcessHandlers(): DiscussionHttpHandlers {
-  const store = new InMemoryDiscussionStore();
+  const environment = resolveDiscussionEnvironment(process.env);
+
+  // Production uses the explicit durable adapter from the environment; the
+  // in-memory store is chosen only by the explicit development/test
+  // configuration (production fails startup when storage is missing).
+  if (environment.storage.kind === "durable") {
+    ensureStorageDirectory(environment.storage.url);
+  }
+  const store =
+    environment.storage.kind === "durable"
+      ? new LibSQLDiscussionStore({
+          url: environment.storage.url,
+          ...(environment.storage.authToken === undefined
+            ? {}
+            : { authToken: environment.storage.authToken }),
+        })
+      : new InMemoryDiscussionStore();
+
+  // Startup readiness: initialize the durable store and reconcile any
+  // Discussion left generating by a previous process before serving. A
+  // store failure is logged and surfaces as a stable 500 on every request.
+  const ready = isDurableDiscussionStore(store)
+    ? store.init().then(async () => {
+        await store.recoverInterrupted();
+      })
+    : Promise.resolve();
+  void ready.catch((error) => {
+    console.error(
+      "[discussion] Durable storage initialization failed; Discussion requests will fail until storage is available.",
+      error,
+    );
+  });
+
   const configuredTurnLimit = process.env.DISCUSSION_TURN_LIMIT;
   const service = new DiscussionService({
     store,
@@ -88,7 +126,7 @@ function createProcessHandlers(): DiscussionHttpHandlers {
   });
   const runner = new DiscussionRunner({ store, discussion, budgets });
   const processSigningKey =
-    process.env.DISCUSSION_SESSION_SECRET ??
+    environment.sessionSecret ??
     randomBytes(32).toString("base64url");
   const sessions = new SignedSessionManager(processSigningKey);
   const protection: DiscussionHttpProtection = {
@@ -113,7 +151,7 @@ function createProcessHandlers(): DiscussionHttpHandlers {
       DEFAULT_NETWORK_RATE_WINDOW_MS,
     ),
   };
-  return createDiscussionHttpHandlers(service, sessions, runner, protection);
+  return createDiscussionHttpHandlers(service, sessions, runner, protection, ready);
 }
 
 export const discussionHttpHandlers =

@@ -12,4 +12,8 @@ describe("production Mastra registry", () => {
     expect(mastra.listTools()).toEqual({});
     expect(mastra.listScorers()).toEqual({});
   });
+
+  it("configures explicit storage instead of the implicit in-memory fallback", () => {
+    expect(mastra.getStorage()).toBeDefined();
+  });
 });

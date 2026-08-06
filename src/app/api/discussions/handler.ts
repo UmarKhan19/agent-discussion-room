@@ -202,6 +202,7 @@ export function createDiscussionHttpHandlers(
   sessions: SignedSessionManager,
   runner: DiscussionRunner,
   protection: DiscussionHttpProtection = {},
+  ready: Promise<void> = Promise.resolve(),
 ) {
   const maxBodyBytes =
     protection.maxBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES;
@@ -292,8 +293,30 @@ export function createDiscussionHttpHandlers(
     return { ok: true, id: parsed.data };
   }
 
+  /**
+   * Returns a 500 envelope while the durable store is initializing, or a
+   * null to proceed. Production startup validates configuration before any
+   * request is served; this covers store failures after process start.
+   */
+  async function storageReadyResponse(): Promise<Response | null> {
+    try {
+      await ready;
+      return null;
+    } catch {
+      return errorResponse(500, {
+        code: "STORAGE_UNAVAILABLE",
+        message: "Discussion storage is not available; the server is still starting or storage is misconfigured.",
+        action: "Wait briefly and retry; check the server logs for storage errors.",
+        retryable: true,
+      });
+    }
+  }
+
   return {
     async post(request: Request): Promise<Response> {
+      const storageBlocked = await storageReadyResponse();
+      if (storageBlocked) return storageBlocked;
+
       const guarded = await authenticateRequest(request);
       if ("response" in guarded) return guarded.response;
       const { session } = guarded;
@@ -315,7 +338,7 @@ export function createDiscussionHttpHandlers(
       }
 
       try {
-        const discussion = service.start(session.id, parsedRequest.data.topic);
+        const discussion = await service.start(session.id, parsedRequest.data.topic);
         return discussionResponse(discussion, 201, session.setCookie);
       } catch (error) {
         if (error instanceof DiscussionPolicyBlockedError) {
@@ -348,6 +371,9 @@ export function createDiscussionHttpHandlers(
       request: Request,
       untrustedId: string,
     ): Promise<Response> {
+      const storageBlocked = await storageReadyResponse();
+      if (storageBlocked) return storageBlocked;
+
       const parsedId = parseDiscussionIdentifier(untrustedId);
       if (!parsedId.ok) return parsedId.response;
 
@@ -559,6 +585,9 @@ export function createDiscussionHttpHandlers(
       request: Request,
       untrustedId: string,
     ): Promise<Response> {
+      const storageBlocked = await storageReadyResponse();
+      if (storageBlocked) return storageBlocked;
+
       const parsedId = parseDiscussionIdentifier(untrustedId);
       if (!parsedId.ok) return parsedId.response;
 
@@ -567,7 +596,7 @@ export function createDiscussionHttpHandlers(
       const { session } = guarded;
 
       try {
-        const discussion = runner.stop(session.id, parsedId.id);
+        const discussion = await runner.stop(session.id, parsedId.id);
         if (!discussion) {
           return errorResponse(
             404,
@@ -608,6 +637,9 @@ export function createDiscussionHttpHandlers(
     },
 
     async get(request: Request, untrustedId: string): Promise<Response> {
+      const storageBlocked = await storageReadyResponse();
+      if (storageBlocked) return storageBlocked;
+
       const parsedId = parseDiscussionIdentifier(untrustedId);
       if (!parsedId.ok) return parsedId.response;
 
@@ -615,7 +647,7 @@ export function createDiscussionHttpHandlers(
       if ("response" in guarded) return guarded.response;
       const { session } = guarded;
 
-      const discussion = service.read(session.id, parsedId.id);
+      const discussion = await service.read(session.id, parsedId.id);
       if (!discussion) {
         return errorResponse(
           404,

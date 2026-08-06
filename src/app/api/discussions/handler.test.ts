@@ -1693,7 +1693,7 @@ describe("Discussion HTTP interface", () => {
     expect(fakeDiscussion.calls).toHaveLength(0);
 
     const sessionId = ownerCookie.split("=")[1]!.split(".")[0]!;
-    expect(store.readOwned(sessionId, discussionId)).toMatchObject({
+    expect(await store.readOwned(sessionId, discussionId)).toMatchObject({
       status: "idle",
       turnCount: 0,
       transcript: [],

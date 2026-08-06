@@ -24,6 +24,7 @@ import {
 import type {
   DiscussionStore,
   TurnFailure,
+  TurnMutationResult,
 } from "./discussion-service";
 import {
   DiscussionOutputPolicy,
@@ -252,10 +253,10 @@ export class DiscussionRunner {
     );
   }
 
-  stop(ownerSessionId: string, discussionId: string): DiscussionState | null {
+  async stop(ownerSessionId: string, discussionId: string): Promise<DiscussionState | null> {
     const sessionId = SessionIdentifierSchema.parse(ownerSessionId);
     const id = DiscussionIdentifierSchema.parse(discussionId);
-    const stopped = this.store.stopOwned(
+    const stopped = await this.store.stopOwned(
       sessionId,
       id,
       this.now().toISOString(),
@@ -301,7 +302,7 @@ export class DiscussionRunner {
     // Capacity guard: only requests that can start a fresh generation
     // reserve a process-wide slot. Observing a prior outcome (replay,
     // conflict, non-retryable failure) never reserves capacity.
-    const status = this.store.requestStatus(sessionId, id, stableRequestId);
+    const status = await this.store.requestStatus(sessionId, id, stableRequestId);
     const needsCapacity =
       status.kind === "unknown" ||
       (status.kind === "failed" && status.retryable);
@@ -311,7 +312,7 @@ export class DiscussionRunner {
     }
 
     try {
-      const claim = this.store.claimTurn({
+      const claim = await this.store.claimTurn({
         ownerSessionId: sessionId,
         discussionId: id,
         requestId: stableRequestId,
@@ -411,7 +412,7 @@ export class DiscussionRunner {
           throw new DiscussionInvalidGeneratedTurnError();
         }
 
-        const completed = this.store.completeTurn({
+        const completed = await this.store.completeTurn({
           ownerSessionId: sessionId,
           discussionId: id,
           requestId: stableRequestId,
@@ -435,7 +436,7 @@ export class DiscussionRunner {
         }
 
         const failure = failureForError(error);
-        const failed = this.store.failTurn({
+        const failed = await this.store.failTurn({
           ownerSessionId: sessionId,
           discussionId: id,
           requestId: stableRequestId,
@@ -521,11 +522,11 @@ export class DiscussionRunner {
     };
 
     active.timeout = setTimeout(() => {
-      this.cancelActiveGeneration(active, "timeout");
+      void this.cancelActiveGeneration(active, "timeout");
     }, this.budgets.generationTimeoutMs);
     if (input.disconnectSignal) {
       active.onDisconnect = () => {
-        this.cancelActiveGeneration(active, "disconnect");
+        void this.cancelActiveGeneration(active, "disconnect");
       };
       input.disconnectSignal.addEventListener("abort", active.onDisconnect, {
         once: true,
@@ -534,27 +535,39 @@ export class DiscussionRunner {
     this.activeGenerations.set(input.discussionId, active);
 
     if (input.disconnectSignal?.aborted) {
-      this.cancelActiveGeneration(active, "disconnect");
+      void this.cancelActiveGeneration(active, "disconnect");
     }
 
     return active;
   }
 
-  private cancelActiveGeneration(
+  private async cancelActiveGeneration(
     active: ActiveGeneration,
     reason: Extract<DiscussionTerminalReason, "disconnect" | "timeout">,
-  ): void {
+  ): Promise<void> {
     if (this.activeGenerations.get(active.discussionId) !== active) return;
 
-    const terminal = this.store.cancelTurn({
-      ownerSessionId: active.ownerSessionId,
-      discussionId: active.discussionId,
-      requestId: active.requestId,
-      attemptId: active.attemptId,
-      expectedTurn: active.turn,
-      reason,
-      updatedAt: this.now().toISOString(),
-    });
+    let terminal: TurnMutationResult;
+    try {
+      terminal = await this.store.cancelTurn({
+        ownerSessionId: active.ownerSessionId,
+        discussionId: active.discussionId,
+        requestId: active.requestId,
+        attemptId: active.attemptId,
+        expectedTurn: active.turn,
+        reason,
+        updatedAt: this.now().toISOString(),
+      });
+    } catch (error) {
+      // The store could not record the cancellation. The in-flight Turn is
+      // left running; its own completion path will surface the store failure
+      // to the participant instead of crashing the process.
+      console.error(
+        `[discussion] Failed to persist ${reason} cancellation for Discussion ${active.discussionId}`,
+        error,
+      );
+      return;
+    }
 
     if (terminal.kind === "updated") {
       this.abortPersistedGeneration(active, reason);

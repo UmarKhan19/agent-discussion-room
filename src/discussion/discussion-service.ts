@@ -5,28 +5,49 @@ import {
   DiscussionMessageSchema,
   DiscussionStateSchema,
   DiscussionTopicSchema,
+  PolicyCategorySchema,
   RequestIdentifierSchema,
   SessionIdentifierSchema,
   type DiscussionMessage,
   type DiscussionState,
   type DiscussionTerminalReason,
   type DiscussionTopic,
-  type PolicyCategory,
   type PolicyOutcome,
 } from "./contracts";
 import { DiscussionPolicy } from "./policy";
 
-export type TurnFailure =
-  | { kind: "generation_failed"; retryable: boolean }
-  | { kind: "invalid_response"; retryable: false }
-  | {
-      kind: "output_blocked";
-      retryable: false;
-      category: PolicyCategory;
-    }
-  | { kind: "output_limit_exceeded"; retryable: false }
-  | { kind: "timeout"; retryable: false }
-  | { kind: "stopped"; retryable: false };
+export const TurnFailureSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("generation_failed"),
+      retryable: z.boolean(),
+    })
+    .strict(),
+  z
+    .object({ kind: z.literal("invalid_response"), retryable: z.literal(false) })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("output_blocked"),
+      retryable: z.literal(false),
+      category: PolicyCategorySchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("output_limit_exceeded"),
+      retryable: z.literal(false),
+    })
+    .strict(),
+  z
+    .object({ kind: z.literal("timeout"), retryable: z.literal(false) })
+    .strict(),
+  z
+    .object({ kind: z.literal("stopped"), retryable: z.literal(false) })
+    .strict(),
+]);
+
+export type TurnFailure = z.infer<typeof TurnFailureSchema>;
 
 type TurnRequestRecord =
   | { status: "generating"; turn: number; attemptId: string }
@@ -75,20 +96,23 @@ export type RequestStatusResult =
   | { kind: "unknown" };
 
 export interface DiscussionStore {
-  create(ownerSessionId: string, discussion: DiscussionState): void;
-  readOwned(ownerSessionId: string, discussionId: string): DiscussionState | null;
+  create(ownerSessionId: string, discussion: DiscussionState): Promise<void>;
+  readOwned(
+    ownerSessionId: string,
+    discussionId: string,
+  ): Promise<DiscussionState | null>;
   requestStatus(
     ownerSessionId: string,
     discussionId: string,
     requestId: string,
-  ): RequestStatusResult;
+  ): Promise<RequestStatusResult>;
   claimTurn(input: {
     ownerSessionId: string;
     discussionId: string;
     requestId: string;
     attemptId: string;
     updatedAt: string;
-  }): ClaimTurnResult;
+  }): Promise<ClaimTurnResult>;
   completeTurn(input: {
     ownerSessionId: string;
     discussionId: string;
@@ -97,7 +121,7 @@ export interface DiscussionStore {
     expectedTurn: number;
     message: DiscussionMessage;
     updatedAt: string;
-  }): TurnMutationResult;
+  }): Promise<TurnMutationResult>;
   failTurn(input: {
     ownerSessionId: string;
     discussionId: string;
@@ -106,7 +130,7 @@ export interface DiscussionStore {
     expectedTurn: number;
     failure: TurnFailure;
     updatedAt: string;
-  }): TurnMutationResult;
+  }): Promise<TurnMutationResult>;
   cancelTurn(input: {
     ownerSessionId: string;
     discussionId: string;
@@ -115,19 +139,41 @@ export interface DiscussionStore {
     expectedTurn: number;
     reason: Extract<DiscussionTerminalReason, "disconnect" | "timeout">;
     updatedAt: string;
-  }): TurnMutationResult;
+  }): Promise<TurnMutationResult>;
   stopOwned(
     ownerSessionId: string,
     discussionId: string,
     updatedAt: string,
-  ): StopTurnResult;
+  ): Promise<StopTurnResult>;
+}
+
+/**
+ * Optional capability of stores that persist across process restarts.
+ * In-memory stores never hold state from a previous process, so they do not
+ * need initialization or interrupted-generation reconciliation.
+ */
+export interface DurableDiscussionStore extends DiscussionStore {
+  /** Creates the store schema; must complete before any other method. */
+  init(): Promise<void>;
+  /**
+   * Reconciles Discussions left generating by a process that exited before
+   * the generation finished: each becomes a retryable failed state so the
+   * participant can resume with the same request identity.
+   */
+  recoverInterrupted(): Promise<number>;
+}
+
+export function isDurableDiscussionStore(
+  store: DiscussionStore,
+): store is DurableDiscussionStore {
+  return typeof (store as DurableDiscussionStore).recoverInterrupted === "function";
 }
 
 function copyDiscussion(discussion: DiscussionState): DiscussionState {
   return DiscussionStateSchema.parse(structuredClone(discussion));
 }
 
-function copyFailure(failure: TurnFailure): TurnFailure {
+export function copyFailure(failure: TurnFailure): TurnFailure {
   return structuredClone(failure);
 }
 
@@ -161,11 +207,11 @@ function isCurrentAttempt(
   );
 }
 
-/** Explicit process-local store. Durable storage is introduced by the persistence ticket. */
+/** Explicit process-local store. Durable storage is the production path; see LibSQLDiscussionStore. */
 export class InMemoryDiscussionStore implements DiscussionStore {
   private readonly discussions = new Map<string, OwnedDiscussion>();
 
-  create(ownerSessionId: string, discussion: DiscussionState): void {
+  async create(ownerSessionId: string, discussion: DiscussionState): Promise<void> {
     this.discussions.set(discussion.id, {
       ownerSessionId: SessionIdentifierSchema.parse(ownerSessionId),
       state: copyDiscussion(discussion),
@@ -173,19 +219,19 @@ export class InMemoryDiscussionStore implements DiscussionStore {
     });
   }
 
-  readOwned(
+  async readOwned(
     ownerSessionId: string,
     discussionId: string,
-  ): DiscussionState | null {
+  ): Promise<DiscussionState | null> {
     const stored = ownedRecord(this.discussions, ownerSessionId, discussionId);
     return stored ? copyDiscussion(stored.state) : null;
   }
 
-  requestStatus(
+  async requestStatus(
     ownerSessionId: string,
     discussionId: string,
     requestId: string,
-  ): RequestStatusResult {
+  ): Promise<RequestStatusResult> {
     const stored = ownedRecord(
       this.discussions,
       SessionIdentifierSchema.parse(ownerSessionId),
@@ -200,13 +246,13 @@ export class InMemoryDiscussionStore implements DiscussionStore {
     return { kind: "failed", retryable: request.failure.retryable };
   }
 
-  claimTurn(input: {
+  async claimTurn(input: {
     ownerSessionId: string;
     discussionId: string;
     requestId: string;
     attemptId: string;
     updatedAt: string;
-  }): ClaimTurnResult {
+  }): Promise<ClaimTurnResult> {
     const stored = ownedRecord(
       this.discussions,
       SessionIdentifierSchema.parse(input.ownerSessionId),
@@ -268,7 +314,7 @@ export class InMemoryDiscussionStore implements DiscussionStore {
     };
   }
 
-  completeTurn(input: {
+  async completeTurn(input: {
     ownerSessionId: string;
     discussionId: string;
     requestId: string;
@@ -276,7 +322,7 @@ export class InMemoryDiscussionStore implements DiscussionStore {
     expectedTurn: number;
     message: DiscussionMessage;
     updatedAt: string;
-  }): TurnMutationResult {
+  }): Promise<TurnMutationResult> {
     const stored = ownedRecord(
       this.discussions,
       input.ownerSessionId,
@@ -311,7 +357,7 @@ export class InMemoryDiscussionStore implements DiscussionStore {
     return { kind: "updated", discussion: copyDiscussion(stored.state) };
   }
 
-  failTurn(input: {
+  async failTurn(input: {
     ownerSessionId: string;
     discussionId: string;
     requestId: string;
@@ -319,7 +365,7 @@ export class InMemoryDiscussionStore implements DiscussionStore {
     expectedTurn: number;
     failure: TurnFailure;
     updatedAt: string;
-  }): TurnMutationResult {
+  }): Promise<TurnMutationResult> {
     const stored = ownedRecord(
       this.discussions,
       input.ownerSessionId,
@@ -345,7 +391,7 @@ export class InMemoryDiscussionStore implements DiscussionStore {
     return { kind: "updated", discussion: copyDiscussion(stored.state) };
   }
 
-  cancelTurn(input: {
+  async cancelTurn(input: {
     ownerSessionId: string;
     discussionId: string;
     requestId: string;
@@ -353,7 +399,7 @@ export class InMemoryDiscussionStore implements DiscussionStore {
     expectedTurn: number;
     reason: Extract<DiscussionTerminalReason, "disconnect" | "timeout">;
     updatedAt: string;
-  }): TurnMutationResult {
+  }): Promise<TurnMutationResult> {
     const stored = ownedRecord(
       this.discussions,
       input.ownerSessionId,
@@ -382,11 +428,11 @@ export class InMemoryDiscussionStore implements DiscussionStore {
     return { kind: "updated", discussion: copyDiscussion(stored.state) };
   }
 
-  stopOwned(
+  async stopOwned(
     ownerSessionId: string,
     discussionId: string,
     updatedAt: string,
-  ): StopTurnResult {
+  ): Promise<StopTurnResult> {
     const stored = ownedRecord(this.discussions, ownerSessionId, discussionId);
     if (!stored) return { kind: "not_found" };
     if (stored.state.status === "stopped") {
@@ -456,7 +502,10 @@ export class DiscussionService {
     this.createId = options.createId ?? (() => crypto.randomUUID());
   }
 
-  start(ownerSessionId: string, untrustedTopic: unknown): DiscussionState {
+  async start(
+    ownerSessionId: string,
+    untrustedTopic: unknown,
+  ): Promise<DiscussionState> {
     const sessionId = SessionIdentifierSchema.parse(ownerSessionId);
     const topic: DiscussionTopic = DiscussionTopicSchema.parse(untrustedTopic);
     const policyOutcome = this.policy.evaluate(topic);
@@ -479,11 +528,14 @@ export class DiscussionService {
       transcript: [],
     });
 
-    this.store.create(sessionId, discussion);
+    await this.store.create(sessionId, discussion);
     return copyDiscussion(discussion);
   }
 
-  read(ownerSessionId: string, discussionId: string): DiscussionState | null {
+  async read(
+    ownerSessionId: string,
+    discussionId: string,
+  ): Promise<DiscussionState | null> {
     return this.store.readOwned(
       SessionIdentifierSchema.parse(ownerSessionId),
       discussionId,

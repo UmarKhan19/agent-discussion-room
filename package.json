@@ -17,6 +17,7 @@
     "sandcastle:resume": "bun .sandcastle/main.ts --resume"
   },
   "dependencies": {
+    "@libsql/client": "^0.17.4",
     "@mastra/core": "^1.55.0",
     "@mastra/duckdb": "^1.5.2",
     "@mastra/libsql": "^1.18.0",

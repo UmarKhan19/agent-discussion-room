@@ -214,6 +214,7 @@ export const ProductErrorCodeSchema = z.enum([
   "SESSION_QUOTA_EXCEEDED",
   "RATE_LIMITED",
   "INVALID_RESPONSE",
+  "STORAGE_UNAVAILABLE",
 ]);
 
 export const ProductErrorSchema = z
