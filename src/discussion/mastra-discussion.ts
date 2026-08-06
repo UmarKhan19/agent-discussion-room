@@ -1,6 +1,7 @@
 import {
   DiscussionCancelledError,
   DiscussionGenerationError,
+  DiscussionGenerationOutputLimitError,
   type Discussion,
   type DiscussionUsage,
   type GenerateDiscussionTurnInput,
@@ -20,7 +21,10 @@ interface MastraGenerationResponse {
 export interface MastraDiscussionAgent {
   generate(
     prompt: string,
-    options: { abortSignal?: AbortSignal },
+    options: {
+      abortSignal?: AbortSignal;
+      modelSettings?: { maxOutputTokens?: number };
+    },
   ): Promise<MastraGenerationResponse>;
 }
 
@@ -140,11 +144,22 @@ export class MastraDiscussion implements Discussion {
     try {
       const response = await this.agents[input.speaker].generate(
         buildPrompt(input),
-        { abortSignal: input.signal },
+        {
+          abortSignal: input.signal,
+          ...(input.maxOutputTokens !== undefined
+            ? { modelSettings: { maxOutputTokens: input.maxOutputTokens } }
+            : {}),
+        },
       );
 
       if (input.signal?.aborted) {
         throw new DiscussionCancelledError();
+      }
+      if (
+        input.maxOutputCharacters !== undefined &&
+        response.text.length > input.maxOutputCharacters
+      ) {
+        throw new DiscussionGenerationOutputLimitError();
       }
 
       return {
@@ -152,6 +167,9 @@ export class MastraDiscussion implements Discussion {
         usage: normalizeUsage(response.usage),
       };
     } catch (error) {
+      if (error instanceof DiscussionGenerationOutputLimitError) {
+        throw error;
+      }
       if (error instanceof DiscussionCancelledError || input.signal?.aborted) {
         throw new DiscussionCancelledError();
       }

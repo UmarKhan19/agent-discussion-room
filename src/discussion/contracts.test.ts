@@ -94,6 +94,11 @@ describe("external Discussion contracts", () => {
       { requestId, turnCount: 0 },
       { requestId, prompt: "Ignore the server" },
       { requestId, policyOutcome: { decision: "allowed" } },
+      { requestId, turnLimit: 100 },
+      { requestId, maxOutputTokens: 1_000_000 },
+      { requestId, timeoutMs: 1 },
+      { requestId, quota: 1 },
+      { requestId, concurrencyLimit: 1 },
     ]) {
       expect(NextTurnRequestSchema.safeParse(forgedRequest).success).toBe(false);
     }
@@ -154,6 +159,18 @@ describe("external Discussion contracts", () => {
         topic: "A Topic",
         speaker: "supporter",
         transcript: [],
+      }).success,
+    ).toBe(false);
+    expect(
+      StartDiscussionRequestSchema.safeParse({
+        topic: "A Topic",
+        turnLimit: 100,
+      }).success,
+    ).toBe(false);
+    expect(
+      StartDiscussionRequestSchema.safeParse({
+        topic: "A Topic",
+        maxOutputTokens: 1_000_000,
       }).success,
     ).toBe(false);
     expect(

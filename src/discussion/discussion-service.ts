@@ -24,6 +24,7 @@ export type TurnFailure =
       retryable: false;
       category: PolicyCategory;
     }
+  | { kind: "output_limit_exceeded"; retryable: false }
   | { kind: "timeout"; retryable: false }
   | { kind: "stopped"; retryable: false };
 
@@ -63,9 +64,24 @@ export type StopTurnResult =
   | { kind: "invalid_state" }
   | { kind: "not_found" };
 
+/**
+ * Non-mutating view of one request identity, used to decide whether a
+ * next-Turn call can start a generation or only observe prior work.
+ */
+export type RequestStatusResult =
+  | { kind: "succeeded" }
+  | { kind: "generating" }
+  | { kind: "failed"; retryable: boolean }
+  | { kind: "unknown" };
+
 export interface DiscussionStore {
   create(ownerSessionId: string, discussion: DiscussionState): void;
   readOwned(ownerSessionId: string, discussionId: string): DiscussionState | null;
+  requestStatus(
+    ownerSessionId: string,
+    discussionId: string,
+    requestId: string,
+  ): RequestStatusResult;
   claimTurn(input: {
     ownerSessionId: string;
     discussionId: string;
@@ -163,6 +179,25 @@ export class InMemoryDiscussionStore implements DiscussionStore {
   ): DiscussionState | null {
     const stored = ownedRecord(this.discussions, ownerSessionId, discussionId);
     return stored ? copyDiscussion(stored.state) : null;
+  }
+
+  requestStatus(
+    ownerSessionId: string,
+    discussionId: string,
+    requestId: string,
+  ): RequestStatusResult {
+    const stored = ownedRecord(
+      this.discussions,
+      SessionIdentifierSchema.parse(ownerSessionId),
+      discussionId,
+    );
+    const request = stored?.requests.get(
+      RequestIdentifierSchema.parse(requestId),
+    );
+    if (!request) return { kind: "unknown" };
+    if (request.status === "succeeded") return { kind: "succeeded" };
+    if (request.status === "generating") return { kind: "generating" };
+    return { kind: "failed", retryable: request.failure.retryable };
   }
 
   claimTurn(input: {

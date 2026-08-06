@@ -17,6 +17,16 @@ export interface GenerateDiscussionTurnInput {
   speaker: Speaker;
   transcript: readonly DiscussionMessage[];
   signal?: AbortSignal;
+  /**
+   * Server-owned output-token ceiling. Passed to the provider when it
+   * supports a token limit; never supplied by the client.
+   */
+  maxOutputTokens?: number;
+  /**
+   * Server-owned output-character ceiling. Enforced by the adapter and the
+   * Discussion Runner after generation; never supplied by the client.
+   */
+  maxOutputCharacters?: number;
 }
 
 export const GeneratedDiscussionTurnSchema = z
@@ -44,6 +54,14 @@ export class DiscussionGenerationError extends Error {
     super("Discussion generation failed");
     this.name = "DiscussionGenerationError";
     this.cause = cause;
+  }
+}
+
+/** The provider returned more output than the configured ceiling allows. */
+export class DiscussionGenerationOutputLimitError extends Error {
+  constructor() {
+    super("Discussion generation exceeded the configured output limit");
+    this.name = "DiscussionGenerationOutputLimitError";
   }
 }
 

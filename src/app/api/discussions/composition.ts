@@ -1,4 +1,8 @@
 import { randomBytes } from "node:crypto";
+import {
+  DEFAULT_DISCUSSION_BUDGETS,
+  DiscussionBudgetSchema,
+} from "@/discussion/budgets";
 import { DiscussionRunner } from "@/discussion/discussion-runner";
 import {
   DiscussionService,
@@ -31,6 +35,18 @@ function envPositiveInt(name: string, fallback: number): number {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+/**
+ * Reads one budget ceiling from the environment. Missing values use the
+ * safe default; present values are validated by `DiscussionBudgetSchema`,
+ * so an out-of-range or non-numeric value fails startup loudly instead of
+ * silently running with different budgets.
+ */
+function envBudgetInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  return Number(raw);
+}
+
 function createProcessHandlers(): DiscussionHttpHandlers {
   const store = new InMemoryDiscussionStore();
   const configuredTurnLimit = process.env.DISCUSSION_TURN_LIMIT;
@@ -40,7 +56,37 @@ function createProcessHandlers(): DiscussionHttpHandlers {
       ? {}
       : { turnLimit: Number(configuredTurnLimit) }),
   });
-  const runner = new DiscussionRunner({ store, discussion });
+  const budgets = DiscussionBudgetSchema.parse({
+    recentTranscriptTurns: envBudgetInt(
+      "DISCUSSION_RECENT_TRANSCRIPT_TURNS",
+      DEFAULT_DISCUSSION_BUDGETS.recentTranscriptTurns,
+    ),
+    transcriptCharacterBudget: envBudgetInt(
+      "DISCUSSION_TRANSCRIPT_CHARACTER_BUDGET",
+      DEFAULT_DISCUSSION_BUDGETS.transcriptCharacterBudget,
+    ),
+    maxOutputTokens: envBudgetInt(
+      "DISCUSSION_MAX_OUTPUT_TOKENS",
+      DEFAULT_DISCUSSION_BUDGETS.maxOutputTokens,
+    ),
+    maxOutputCharacters: envBudgetInt(
+      "DISCUSSION_MAX_OUTPUT_CHARACTERS",
+      DEFAULT_DISCUSSION_BUDGETS.maxOutputCharacters,
+    ),
+    generationTimeoutMs: envBudgetInt(
+      "DISCUSSION_GENERATION_TIMEOUT_MS",
+      DEFAULT_DISCUSSION_BUDGETS.generationTimeoutMs,
+    ),
+    maxConcurrentGenerations: envBudgetInt(
+      "DISCUSSION_MAX_CONCURRENT_GENERATIONS",
+      DEFAULT_DISCUSSION_BUDGETS.maxConcurrentGenerations,
+    ),
+    sessionGenerationQuota: envBudgetInt(
+      "DISCUSSION_SESSION_GENERATION_QUOTA",
+      DEFAULT_DISCUSSION_BUDGETS.sessionGenerationQuota,
+    ),
+  });
+  const runner = new DiscussionRunner({ store, discussion, budgets });
   const processSigningKey =
     process.env.DISCUSSION_SESSION_SECRET ??
     randomBytes(32).toString("base64url");

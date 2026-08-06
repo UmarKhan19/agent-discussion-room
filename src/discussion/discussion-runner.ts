@@ -10,9 +10,17 @@ import {
 } from "./contracts";
 import {
   DiscussionGenerationError,
+  DiscussionGenerationOutputLimitError,
   GeneratedDiscussionTurnSchema,
   type Discussion,
 } from "./discussion";
+
+export { DiscussionGenerationOutputLimitError } from "./discussion";
+import {
+  DEFAULT_DISCUSSION_BUDGETS,
+  DiscussionBudgetSchema,
+  type DiscussionBudgets,
+} from "./budgets";
 import type {
   DiscussionStore,
   TurnFailure,
@@ -21,8 +29,6 @@ import {
   DiscussionOutputPolicy,
   type DiscussionOutputPolicyEvaluator,
 } from "./policy";
-
-export const DEFAULT_GENERATION_TIMEOUT_MS = 30_000;
 
 export class DiscussionInvalidStateError extends Error {
   constructor() {
@@ -66,6 +72,22 @@ export class DiscussionGenerationTimeoutError extends Error {
   }
 }
 
+/** The process-wide simultaneous-generation ceiling is already in use. */
+export class DiscussionGenerationCapacityError extends Error {
+  constructor() {
+    super("Discussion generation capacity is exhausted");
+    this.name = "DiscussionGenerationCapacityError";
+  }
+}
+
+/** The owning session has claimed its configured generation quota. */
+export class DiscussionSessionQuotaExceededError extends Error {
+  constructor() {
+    super("Discussion session generation quota exceeded");
+    this.name = "DiscussionSessionQuotaExceededError";
+  }
+}
+
 export class DiscussionOutputPolicyBlockedError extends Error {
   constructor(readonly category: PolicyCategory) {
     super("Generated Turn was blocked by output policy");
@@ -94,34 +116,32 @@ export interface DiscussionRunnerOptions {
   now?: () => Date;
   createMessageId?: () => string;
   createAttemptId?: () => string;
-  generationTimeoutMs?: number;
+  /**
+   * Server-owned generation budgets. Values merge over the safe defaults
+   * and are validated against the hard maximums; the client cannot submit
+   * any budget.
+   */
+  budgets?: Partial<DiscussionBudgets>;
 }
 
-const RECENT_TRANSCRIPT_TURN_LIMIT = 8;
-const TRANSCRIPT_CHARACTER_BUDGET = 32_000;
+/**
+ * Process-wide generation capacity. Only claimed generation work holds a
+ * slot; replays, duplicates, and requests rejected before claim do not.
+ */
+class GenerationCapacity {
+  private inUse = 0;
 
-function selectGenerationTranscript(
-  transcript: DiscussionState["transcript"],
-): DiscussionState["transcript"] {
-  const selected = [] as DiscussionState["transcript"];
-  let characterCount = 0;
+  constructor(private readonly max: number) {}
 
-  for (
-    let index = transcript.length - 1;
-    index >= 0 && selected.length < RECENT_TRANSCRIPT_TURN_LIMIT;
-    index -= 1
-  ) {
-    const message = transcript[index];
-    if (!message) continue;
-    if (characterCount + message.content.length > TRANSCRIPT_CHARACTER_BUDGET) {
-      break;
-    }
-
-    selected.unshift(message);
-    characterCount += message.content.length;
+  tryAcquire(): boolean {
+    if (this.inUse >= this.max) return false;
+    this.inUse += 1;
+    return true;
   }
 
-  return selected;
+  release(): void {
+    this.inUse = Math.max(0, this.inUse - 1);
+  }
 }
 
 interface ActiveGeneration {
@@ -156,6 +176,9 @@ function failureForError(error: unknown): TurnFailure {
   if (error instanceof DiscussionInvalidGeneratedTurnError) {
     return { kind: "invalid_response", retryable: false };
   }
+  if (error instanceof DiscussionGenerationOutputLimitError) {
+    return { kind: "output_limit_exceeded", retryable: false };
+  }
   if (error instanceof DiscussionGenerationError) {
     return { kind: "generation_failed", retryable: error.retryable };
   }
@@ -171,6 +194,8 @@ function errorForFailure(failure: TurnFailure): Error {
       return new DiscussionOutputPolicyBlockedError(failure.category);
     case "invalid_response":
       return new DiscussionInvalidGeneratedTurnError();
+    case "output_limit_exceeded":
+      return new DiscussionGenerationOutputLimitError();
     case "timeout":
       return new DiscussionGenerationTimeoutError();
     case "stopped":
@@ -196,8 +221,17 @@ export class DiscussionRunner {
   private readonly now: () => Date;
   private readonly createMessageId: () => string;
   private readonly createAttemptId: () => string;
-  private readonly generationTimeoutMs: number;
+  private readonly budgets: DiscussionBudgets;
+  private readonly capacity: GenerationCapacity;
   private readonly activeGenerations = new Map<string, ActiveGeneration>();
+  /**
+   * Session -> generation charge keys. A key is `discussionId/requestId`, so
+   * reusing one request identity across Discussions charges each Discussion
+   * separately while a retry of the same identity in the same Discussion is
+   * charged at most once. Replays, conflicts, and rejected duplicates never
+   * charge.
+   */
+  private readonly chargedGenerationKeys = new Map<string, Set<string>>();
 
   constructor(options: DiscussionRunnerOptions) {
     this.store = options.store;
@@ -209,15 +243,13 @@ export class DiscussionRunner {
       options.createMessageId ?? (() => crypto.randomUUID());
     this.createAttemptId =
       options.createAttemptId ?? (() => crypto.randomUUID());
-    this.generationTimeoutMs =
-      options.generationTimeoutMs ?? DEFAULT_GENERATION_TIMEOUT_MS;
-
-    if (
-      !Number.isFinite(this.generationTimeoutMs) ||
-      this.generationTimeoutMs <= 0
-    ) {
-      throw new RangeError("Generation timeout must be a positive number");
-    }
+    this.budgets = DiscussionBudgetSchema.parse({
+      ...DEFAULT_DISCUSSION_BUDGETS,
+      ...options.budgets,
+    });
+    this.capacity = new GenerationCapacity(
+      this.budgets.maxConcurrentGenerations,
+    );
   }
 
   stop(ownerSessionId: string, discussionId: string): DiscussionState | null {
@@ -250,142 +282,214 @@ export class DiscussionRunner {
     const id = DiscussionIdentifierSchema.parse(discussionId);
     const stableRequestId = RequestIdentifierSchema.parse(requestId);
     const attemptId = RequestIdentifierSchema.parse(this.createAttemptId());
-    const claim = this.store.claimTurn({
-      ownerSessionId: sessionId,
-      discussionId: id,
-      requestId: stableRequestId,
-      attemptId,
-      updatedAt: this.now().toISOString(),
-    });
 
-    switch (claim.kind) {
-      case "not_found":
-        return null;
-      case "replay":
-        return claim.discussion;
-      case "request_in_progress":
-        throw new DiscussionRequestInProgressError();
-      case "turn_in_progress":
-        throw new DiscussionTurnInProgressError();
-      case "failed":
-        throw errorForFailure(claim.failure);
-      case "completed":
-        throw new DiscussionCompletedError();
-      case "invalid_state":
-        throw new DiscussionInvalidStateError();
-      case "claimed":
-        break;
+    // Quota guard: charged before any generation starts, and only once per
+    // (Discussion, request identity) pair. Replayed, in-flight, and rejected
+    // duplicate requests are already charged or never claim, so they are not
+    // blocked and never double charge; reusing an identity in a fresh
+    // Discussion still counts against the session quota.
+    const chargeKey = `${id}/${stableRequestId}`;
+    const sessionCharges =
+      this.chargedGenerationKeys.get(sessionId) ?? new Set<string>();
+    if (
+      !sessionCharges.has(chargeKey) &&
+      sessionCharges.size >= this.budgets.sessionGenerationQuota
+    ) {
+      throw new DiscussionSessionQuotaExceededError();
     }
 
-    const generating = claim.discussion;
-    const turn = claim.turn;
-    const active = this.createActiveGeneration({
-      ownerSessionId: sessionId,
-      discussionId: id,
-      requestId: stableRequestId,
-      attemptId: claim.attemptId,
-      turn,
-      disconnectSignal: signal,
-    });
-    const speaker = speakerForTurn(turn);
-    const generationTranscript = selectGenerationTranscript(
-      generating.transcript,
-    );
+    // Capacity guard: only requests that can start a fresh generation
+    // reserve a process-wide slot. Observing a prior outcome (replay,
+    // conflict, non-retryable failure) never reserves capacity.
+    const status = this.store.requestStatus(sessionId, id, stableRequestId);
+    const needsCapacity =
+      status.kind === "unknown" ||
+      (status.kind === "failed" && status.retryable);
+    const capacityHeld = needsCapacity && this.capacity.tryAcquire();
+    if (needsCapacity && !capacityHeld) {
+      throw new DiscussionGenerationCapacityError();
+    }
 
     try {
-      const generated = active.controller.signal.aborted
-        ? active.cancellation
-        : this.discussion.generateTurn({
-            topic: generating.topic,
-            speaker,
-            transcript: generationTranscript,
-            signal: active.controller.signal,
-          });
-      const generatedResult = GeneratedDiscussionTurnSchema.safeParse(
-        await Promise.race([generated, active.cancellation]),
-      );
-
-      if (active.controller.signal.aborted) {
-        throw cancellationError(active.reason ?? "disconnect");
-      }
-      if (!generatedResult.success) {
-        throw new DiscussionInvalidGeneratedTurnError();
-      }
-
-      const outputPolicyOutcome = this.outputPolicy.evaluate(
-        generatedResult.data.content,
-      );
-      if (outputPolicyOutcome.decision === "blocked") {
-        throw new DiscussionOutputPolicyBlockedError(
-          outputPolicyOutcome.category,
-        );
-      }
-
-      const timestamp = this.now().toISOString();
-      const messageResult = DiscussionMessageSchema.safeParse({
-        id: this.createMessageId(),
-        content: generatedResult.data.content,
-        speaker,
-        createdAt: timestamp,
-        turn,
-        generation: {
-          requestId: stableRequestId,
-          ...(generatedResult.data.usage
-            ? { usage: generatedResult.data.usage }
-            : {}),
-          outputPolicyOutcome,
-        },
-      });
-      if (!messageResult.success) {
-        throw new DiscussionInvalidGeneratedTurnError();
-      }
-
-      const completed = this.store.completeTurn({
+      const claim = this.store.claimTurn({
         ownerSessionId: sessionId,
         discussionId: id,
         requestId: stableRequestId,
-        attemptId: claim.attemptId,
-        expectedTurn: turn,
-        message: messageResult.data,
-        updatedAt: timestamp,
-      });
-      if (completed.kind === "updated") return completed.discussion;
-      if (completed.kind === "stale") {
-        throw errorForTerminalState(completed.discussion) ??
-          new DiscussionInvalidStateError();
-      }
-      throw new DiscussionInvalidGeneratedTurnError();
-    } catch (error) {
-      if (active.reason === "timeout") {
-        throw new DiscussionGenerationTimeoutError();
-      }
-      if (active.reason === "stop" || active.reason === "disconnect") {
-        throw new DiscussionStoppedError();
-      }
-
-      const failure = failureForError(error);
-      const failed = this.store.failTurn({
-        ownerSessionId: sessionId,
-        discussionId: id,
-        requestId: stableRequestId,
-        attemptId: claim.attemptId,
-        expectedTurn: turn,
-        failure,
+        attemptId,
         updatedAt: this.now().toISOString(),
       });
-      if (failed.kind === "stale") {
-        throw errorForTerminalState(failed.discussion) ??
-          (error instanceof DiscussionInvalidStateError
-            ? error
-            : new DiscussionInvalidStateError());
+
+      switch (claim.kind) {
+        case "not_found":
+          return null;
+        case "replay":
+          return claim.discussion;
+        case "request_in_progress":
+          throw new DiscussionRequestInProgressError();
+        case "turn_in_progress":
+          throw new DiscussionTurnInProgressError();
+        case "failed":
+          throw errorForFailure(claim.failure);
+        case "completed":
+          throw new DiscussionCompletedError();
+        case "invalid_state":
+          throw new DiscussionInvalidStateError();
+        case "claimed":
+          sessionCharges.add(chargeKey);
+          this.chargedGenerationKeys.set(sessionId, sessionCharges);
+          break;
       }
-      if (failed.kind === "not_found") {
+
+      const generating = claim.discussion;
+      const turn = claim.turn;
+      const active = this.createActiveGeneration({
+        ownerSessionId: sessionId,
+        discussionId: id,
+        requestId: stableRequestId,
+        attemptId: claim.attemptId,
+        turn,
+        disconnectSignal: signal,
+      });
+      const speaker = speakerForTurn(turn);
+      const generationTranscript = this.selectGenerationTranscript(
+        generating.transcript,
+      );
+
+      try {
+        const generated = active.controller.signal.aborted
+          ? active.cancellation
+          : this.discussion.generateTurn({
+              topic: generating.topic,
+              speaker,
+              transcript: generationTranscript,
+              signal: active.controller.signal,
+              maxOutputTokens: this.budgets.maxOutputTokens,
+              maxOutputCharacters: this.budgets.maxOutputCharacters,
+            });
+        const generatedResult = GeneratedDiscussionTurnSchema.safeParse(
+          await Promise.race([generated, active.cancellation]),
+        );
+
+        if (active.controller.signal.aborted) {
+          throw cancellationError(active.reason ?? "disconnect");
+        }
+        if (!generatedResult.success) {
+          throw new DiscussionInvalidGeneratedTurnError();
+        }
+        if (
+          generatedResult.data.content.length >
+          this.budgets.maxOutputCharacters
+        ) {
+          throw new DiscussionGenerationOutputLimitError();
+        }
+
+        const outputPolicyOutcome = this.outputPolicy.evaluate(
+          generatedResult.data.content,
+        );
+        if (outputPolicyOutcome.decision === "blocked") {
+          throw new DiscussionOutputPolicyBlockedError(
+            outputPolicyOutcome.category,
+          );
+        }
+
+        const timestamp = this.now().toISOString();
+        const messageResult = DiscussionMessageSchema.safeParse({
+          id: this.createMessageId(),
+          content: generatedResult.data.content,
+          speaker,
+          createdAt: timestamp,
+          turn,
+          generation: {
+            requestId: stableRequestId,
+            ...(generatedResult.data.usage
+              ? { usage: generatedResult.data.usage }
+              : {}),
+            outputPolicyOutcome,
+          },
+        });
+        if (!messageResult.success) {
+          throw new DiscussionInvalidGeneratedTurnError();
+        }
+
+        const completed = this.store.completeTurn({
+          ownerSessionId: sessionId,
+          discussionId: id,
+          requestId: stableRequestId,
+          attemptId: claim.attemptId,
+          expectedTurn: turn,
+          message: messageResult.data,
+          updatedAt: timestamp,
+        });
+        if (completed.kind === "updated") return completed.discussion;
+        if (completed.kind === "stale") {
+          throw errorForTerminalState(completed.discussion) ??
+            new DiscussionInvalidStateError();
+        }
         throw new DiscussionInvalidGeneratedTurnError();
+      } catch (error) {
+        if (active.reason === "timeout") {
+          throw new DiscussionGenerationTimeoutError();
+        }
+        if (active.reason === "stop" || active.reason === "disconnect") {
+          throw new DiscussionStoppedError();
+        }
+
+        const failure = failureForError(error);
+        const failed = this.store.failTurn({
+          ownerSessionId: sessionId,
+          discussionId: id,
+          requestId: stableRequestId,
+          attemptId: claim.attemptId,
+          expectedTurn: turn,
+          failure,
+          updatedAt: this.now().toISOString(),
+        });
+        if (failed.kind === "stale") {
+          throw errorForTerminalState(failed.discussion) ??
+            (error instanceof DiscussionInvalidStateError
+              ? error
+              : new DiscussionInvalidStateError());
+        }
+        if (failed.kind === "not_found") {
+          throw new DiscussionInvalidGeneratedTurnError();
+        }
+        throw errorForFailure(failure);
+      } finally {
+        this.releaseActiveGeneration(active);
       }
-      throw errorForFailure(failure);
     } finally {
-      this.releaseActiveGeneration(active);
+      // Reserved capacity is released on every path: completion, failure,
+      // timeout, Stop, disconnect, late results, and claims that turned out
+      // to be replays or conflicts.
+      if (capacityHeld) this.capacity.release();
     }
+  }
+
+  private selectGenerationTranscript(
+    transcript: DiscussionState["transcript"],
+  ): DiscussionState["transcript"] {
+    const selected = [] as DiscussionState["transcript"];
+    let characterCount = 0;
+
+    for (
+      let index = transcript.length - 1;
+      index >= 0 && selected.length < this.budgets.recentTranscriptTurns;
+      index -= 1
+    ) {
+      const message = transcript[index];
+      if (!message) continue;
+      if (
+        characterCount + message.content.length >
+        this.budgets.transcriptCharacterBudget
+      ) {
+        break;
+      }
+
+      selected.unshift(message);
+      characterCount += message.content.length;
+    }
+
+    return selected;
   }
 
   private createActiveGeneration(input: {
@@ -418,7 +522,7 @@ export class DiscussionRunner {
 
     active.timeout = setTimeout(() => {
       this.cancelActiveGeneration(active, "timeout");
-    }, this.generationTimeoutMs);
+    }, this.budgets.generationTimeoutMs);
     if (input.disconnectSignal) {
       active.onDisconnect = () => {
         this.cancelActiveGeneration(active, "disconnect");

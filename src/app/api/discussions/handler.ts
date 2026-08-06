@@ -38,11 +38,14 @@ export interface DiscussionHttpProtection {
 }
 import {
   DiscussionCompletedError,
+  DiscussionGenerationCapacityError,
   DiscussionGenerationFailedError,
+  DiscussionGenerationOutputLimitError,
   DiscussionGenerationTimeoutError,
   DiscussionInvalidGeneratedTurnError,
   DiscussionInvalidStateError,
   DiscussionRequestInProgressError,
+  DiscussionSessionQuotaExceededError,
   DiscussionTurnInProgressError,
   DiscussionOutputPolicyBlockedError,
   DiscussionStoppedError,
@@ -415,6 +418,31 @@ export function createDiscussionHttpHandlers(
           );
         }
 
+        if (error instanceof DiscussionSessionQuotaExceededError) {
+          return errorResponse(
+            429,
+            {
+              code: "SESSION_QUOTA_EXCEEDED",
+              message: "This session has reached its generation quota.",
+              action: "Start a fresh session, or try again later.",
+            },
+            session.setCookie,
+          );
+        }
+
+        if (error instanceof DiscussionGenerationCapacityError) {
+          return errorResponse(
+            503,
+            {
+              code: "GENERATION_CAPACITY_EXCEEDED",
+              message: "The server has reached its simultaneous generation limit.",
+              action: "Wait for an active generation to finish, then retry with the same request identity.",
+              retryable: true,
+            },
+            session.setCookie,
+          );
+        }
+
         if (error instanceof DiscussionCompletedError) {
           return errorResponse(
             409,
@@ -458,6 +486,18 @@ export function createDiscussionHttpHandlers(
             {
               code: "INVALID_RESPONSE",
               message: "The generated Turn did not match the safe response contract.",
+              action: "Start a new Discussion or try again later.",
+            },
+            session.setCookie,
+          );
+        }
+
+        if (error instanceof DiscussionGenerationOutputLimitError) {
+          return errorResponse(
+            502,
+            {
+              code: "OUTPUT_LIMIT_EXCEEDED",
+              message: "The generated Turn exceeded the configured output limit.",
               action: "Start a new Discussion or try again later.",
             },
             session.setCookie,

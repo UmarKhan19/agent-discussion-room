@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DiscussionCancelledError,
   DiscussionGenerationError,
+  DiscussionGenerationOutputLimitError,
   type Discussion,
   type GenerateDiscussionTurnInput,
   type GeneratedDiscussionTurn,
@@ -96,6 +97,66 @@ describe("MastraDiscussion provider error normalization", () => {
         retryable,
       });
     }
+  });
+});
+
+describe("MastraDiscussion output budgets", () => {
+  it("passes the server output-token ceiling to the provider", async () => {
+    let receivedOptions:
+      | { abortSignal?: AbortSignal; modelSettings?: { maxOutputTokens?: number } }
+      | undefined;
+    const agent = {
+      generate: async (
+        _prompt: string,
+        options: {
+          abortSignal?: AbortSignal;
+          modelSettings?: { maxOutputTokens?: number };
+        },
+      ) => {
+        receivedOptions = options;
+        return { text: controlledResult.content };
+      },
+    };
+    const discussion = new MastraDiscussion({
+      supporter: agent,
+      opponent: agent,
+    });
+
+    await discussion.generateTurn({
+      ...request,
+      maxOutputTokens: 2_000,
+      maxOutputCharacters: 8_000,
+    });
+
+    expect(receivedOptions?.modelSettings).toEqual({ maxOutputTokens: 2_000 });
+  });
+
+  it("enforces the output-character ceiling with a stable non-retryable error", async () => {
+    const agent = {
+      generate: async () => ({ text: "x".repeat(100) }),
+    };
+    const discussion = new MastraDiscussion({
+      supporter: agent,
+      opponent: agent,
+    });
+
+    await expect(
+      discussion.generateTurn({ ...request, maxOutputCharacters: 50 }),
+    ).rejects.toBeInstanceOf(DiscussionGenerationOutputLimitError);
+  });
+
+  it("accepts output exactly at the character ceiling", async () => {
+    const agent = {
+      generate: async () => ({ text: "y".repeat(50) }),
+    };
+    const discussion = new MastraDiscussion({
+      supporter: agent,
+      opponent: agent,
+    });
+
+    await expect(
+      discussion.generateTurn({ ...request, maxOutputCharacters: 50 }),
+    ).resolves.toEqual({ content: "y".repeat(50) });
   });
 });
 

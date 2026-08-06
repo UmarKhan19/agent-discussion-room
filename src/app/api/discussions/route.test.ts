@@ -135,4 +135,24 @@ describe("Discussion routes", () => {
       "DISCUSSION_NOT_FOUND",
     );
   });
+
+  it.each([
+    "DISCUSSION_TURN_LIMIT",
+    "DISCUSSION_RECENT_TRANSCRIPT_TURNS",
+    "DISCUSSION_TRANSCRIPT_CHARACTER_BUDGET",
+    "DISCUSSION_MAX_OUTPUT_TOKENS",
+    "DISCUSSION_MAX_OUTPUT_CHARACTERS",
+    "DISCUSSION_GENERATION_TIMEOUT_MS",
+    "DISCUSSION_MAX_CONCURRENT_GENERATIONS",
+    "DISCUSSION_SESSION_GENERATION_QUOTA",
+  ])(
+    "fails startup loudly when a budget environment value is out of range: %s",
+    async (name) => {
+      vi.stubEnv(name, "999999999");
+      delete (globalThis as { discussionHttpHandlers?: unknown })
+        .discussionHttpHandlers;
+      vi.resetModules();
+      await expect(import("./route")).rejects.toThrow();
+    },
+  );
 });
