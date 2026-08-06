@@ -1,6 +1,6 @@
 # Reject oversized and abusive endpoint traffic
 
-Status: ready-for-agent
+Status: done
 
 ## Parent
 
@@ -12,14 +12,18 @@ Protect every public Discussion operation from oversized payloads and abusive re
 
 ## Acceptance criteria
 
-- [ ] Request body, string, array, identifier, and content-type limits are enforced before expensive parsing, policy checks, storage work, or model generation wherever practical.
-- [ ] Oversized or malformed traffic receives a stable 400-series response and cannot create or mutate a Discussion.
-- [ ] Per-signed-session rate limits prevent one participant from exhausting endpoint or provider capacity.
-- [ ] A separately keyed network-level rate limit provides protection when callers create or discard sessions repeatedly.
-- [ ] Rate-limit responses use a stable product error, identify that waiting is appropriate, and expose retry timing when available.
-- [ ] Ownership checks remain enforced and rate-limit keys do not expose session secrets or treat a guessable Discussion identifier as authorization.
-- [ ] Deterministic tests with a controlled clock prove limits, reset behavior, independent callers, malformed requests, and that blocked traffic never invokes the generator.
+- [x] Request body, string, array, identifier, and content-type limits are enforced before expensive parsing, policy checks, storage work, or model generation wherever practical.
+- [x] Oversized or malformed traffic receives a stable 400-series response and cannot create or mutate a Discussion.
+- [x] Per-signed-session rate limits prevent one participant from exhausting endpoint or provider capacity.
+- [x] A separately keyed network-level rate limit provides protection when callers create or discard sessions repeatedly.
+- [x] Rate-limit responses use a stable product error, identify that waiting is appropriate, and expose retry timing when available.
+- [x] Ownership checks remain enforced and rate-limit keys do not expose session secrets or treat a guessable Discussion identifier as authorization.
+- [x] Deterministic tests with a controlled clock prove limits, reset behavior, independent callers, malformed requests, and that blocked traffic never invokes the generator.
 
 ## Blocked by
 
 - [03 — Start and read a safe, session-owned Discussion](./03-start-session-owned-discussion.md)
+
+## Comments
+
+- Implemented and independently reviewed on `main` (commits `7c8c880` and `1caa281`). Verified: `bun run lint` (exit 0), `bun run typecheck` (exit 0), `bun run test` (152 tests passed), and `bun run build` (exit 0).
