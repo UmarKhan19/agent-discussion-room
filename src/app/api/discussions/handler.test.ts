@@ -21,7 +21,7 @@ import {
   DISCUSSION_SESSION_COOKIE,
   SignedSessionManager,
 } from "@/discussion/signed-session";
-import { createDiscussionHttpHandlers } from "./handler";
+import { createDiscussionHttpHandlers, type DiscussionHttpProtection } from "./handler";
 
 const now = new Date("2026-08-02T12:00:00.000Z");
 const discussionId = "11111111-1111-4111-8111-111111111111";
@@ -60,12 +60,14 @@ function jsonRequest(
   cookie?: string,
   url = "http://localhost/api/discussions",
   signal?: AbortSignal,
+  extraHeaders: Record<string, string> = {},
 ): Request {
   return new Request(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       ...(cookie ? { Cookie: cookie } : {}),
+      ...extraHeaders,
     },
     body: JSON.stringify(body),
     signal,
@@ -100,13 +102,14 @@ describe("Discussion HTTP interface", () => {
   let store: InMemoryDiscussionStore;
   let service: DiscussionService;
   let fakeDiscussion: FakeDiscussion;
+  let runner: DiscussionRunner;
   let handlers: ReturnType<typeof createDiscussionHttpHandlers>;
 
   function useDiscussion(
     discussion: Discussion,
     generationTimeoutMs?: number,
   ): void {
-    const runner = new DiscussionRunner({
+    runner = new DiscussionRunner({
       store,
       discussion,
       outputPolicy: new DiscussionOutputPolicy(() => now),
@@ -138,6 +141,17 @@ describe("Discussion HTTP interface", () => {
   function useFake(outcomes: readonly FakeDiscussionOutcome[]): void {
     fakeDiscussion = new FakeDiscussion(outcomes);
     useDiscussion(fakeDiscussion);
+  }
+
+  function useProtectedHandlers(
+    protection: DiscussionHttpProtection,
+  ): void {
+    handlers = createDiscussionHttpHandlers(
+      service,
+      sessions,
+      runner,
+      protection,
+    );
   }
 
   async function waitForFakeCall(): Promise<void> {
@@ -223,6 +237,7 @@ describe("Discussion HTTP interface", () => {
     const response = await handlers.post(
       new Request("http://localhost/api/discussions", {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: "{",
       }),
     );
@@ -1349,5 +1364,343 @@ describe("Discussion HTTP interface", () => {
     expect(ErrorResponseSchema.parse(await response.json()).error.code).toBe(
       "INVALID_DISCUSSION_ID",
     );
+  });
+
+  it.each([
+    "text/plain",
+    "application/x-www-form-urlencoded",
+    "multipart/form-data",
+  ])("rejects a non-JSON content type %s before parsing or creating state", async (contentType) => {
+    const response = await handlers.post(
+      new Request("http://localhost/api/discussions", {
+        method: "POST",
+        headers: { "Content-Type": contentType },
+        body: JSON.stringify({ topic: "A permitted Topic" }),
+      }),
+    );
+    const payload = ErrorResponseSchema.parse(await response.json());
+
+    expect(response.status).toBe(415);
+    expect(payload.error.code).toBe("CONTENT_TYPE_UNSUPPORTED");
+    expect(idCalls).toBe(0);
+  });
+
+  it("rejects a body that declares no content type", async () => {
+    const response = await handlers.post(
+      new Request("http://localhost/api/discussions", {
+        method: "POST",
+        body: JSON.stringify({ topic: "A permitted Topic" }),
+      }),
+    );
+
+    expect(response.status).toBe(415);
+    expect(
+      ErrorResponseSchema.parse(await response.json()).error.code,
+    ).toBe("CONTENT_TYPE_UNSUPPORTED");
+    expect(idCalls).toBe(0);
+  });
+
+  it("accepts a JSON content type with parameters", async () => {
+    const response = await handlers.post(
+      new Request("http://localhost/api/discussions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ topic: "A permitted Topic" }),
+      }),
+    );
+
+    expect(response.status).toBe(201);
+    expect(idCalls).toBe(1);
+  });
+
+  it("rejects an oversized body before parsing or creating state", async () => {
+    useProtectedHandlers({ maxBodyBytes: 128 });
+    const accepted = await handlers.post(
+      jsonRequest({ topic: "A permitted Topic" }),
+    );
+    expect(accepted.status).toBe(201);
+
+    const oversized = await handlers.post(
+      jsonRequest({ topic: "x".repeat(200) }),
+    );
+    const payload = ErrorResponseSchema.parse(await oversized.json());
+
+    expect(oversized.status).toBe(413);
+    expect(payload.error.code).toBe("BODY_TOO_LARGE");
+    expect(payload.error.action.length).toBeGreaterThan(10);
+    expect(idCalls).toBe(1);
+  });
+
+  it("abandons a streamed body that exceeds the limit mid-read", async () => {
+    useProtectedHandlers({ maxBodyBytes: 128 });
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(JSON.stringify({ topic: "x".repeat(200) })),
+        );
+        controller.close();
+      },
+    });
+    const response = await handlers.post(
+      new Request("http://localhost/api/discussions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: stream,
+        duplex: "half",
+      } as RequestInit),
+    );
+
+    expect(response.status).toBe(413);
+    expect(
+      ErrorResponseSchema.parse(await response.json()).error.code,
+    ).toBe("BODY_TOO_LARGE");
+    expect(idCalls).toBe(0);
+  });
+
+  it("rejects an oversized Discussion identifier before any state access", async () => {
+    const longId = "a".repeat(1000);
+    const response = await handlers.get(
+      new Request(`http://localhost/api/discussions/${longId}`),
+      longId,
+    );
+
+    expect(response.status).toBe(400);
+    expect(
+      ErrorResponseSchema.parse(await response.json()).error.code,
+    ).toBe("INVALID_DISCUSSION_ID");
+  });
+
+  it("rejects requests beyond the per-session limit with retry timing", async () => {
+    vi.useFakeTimers();
+    useProtectedHandlers({
+      sessionRateLimit: 2,
+      sessionRateWindowMs: 60_000,
+    });
+    const created = await handlers.post(
+      jsonRequest({ topic: "A permitted Topic" }),
+    );
+    expect(created.status).toBe(201);
+    const ownerCookie = cookiePair(created);
+
+    const second = await handlers.post(
+      jsonRequest({ topic: "A second permitted Topic" }, ownerCookie),
+    );
+    expect(second.status).toBe(201);
+
+    const blocked = await handlers.post(
+      jsonRequest({ topic: "A third Topic" }, ownerCookie),
+    );
+    const payload = ErrorResponseSchema.parse(await blocked.json());
+
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers.get("retry-after")).toBe("60");
+    expect(blocked.headers.get("cache-control")).toBe("private, no-store");
+    expect(blocked.headers.get("vary")).toBe("Cookie");
+    expect(payload.error).toMatchObject({
+      code: "RATE_LIMITED",
+      retryable: true,
+      retryAfterSeconds: 60,
+    });
+    expect(payload.error.message).toMatch(/wait/i);
+    expect(idCalls).toBe(2);
+  });
+
+  it("rate-limits every public operation for the same session", async () => {
+    vi.useFakeTimers();
+    useProtectedHandlers({
+      sessionRateLimit: 2,
+      sessionRateWindowMs: 60_000,
+    });
+    const created = await handlers.post(
+      jsonRequest({ topic: "A permitted Topic" }),
+    );
+    const ownerCookie = cookiePair(created);
+    await handlers.post(
+      jsonRequest({ topic: "A second permitted Topic" }, ownerCookie),
+    );
+
+    const read = await handlers.get(
+      new Request(`http://localhost/api/discussions/${discussionId}`, {
+        headers: { Cookie: ownerCookie },
+      }),
+      discussionId,
+    );
+    expect(read.status).toBe(429);
+
+    const stop = await handlers.postStop(
+      new Request(`http://localhost/api/discussions/${discussionId}/stop`, {
+        method: "POST",
+        headers: { Cookie: ownerCookie },
+      }),
+      discussionId,
+    );
+    expect(stop.status).toBe(429);
+
+    const turn = await handlers.postTurn(
+      jsonRequest(
+        { requestId },
+        ownerCookie,
+        `http://localhost/api/discussions/${discussionId}`,
+      ),
+      discussionId,
+    );
+    expect(turn.status).toBe(429);
+    expect(fakeDiscussion.calls).toHaveLength(0);
+  });
+
+  it("leaves an independent signed session unaffected by another's limit", async () => {
+    vi.useFakeTimers();
+    useProtectedHandlers({
+      sessionRateLimit: 1,
+      sessionRateWindowMs: 60_000,
+    });
+    const created = await handlers.post(
+      jsonRequest({ topic: "A permitted Topic" }),
+    );
+    const ownerCookie = cookiePair(created);
+    const blocked = await handlers.post(
+      jsonRequest({ topic: "A second Topic" }, ownerCookie),
+    );
+    expect(blocked.status).toBe(429);
+
+    const independentToken = sessions.createToken(
+      "22222222-2222-4222-8222-222222222222",
+    );
+    const independent = await handlers.post(
+      jsonRequest({
+        topic: "An independent Topic",
+      }, `${DISCUSSION_SESSION_COOKIE}=${independentToken}`),
+    );
+    expect(independent.status).toBe(201);
+    expect(idCalls).toBe(2);
+  });
+
+  it("recovers a session once its rate window has elapsed", async () => {
+    vi.useFakeTimers();
+    useProtectedHandlers({
+      sessionRateLimit: 1,
+      sessionRateWindowMs: 60_000,
+    });
+    const created = await handlers.post(
+      jsonRequest({ topic: "A permitted Topic" }),
+    );
+    const ownerCookie = cookiePair(created);
+
+    const blocked = await handlers.post(
+      jsonRequest({ topic: "A second Topic" }, ownerCookie),
+    );
+    expect(blocked.status).toBe(429);
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    const recovered = await handlers.post(
+      jsonRequest({ topic: "A later Topic" }, ownerCookie),
+    );
+    expect(recovered.status).toBe(201);
+    expect(idCalls).toBe(2);
+  });
+
+  it("bounds session churn with a separately keyed network limit", async () => {
+    vi.useFakeTimers();
+    useProtectedHandlers({
+      networkRateLimit: 2,
+      networkRateWindowMs: 60_000,
+    });
+    const clientAddress = { "X-Forwarded-For": "203.0.113.7" };
+
+    const first = await handlers.post(
+      jsonRequest({ topic: "A permitted Topic" }, undefined, undefined, undefined, clientAddress),
+    );
+    expect(first.status).toBe(201);
+    const second = await handlers.post(
+      jsonRequest({ topic: "A second permitted Topic" }, undefined, undefined, undefined, clientAddress),
+    );
+    expect(second.status).toBe(201);
+
+    const blocked = await handlers.post(
+      jsonRequest({ topic: "A third Topic" }, undefined, undefined, undefined, clientAddress),
+    );
+    const payload = ErrorResponseSchema.parse(await blocked.json());
+
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers.get("retry-after")).toBe("60");
+    expect(blocked.headers.get("set-cookie")).toBeTruthy();
+    expect(payload.error.code).toBe("RATE_LIMITED");
+    expect(idCalls).toBe(2);
+
+    const otherAddress = await handlers.post(
+      jsonRequest({ topic: "A fourth Topic" }, undefined, undefined, undefined, {
+        "X-Forwarded-For": "198.51.100.9",
+      }),
+    );
+    expect(otherAddress.status).toBe(201);
+  });
+
+  it("never invokes generation for a rate-limited next-Turn request", async () => {
+    vi.useFakeTimers();
+    useProtectedHandlers({
+      sessionRateLimit: 2,
+      sessionRateWindowMs: 60_000,
+    });
+    const created = await handlers.post(
+      jsonRequest({ topic: "A permitted Topic" }),
+    );
+    const ownerCookie = cookiePair(created);
+    await handlers.post(
+      jsonRequest({ topic: "A second permitted Topic" }, ownerCookie),
+    );
+
+    const blocked = await handlers.postTurn(
+      jsonRequest(
+        { requestId },
+        ownerCookie,
+        `http://localhost/api/discussions/${discussionId}`,
+      ),
+      discussionId,
+    );
+    expect(blocked.status).toBe(429);
+    expect(fakeDiscussion.calls).toHaveLength(0);
+
+    const sessionId = ownerCookie.split("=")[1]!.split(".")[0]!;
+    expect(store.readOwned(sessionId, discussionId)).toMatchObject({
+      status: "idle",
+      turnCount: 0,
+      transcript: [],
+    });
+  });
+
+  it("rejects oversized next-Turn and Stop traffic before generation", async () => {
+    useProtectedHandlers({ maxBodyBytes: 48 });
+    const created = await handlers.post(
+      jsonRequest({ topic: "A permitted Topic" }),
+    );
+    const ownerCookie = cookiePair(created);
+
+    const oversizedTurn = await handlers.postTurn(
+      jsonRequest(
+        { requestId },
+        ownerCookie,
+        `http://localhost/api/discussions/${discussionId}`,
+      ),
+      discussionId,
+    );
+    expect(oversizedTurn.status).toBe(413);
+    expect(fakeDiscussion.calls).toHaveLength(0);
+
+    const oversizedStop = await handlers.postStop(
+      new Request(
+        `http://localhost/api/discussions/${discussionId}/stop`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "text/plain",
+            Cookie: ownerCookie,
+          },
+          body: "y".repeat(100),
+        },
+      ),
+      discussionId,
+    );
+    expect(oversizedStop.status).toBe(415);
   });
 });

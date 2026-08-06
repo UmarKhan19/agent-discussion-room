@@ -192,6 +192,8 @@ export const DiscussionStateSchema = z
 
 export const ProductErrorCodeSchema = z.enum([
   "MALFORMED_REQUEST",
+  "BODY_TOO_LARGE",
+  "CONTENT_TYPE_UNSUPPORTED",
   "INVALID_REQUEST",
   "TOPIC_REQUIRED",
   "TOPIC_INVALID",
@@ -207,6 +209,7 @@ export const ProductErrorCodeSchema = z.enum([
   "OUTPUT_BLOCKED",
   "GENERATION_FAILED",
   "GENERATION_TIMEOUT",
+  "RATE_LIMITED",
   "INVALID_RESPONSE",
 ]);
 
@@ -217,6 +220,7 @@ export const ProductErrorSchema = z
     action: z.string().min(1),
     retryable: z.boolean(),
     category: PolicyCategorySchema.optional(),
+    retryAfterSeconds: z.number().int().positive().optional(),
   })
   .strict();
 

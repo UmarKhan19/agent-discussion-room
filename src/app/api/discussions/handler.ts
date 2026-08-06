@@ -8,6 +8,35 @@ import {
   type ProductError,
 } from "@/discussion/contracts";
 import {
+  DEFAULT_MAX_REQUEST_BODY_BYTES,
+  MAX_DISCUSSION_IDENTIFIER_LENGTH,
+  clientNetworkKey,
+  hasJsonContentType,
+  readBoundedBody,
+} from "@/discussion/request-protection";
+import {
+  FixedWindowRateLimiter,
+  type RateLimitDecision,
+} from "@/discussion/rate-limit";
+
+export const DEFAULT_SESSION_RATE_LIMIT = 60;
+export const DEFAULT_SESSION_RATE_WINDOW_MS = 60_000;
+export const DEFAULT_NETWORK_RATE_LIMIT = 300;
+export const DEFAULT_NETWORK_RATE_WINDOW_MS = 60_000;
+
+export interface DiscussionHttpProtection {
+  /** Ceiling for a JSON request body in bytes. */
+  maxBodyBytes?: number;
+  /** Per signed-session requests allowed within one window. */
+  sessionRateLimit?: number;
+  sessionRateWindowMs?: number;
+  /** Per network key (client address) requests allowed within one window. */
+  networkRateLimit?: number;
+  networkRateWindowMs?: number;
+  /** Injectable clock for deterministic tests; defaults to Date.now. */
+  now?: () => number;
+}
+import {
   DiscussionCompletedError,
   DiscussionGenerationFailedError,
   DiscussionGenerationTimeoutError,
@@ -27,7 +56,10 @@ import {
   SAFE_OUTPUT_ALTERNATIVE,
   SAFE_TOPIC_ALTERNATIVE,
 } from "@/discussion/policy";
-import type { SignedSessionManager } from "@/discussion/signed-session";
+import type {
+  AuthenticatedSession,
+  SignedSessionManager,
+} from "@/discussion/signed-session";
 
 type ProductErrorInput = Omit<ProductError, "retryable"> & {
   retryable?: boolean;
@@ -37,6 +69,7 @@ function errorResponse(
   status: number,
   error: ProductErrorInput,
   setCookie?: string,
+  retryAfterSeconds?: number,
 ): Response {
   const body = ErrorResponseSchema.parse({
     error: { ...error, retryable: error.retryable ?? false },
@@ -47,7 +80,28 @@ function errorResponse(
     Vary: "Cookie",
   });
   if (setCookie) headers.set("Set-Cookie", setCookie);
+  if (retryAfterSeconds !== undefined) {
+    headers.set("Retry-After", String(retryAfterSeconds));
+  }
   return new Response(JSON.stringify(body), { status, headers });
+}
+
+function rateLimitedResponse(
+  session: AuthenticatedSession,
+  decision: Extract<RateLimitDecision, { allowed: false }>,
+): Response {
+  return errorResponse(
+    429,
+    {
+      code: "RATE_LIMITED",
+      message: "Too many requests from this address or session. Waiting is required.",
+      action: "Wait for the retry window to pass, then try again.",
+      retryable: true,
+      retryAfterSeconds: decision.retryAfterSeconds,
+    },
+    session.setCookie,
+    decision.retryAfterSeconds,
+  );
 }
 
 function discussionResponse(
@@ -144,12 +198,81 @@ export function createDiscussionHttpHandlers(
   service: DiscussionService,
   sessions: SignedSessionManager,
   runner: DiscussionRunner,
+  protection: DiscussionHttpProtection = {},
 ) {
+  const maxBodyBytes =
+    protection.maxBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES;
+  const networkLimiter = new FixedWindowRateLimiter({
+    limit: protection.networkRateLimit ?? DEFAULT_NETWORK_RATE_LIMIT,
+    windowMs:
+      protection.networkRateWindowMs ?? DEFAULT_NETWORK_RATE_WINDOW_MS,
+    now: protection.now,
+  });
+  const sessionLimiter = new FixedWindowRateLimiter({
+    limit: protection.sessionRateLimit ?? DEFAULT_SESSION_RATE_LIMIT,
+    windowMs:
+      protection.sessionRateWindowMs ?? DEFAULT_SESSION_RATE_WINDOW_MS,
+    now: protection.now,
+  });
+
+  /** Applies network then per-session limits; returns a 429 response when blocked. */
+  function rateLimited(
+    session: AuthenticatedSession,
+    request: Request,
+  ): Response | null {
+    const network = networkLimiter.check(clientNetworkKey(request));
+    if (!network.allowed) return rateLimitedResponse(session, network);
+    const perSession = sessionLimiter.check(session.id);
+    if (!perSession.allowed) return rateLimitedResponse(session, perSession);
+    return null;
+  }
+
+  /** Guards the request before body parsing; returns a 400-series response when blocked. */
+  async function jsonBodyGuard(
+    request: Request,
+  ): Promise<{ response: Response } | { text: string }> {
+    if (request.body !== null && !hasJsonContentType(request)) {
+      return {
+        response: errorResponse(415, {
+          code: "CONTENT_TYPE_UNSUPPORTED",
+          message: "Discussion requests must be sent as JSON.",
+          action: 'Send the request with "Content-Type: application/json".',
+        }),
+      };
+    }
+    const bounded = await readBoundedBody(request, maxBodyBytes);
+    if (!bounded.ok) {
+      return {
+        response: errorResponse(413, {
+          code: "BODY_TOO_LARGE",
+          message: `The request body exceeds the ${maxBodyBytes}-byte limit.`,
+          action: "Send only the required fields in a compact JSON body.",
+        }),
+      };
+    }
+    return { text: bounded.text };
+  }
+
+  function invalidIdentifierResponse(): Response {
+    return errorResponse(400, {
+      code: "INVALID_DISCUSSION_ID",
+      message: "The Discussion identifier is malformed or too long.",
+      action: "Use the UUID returned when the Discussion was started.",
+    });
+  }
+
   return {
     async post(request: Request): Promise<Response> {
+      const guarded = await jsonBodyGuard(request);
+      if ("response" in guarded) return guarded.response;
+
+      const session = sessions.authenticate(request);
+      const limited = rateLimited(session, request);
+      if (limited) return limited;
+
       let body: unknown;
       try {
-        body = await request.json();
+        body = JSON.parse(guarded.text);
       } catch {
         return errorResponse(400, {
           code: "MALFORMED_REQUEST",
@@ -163,7 +286,6 @@ export function createDiscussionHttpHandlers(
         return errorResponse(400, invalidStartRequest(body));
       }
 
-      const session = sessions.authenticate(request);
       try {
         const discussion = service.start(session.id, parsedRequest.data.topic);
         return discussionResponse(discussion, 201, session.setCookie);
@@ -198,18 +320,24 @@ export function createDiscussionHttpHandlers(
       request: Request,
       untrustedId: string,
     ): Promise<Response> {
+      if (untrustedId.length > MAX_DISCUSSION_IDENTIFIER_LENGTH) {
+        return invalidIdentifierResponse();
+      }
       const parsedId = DiscussionIdentifierSchema.safeParse(untrustedId);
       if (!parsedId.success) {
-        return errorResponse(400, {
-          code: "INVALID_DISCUSSION_ID",
-          message: "The Discussion identifier is malformed.",
-          action: "Use the UUID returned when the Discussion was started.",
-        });
+        return invalidIdentifierResponse();
       }
+
+      const guarded = await jsonBodyGuard(request);
+      if ("response" in guarded) return guarded.response;
+
+      const session = sessions.authenticate(request);
+      const limited = rateLimited(session, request);
+      if (limited) return limited;
 
       let body: unknown;
       try {
-        body = await request.json();
+        body = JSON.parse(guarded.text);
       } catch {
         return errorResponse(400, {
           code: "MALFORMED_REQUEST",
@@ -223,7 +351,6 @@ export function createDiscussionHttpHandlers(
         return errorResponse(400, invalidNextTurnRequest(body));
       }
 
-      const session = sessions.authenticate(request);
       try {
         const discussion = await runner.nextTurn(
           session.id,
@@ -375,16 +502,21 @@ export function createDiscussionHttpHandlers(
       request: Request,
       untrustedId: string,
     ): Promise<Response> {
+      if (untrustedId.length > MAX_DISCUSSION_IDENTIFIER_LENGTH) {
+        return invalidIdentifierResponse();
+      }
       const parsedId = DiscussionIdentifierSchema.safeParse(untrustedId);
       if (!parsedId.success) {
-        return errorResponse(400, {
-          code: "INVALID_DISCUSSION_ID",
-          message: "The Discussion identifier is malformed.",
-          action: "Use the UUID returned when the Discussion was started.",
-        });
+        return invalidIdentifierResponse();
       }
 
+      const guarded = await jsonBodyGuard(request);
+      if ("response" in guarded) return guarded.response;
+
       const session = sessions.authenticate(request);
+      const limited = rateLimited(session, request);
+      if (limited) return limited;
+
       try {
         const discussion = runner.stop(session.id, parsedId.data);
         if (!discussion) {
@@ -427,16 +559,18 @@ export function createDiscussionHttpHandlers(
     },
 
     async get(request: Request, untrustedId: string): Promise<Response> {
+      if (untrustedId.length > MAX_DISCUSSION_IDENTIFIER_LENGTH) {
+        return invalidIdentifierResponse();
+      }
       const parsedId = DiscussionIdentifierSchema.safeParse(untrustedId);
       if (!parsedId.success) {
-        return errorResponse(400, {
-          code: "INVALID_DISCUSSION_ID",
-          message: "The Discussion identifier is malformed.",
-          action: "Use the UUID returned when the Discussion was started.",
-        });
+        return invalidIdentifierResponse();
       }
 
       const session = sessions.authenticate(request);
+      const limited = rateLimited(session, request);
+      if (limited) return limited;
+
       const discussion = service.read(session.id, parsedId.data);
       if (!discussion) {
         return errorResponse(
