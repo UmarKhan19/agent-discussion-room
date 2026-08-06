@@ -184,6 +184,92 @@ describe("participant-visible Discussion start", () => {
     )).toEqual([firstRequestId, secondRequestId]);
   });
 
+  it("announces each newly committed Turn without re-reading earlier Messages", async () => {
+    const firstRequestId = requestId;
+    const secondRequestId = "44444444-4444-4444-8444-444444444444";
+    const boundedInitial = { ...initialDiscussion, turnLimit: 2 };
+    const firstTurn = {
+      ...discussionWithFirstTurn,
+      turnLimit: 2,
+    };
+    const opponentContent =
+      "Dense development can leave more land available for parks.";
+    const completed = {
+      ...firstTurn,
+      status: "completed",
+      turnCount: 2,
+      transcript: [
+        ...firstTurn.transcript,
+        {
+          ...firstTurn.transcript[0],
+          id: "55555555-5555-4555-8555-555555555555",
+          content: opponentContent,
+          speaker: "opponent",
+          turn: 2,
+          generation: {
+            ...firstTurn.transcript[0].generation,
+            requestId: secondRequestId,
+          },
+        },
+      ],
+    };
+    let resolveFirstTurn: ((response: Response) => void) | undefined;
+    let resolveSecondTurn: ((response: Response) => void) | undefined;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(boundedInitial), { status: 201 }),
+      )
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveFirstTurn = resolve;
+        }),
+      )
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveSecondTurn = resolve;
+        }),
+      );
+    const generatedIds = [firstRequestId, secondRequestId];
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID: () => generatedIds.shift() });
+    const user = userEvent.setup();
+
+    render(<Home />);
+    await user.type(
+      screen.getByRole("textbox", { name: "Discussion Topic" }),
+      topic,
+    );
+    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("log").textContent).toBe("");
+
+    resolveFirstTurn?.(new Response(JSON.stringify(firstTurn), { status: 200 }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("log").textContent).toContain(
+        "New Turn 1 from the Supporter.",
+      ),
+    );
+    expect(screen.getByRole("log").textContent).not.toContain(
+      "New Turn 2 from the Opponent.",
+    );
+    expect(screen.getByRole("log").textContent).not.toContain(messageContent);
+
+    resolveSecondTurn?.(new Response(JSON.stringify(completed), { status: 200 }));
+
+    expect(await screen.findByText("Discussion completed.")).toBeTruthy();
+    await waitFor(() =>
+      expect(screen.getByRole("log").textContent).toContain(
+        "New Turn 2 from the Opponent.",
+      ),
+    );
+    const log = screen.getByRole("log");
+    expect(log.textContent).toContain("New Turn 1 from the Supporter.");
+    expect(log.textContent).not.toContain(messageContent);
+    expect(log.textContent).not.toContain(opponentContent);
+  });
+
   it("retries a retryable server failure with the same logical request identity", async () => {
     const boundedInitial = { ...initialDiscussion, turnLimit: 1 };
     const failed = {

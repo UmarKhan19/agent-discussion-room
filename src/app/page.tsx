@@ -12,7 +12,7 @@ import {
   type ProductErrorCode,
   type Speaker,
 } from "@/discussion/contracts";
-import { MessageList } from "./components/message-list";
+import { Transcript } from "./components/transcript";
 import {
   LifecycleStatus,
   derivePhase,
@@ -575,9 +575,7 @@ export default function Home() {
               </button>
             ) : null}
           </div>
-          <div className="rounded-lg border border-neutral-500 p-6">
-            <MessageList messages={discussion.transcript} />
-          </div>
+          <Transcript messages={discussion.transcript} />
         </section>
       ) : null}
     </main>
