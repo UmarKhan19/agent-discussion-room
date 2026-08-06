@@ -13,6 +13,19 @@ import {
   type Speaker,
 } from "@/discussion/contracts";
 import { MessageList } from "./components/message-list";
+import {
+  LifecycleStatus,
+  derivePhase,
+} from "./components/lifecycle-status";
+import {
+  combinedErrorCopy,
+  errorFamilyForCode,
+  fallbackErrorForStatus,
+  malformedServerDataError,
+  networkLossError,
+  type DiscussionErrorCopy,
+  type DiscussionErrorFamily,
+} from "./discussion-error";
 
 function topicError(topic: string): string {
   if (topic.trim().length === 0) {
@@ -24,41 +37,91 @@ function topicError(topic: string): string {
   return "Use plain text without tabs, line breaks, or control characters.";
 }
 
+/** Copy shown to the participant in the alert region. */
+interface ParticipantError {
+  message: string;
+  family: DiscussionErrorFamily;
+}
+
+function networkError(family: DiscussionErrorFamily): ParticipantError {
+  return { message: combinedErrorCopy(networkLossError()), family };
+}
+
 type DiscussionRequestResult =
   | { ok: true; discussion: DiscussionState }
-  | {
-      ok: false;
-      error: string;
-      retryable: boolean;
-      code?: ProductErrorCode;
-    };
+  | { ok: false; error: ParticipantError; retryable: boolean };
 
+/**
+ * Decodes a Discussion HTTP response into either the authoritative
+ * Discussion state or stable participant copy. Server error envelopes are
+ * trusted; malformed or missing envelopes fall back to status-based copy so
+ * internals never leak.
+ */
 async function readDiscussionResponse(
   response: Response,
-  fallbackError: string,
 ): Promise<DiscussionRequestResult> {
-  const payload: unknown = await response.json();
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    if (response.ok) {
+      return {
+        ok: false,
+        retryable: false,
+        error: {
+          message: combinedErrorCopy(malformedServerDataError()),
+          family: "unknown",
+        },
+      };
+    }
+    const fallback = fallbackErrorForStatus(response.status);
+    return {
+      ok: false,
+      retryable: fallback.retryable,
+      error: { message: combinedErrorCopy(fallback), family: fallback.family },
+    };
+  }
 
   if (!response.ok) {
     const parsedError = ErrorResponseSchema.safeParse(payload);
     if (parsedError.success) {
+      const serverError = parsedError.data.error;
+      const copy: DiscussionErrorCopy = {
+        message: serverError.message,
+        action: serverError.action,
+        retryable: serverError.retryable,
+        family: errorFamilyForCode(
+          serverError.code as ProductErrorCode,
+          serverError.retryable,
+        ),
+      };
       return {
         ok: false,
-        code: parsedError.data.error.code,
-        error: `${parsedError.data.error.message} ${parsedError.data.error.action}`,
-        retryable: parsedError.data.error.retryable,
+        retryable: serverError.retryable,
+        error: {
+          message: combinedErrorCopy(copy, serverError.retryAfterSeconds),
+          family: copy.family,
+        },
       };
     }
 
-    return { ok: false, error: fallbackError, retryable: false };
+    const fallback = fallbackErrorForStatus(response.status);
+    return {
+      ok: false,
+      retryable: fallback.retryable,
+      error: { message: combinedErrorCopy(fallback), family: fallback.family },
+    };
   }
 
   const parsedDiscussion = DiscussionResponseSchema.safeParse(payload);
   if (!parsedDiscussion.success) {
     return {
       ok: false,
-      error: "The server returned an invalid Discussion. Please try again.",
       retryable: false,
+      error: {
+        message: combinedErrorCopy(malformedServerDataError()),
+        family: "unknown",
+      },
     };
   }
 
@@ -68,7 +131,7 @@ async function readDiscussionResponse(
 export default function Home() {
   const [topic, setTopic] = useState("");
   const [discussion, setDiscussion] = useState<DiscussionState | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ParticipantError | null>(null);
   const [isStarting, setIsStarting] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
@@ -78,19 +141,57 @@ export default function Home() {
   );
   const generationControllerRef = useRef<AbortController | null>(null);
   const generationRunRef = useRef(0);
+  const refreshControllerRef = useRef<AbortController | null>(null);
   const pendingTurnRef = useRef<{
     discussionId: string;
     requestId: string;
   } | null>(null);
+  const topicInputRef = useRef<HTMLTextAreaElement | null>(null);
+  // Synchronous double-click guards: the disabled attribute prevents a
+  // second activation after re-render; these refs close the same-tick gap.
+  const startGuardRef = useRef(false);
+  const stopGuardRef = useRef(false);
+  const retryGuardRef = useRef(false);
 
   useEffect(() => {
     return () => {
       generationRunRef.current += 1;
       generationControllerRef.current?.abort();
       generationControllerRef.current = null;
+      refreshControllerRef.current?.abort();
+      refreshControllerRef.current = null;
       pendingTurnRef.current = null;
     };
   }, []);
+
+  /**
+   * Bumps the run identity and clears every piece of lifecycle, request,
+   * and error state. Used when starting a fresh Discussion and when the
+   * participant explicitly resets after completion, Stop, or failure.
+   */
+  function beginFreshRun(): number {
+    const runId = generationRunRef.current + 1;
+    generationRunRef.current = runId;
+    generationControllerRef.current?.abort();
+    generationControllerRef.current = null;
+    refreshControllerRef.current?.abort();
+    refreshControllerRef.current = null;
+    pendingTurnRef.current = null;
+    setCanRetryTurn(false);
+    setGeneratingSpeaker(null);
+    setIsGenerating(false);
+    setIsStopping(false);
+    setIsStarting(false);
+    setDiscussion(null);
+    setError(null);
+    return runId;
+  }
+
+  function startFreshDiscussion() {
+    beginFreshRun();
+    setTopic("");
+    topicInputRef.current?.focus();
+  }
 
   async function readPersistedDiscussion(
     discussionId: string,
@@ -120,9 +221,36 @@ export default function Home() {
     }
   }
 
+  /**
+   * Fire-and-forget authoritative refresh after a persisted failure. The
+   * refresh has its own controller so it never rides (or blocks) the
+   * generation request; a fresh run or a successful Stop aborts it.
+   */
+  function refreshDiscussion(discussionId: string, runId: number): void {
+    const refreshController = new AbortController();
+    refreshControllerRef.current = refreshController;
+    void readPersistedDiscussion(
+      discussionId,
+      runId,
+      refreshController.signal,
+    ).then((persistedDiscussion) => {
+      if (refreshControllerRef.current === refreshController) {
+        refreshControllerRef.current = null;
+      }
+      if (
+        generationRunRef.current === runId &&
+        !refreshController.signal.aborted &&
+        persistedDiscussion
+      ) {
+        setDiscussion(persistedDiscussion);
+      }
+    });
+  }
+
   async function advanceDiscussion(
     initialDiscussion: DiscussionState,
     runId: number,
+    retry = false,
   ) {
     if (generationRunRef.current !== runId) return;
 
@@ -134,7 +262,10 @@ export default function Home() {
 
     try {
       while (
-        current.status === "idle" &&
+        (current.status === "idle" ||
+          (retry &&
+            current.status === "failed" &&
+            current.terminalReason === null)) &&
         current.turnCount < current.turnLimit
       ) {
         const nextSpeaker = speakerForTurn(current.turnCount + 1);
@@ -158,30 +289,24 @@ export default function Home() {
         });
         if (generationRunRef.current !== runId) return;
 
-        const result = await readDiscussionResponse(
-          response,
-          "The next Turn could not be generated safely.",
-        );
+        const result = await readDiscussionResponse(response);
         if (generationRunRef.current !== runId) return;
         if (!result.ok) {
           setError(result.error);
           setCanRetryTurn(result.retryable);
-          if (result.code === "GENERATION_TIMEOUT") {
-            setGeneratingSpeaker(null);
-            setIsGenerating(false);
-            const persistedDiscussion = await readPersistedDiscussion(
-              current.id,
-              runId,
-              controller.signal,
-            );
-            if (
-              generationRunRef.current === runId &&
-              !controller.signal.aborted &&
-              persistedDiscussion
-            ) {
-              setDiscussion(persistedDiscussion);
-              pendingTurnRef.current = null;
-            }
+          // Claim-time and terminal failures persist a new server state;
+          // refresh it so status and controls follow the server. Wait-family
+          // and Topic errors leave the Discussion unchanged, so no refresh
+          // is needed. Ambiguous network failures are recovered by Retry
+          // with the same request identity (replay-safe).
+          if (
+            result.error.family !== "wait" &&
+            result.error.family !== "topic"
+          ) {
+            refreshDiscussion(current.id, runId);
+          }
+          if (!result.retryable) {
+            pendingTurnRef.current = null;
           }
           return;
         }
@@ -189,23 +314,20 @@ export default function Home() {
         pendingTurnRef.current = null;
         current = result.discussion;
         setDiscussion(current);
+        setError(null);
       }
     } catch {
-      if (
-        generationRunRef.current !== runId ||
-        controller.signal.aborted
-      ) {
+      if (generationRunRef.current !== runId || controller.signal.aborted) {
         return;
       }
-      setError(
-        "The next Turn could not be generated. Check your connection and try again.",
-      );
+      setError(networkError("retry"));
       setCanRetryTurn(true);
     } finally {
       if (generationRunRef.current === runId) {
         generationControllerRef.current = null;
         setGeneratingSpeaker(null);
         setIsGenerating(false);
+        retryGuardRef.current = false;
       }
     }
   }
@@ -216,34 +338,32 @@ export default function Home() {
       !pendingTurnRef.current ||
       pendingTurnRef.current.discussionId !== discussion.id ||
       isGenerating ||
-      isStopping
+      isStopping ||
+      retryGuardRef.current
     ) {
       return;
     }
 
+    retryGuardRef.current = true;
+    refreshControllerRef.current?.abort();
+    refreshControllerRef.current = null;
     setError(null);
-    void advanceDiscussion(discussion, generationRunRef.current);
+    void advanceDiscussion(discussion, generationRunRef.current, true);
   }
 
   async function startDiscussion(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setError(null);
+    if (startGuardRef.current) return;
 
     const parsedTopic = DiscussionTopicSchema.safeParse(topic);
     if (!parsedTopic.success) {
-      setError(topicError(topic));
+      setError({ message: topicError(topic), family: "topic" });
+      topicInputRef.current?.focus();
       return;
     }
 
-    const runId = generationRunRef.current + 1;
-    generationRunRef.current = runId;
-    generationControllerRef.current?.abort();
-    generationControllerRef.current = null;
-    setDiscussion(null);
-    pendingTurnRef.current = null;
-    setCanRetryTurn(false);
-    setGeneratingSpeaker(null);
-    setIsGenerating(false);
+    startGuardRef.current = true;
+    const runId = beginFreshRun();
     setIsStarting(true);
     try {
       const response = await fetch("/api/discussions", {
@@ -253,13 +373,13 @@ export default function Home() {
       });
       if (generationRunRef.current !== runId) return;
 
-      const result = await readDiscussionResponse(
-        response,
-        "The Discussion could not be started. Check the Topic and try again.",
-      );
+      const result = await readDiscussionResponse(response);
       if (generationRunRef.current !== runId) return;
       if (!result.ok) {
         setError(result.error);
+        if (result.error.family === "topic") {
+          topicInputRef.current?.focus();
+        }
         return;
       }
 
@@ -267,22 +387,27 @@ export default function Home() {
       void advanceDiscussion(result.discussion, runId);
     } catch {
       if (generationRunRef.current === runId) {
-        setError(
-          "The Discussion could not be started. Check your connection and try again.",
-        );
+        setError(networkError("unknown"));
       }
     } finally {
       if (generationRunRef.current === runId) {
         setIsStarting(false);
+        startGuardRef.current = false;
       }
     }
   }
 
   async function stopDiscussion() {
-    if (!discussion || !isGenerating || isStopping) return;
+    if (!discussion) return;
+    const serverGenerating =
+      isGenerating || discussion.status === "generating";
+    if (!serverGenerating || isStopping || stopGuardRef.current) {
+      return;
+    }
 
     const activeRunId = generationRunRef.current;
     const turnController = generationControllerRef.current;
+    stopGuardRef.current = true;
     setIsStopping(true);
     setError(null);
 
@@ -293,26 +418,30 @@ export default function Home() {
       );
       if (generationRunRef.current !== activeRunId) return;
 
-      const result = await readDiscussionResponse(
-        response,
-        "The Discussion could not be stopped safely.",
-      );
+      const result = await readDiscussionResponse(response);
       if (generationRunRef.current !== activeRunId) return;
 
       if (!result.ok) {
         setError(result.error);
-        setIsStopping(false);
+        setCanRetryTurn(false);
+        // Stop failed while generation may still be running; refresh the
+        // authoritative state so status and controls match the server.
+        refreshDiscussion(discussion.id, activeRunId);
         return;
       }
       if (result.discussion.status !== "stopped") {
-        setError(
-          "The server did not confirm that the Discussion stopped. Try Stop again.",
-        );
-        setIsStopping(false);
+        setError({
+          message: combinedErrorCopy(malformedServerDataError()),
+          family: "unknown",
+        });
+        setCanRetryTurn(false);
+        refreshDiscussion(discussion.id, activeRunId);
         return;
       }
 
       generationRunRef.current = activeRunId + 1;
+      refreshControllerRef.current?.abort();
+      refreshControllerRef.current = null;
       setDiscussion(result.discussion);
       pendingTurnRef.current = null;
       setCanRetryTurn(false);
@@ -320,24 +449,40 @@ export default function Home() {
       setGeneratingSpeaker(null);
       setIsGenerating(false);
       setIsStopping(false);
+      stopGuardRef.current = false;
       turnController?.abort();
       if (generationControllerRef.current === turnController) {
         generationControllerRef.current = null;
       }
     } catch {
       if (generationRunRef.current === activeRunId) {
-        setError(
-          "The Discussion could not be stopped. Check your connection and try again.",
-        );
+        setError(networkError("unknown"));
+      }
+    } finally {
+      if (generationRunRef.current === activeRunId) {
         setIsStopping(false);
+        stopGuardRef.current = false;
       }
     }
   }
 
-  const stopped = discussion?.status === "stopped";
-  const timedOut =
-    discussion?.status === "failed" &&
-    discussion.terminalReason === "timeout";
+  const phase = derivePhase(discussion, {
+    isStarting,
+    isStopping,
+    isGenerating,
+    generatingSpeaker,
+    errorFamily: error?.family ?? null,
+  });
+  const stopVisible = phase.kind === "generating" || phase.kind === "stopping";
+  const retryVisible = canRetryTurn && !isGenerating && !isStopping;
+  const newDiscussionVisible =
+    discussion !== null &&
+    (phase.kind === "completed" ||
+      phase.kind === "stopped" ||
+      phase.kind === "failed" ||
+      error?.family === "terminal" ||
+      error?.family === "unknown");
+  const topicInvalid = error?.family === "topic";
 
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-4xl flex-col gap-8 px-5 py-10 sm:px-10">
@@ -355,10 +500,12 @@ export default function Home() {
         <textarea
           id="discussion-topic"
           name="topic"
+          ref={topicInputRef}
           value={topic}
           maxLength={TOPIC_MAX_LENGTH + 1}
           rows={3}
           aria-describedby="topic-help"
+          aria-invalid={topicInvalid || undefined}
           onChange={(event) => setTopic(event.target.value)}
           className="rounded-lg border border-neutral-500 bg-transparent p-3"
         />
@@ -375,8 +522,10 @@ export default function Home() {
       </form>
 
       <p role="alert" aria-live="polite" className="min-h-6 text-red-700 dark:text-red-300">
-        {error}
+        {error?.message}
       </p>
+
+      <LifecycleStatus phase={phase} />
 
       {discussion ? (
         <section
@@ -395,53 +544,42 @@ export default function Home() {
           <p aria-label="Turn progress">
             {discussion.turnCount} / {discussion.turnLimit} Turns
           </p>
-          {isGenerating && generatingSpeaker ? (
-            <p role="status" aria-live="polite" className="font-semibold">
-              Generating {generatingSpeaker === "supporter" ? "Supporter" : "Opponent"} Turn…
-            </p>
-          ) : null}
-          {isGenerating ? (
-            <button
-              type="button"
-              onClick={() => void stopDiscussion()}
-              disabled={isStopping}
-              className="min-h-11 self-start rounded-lg bg-red-700 px-5 py-2 font-semibold text-white disabled:opacity-60"
-            >
-              Stop Discussion
-            </button>
-          ) : null}
-          {canRetryTurn && !isGenerating ? (
-            <button
-              type="button"
-              onClick={retryTurn}
-              disabled={isStopping}
-              className="min-h-11 self-start rounded-lg bg-green-700 px-5 py-2 font-semibold text-white disabled:opacity-60"
-            >
-              Retry Turn
-            </button>
-          ) : null}
-          {discussion.status === "completed" ? (
-            <p role="status" aria-live="polite" className="font-semibold">
-              Discussion completed.
-            </p>
-          ) : null}
-          {stopped ? (
-            <p role="status" aria-live="polite" className="font-semibold">
-              Discussion stopped.
-            </p>
-          ) : null}
-          {timedOut ? (
-            <p role="status" aria-live="polite" className="font-semibold">
-              Discussion timed out.
-            </p>
-          ) : null}
+          <div className="flex flex-wrap gap-3">
+            {stopVisible ? (
+              <button
+                type="button"
+                onClick={() => void stopDiscussion()}
+                disabled={isStopping}
+                className="min-h-11 self-start rounded-lg bg-red-700 px-5 py-2 font-semibold text-white disabled:opacity-60"
+              >
+                Stop Discussion
+              </button>
+            ) : null}
+            {retryVisible ? (
+              <button
+                type="button"
+                onClick={retryTurn}
+                disabled={isStopping}
+                className="min-h-11 self-start rounded-lg bg-green-700 px-5 py-2 font-semibold text-white disabled:opacity-60"
+              >
+                Retry Turn
+              </button>
+            ) : null}
+            {newDiscussionVisible ? (
+              <button
+                type="button"
+                onClick={startFreshDiscussion}
+                className="min-h-11 self-start rounded-lg border border-neutral-500 px-5 py-2 font-semibold"
+              >
+                Start a New Discussion
+              </button>
+            ) : null}
+          </div>
           <div className="rounded-lg border border-neutral-500 p-6">
             <MessageList messages={discussion.transcript} />
           </div>
         </section>
-      ) : (
-        <p>No active Discussion. Enter a Topic and choose Start Discussion.</p>
-      )}
+      ) : null}
     </main>
   );
 }
