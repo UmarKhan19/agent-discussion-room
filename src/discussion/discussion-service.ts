@@ -124,6 +124,27 @@ function ownedRecord(
   return stored?.ownerSessionId === ownerSessionId ? stored : null;
 }
 
+interface TurnRequestIdentity {
+  requestId: string;
+  attemptId: string;
+  expectedTurn: number;
+}
+
+/** Guards the one-Turn boundary: only the currently persisted attempt may mutate. */
+function isCurrentAttempt(
+  stored: OwnedDiscussion,
+  identity: TurnRequestIdentity,
+): boolean {
+  const request = stored.requests.get(identity.requestId);
+  return (
+    request?.status === "generating" &&
+    request.attemptId === identity.attemptId &&
+    request.turn === identity.expectedTurn &&
+    stored.state.status === "generating" &&
+    stored.state.turnCount === identity.expectedTurn - 1
+  );
+}
+
 /** Explicit process-local store. Durable storage is introduced by the persistence ticket. */
 export class InMemoryDiscussionStore implements DiscussionStore {
   private readonly discussions = new Map<string, OwnedDiscussion>();
@@ -228,14 +249,11 @@ export class InMemoryDiscussionStore implements DiscussionStore {
     );
     if (!stored) return { kind: "not_found" };
 
-    const request = stored.requests.get(input.requestId);
     const message = DiscussionMessageSchema.parse(input.message);
+    if (!isCurrentAttempt(stored, input)) {
+      return { kind: "stale", discussion: copyDiscussion(stored.state) };
+    }
     if (
-      request?.status !== "generating" ||
-      request.attemptId !== input.attemptId ||
-      request.turn !== input.expectedTurn ||
-      stored.state.status !== "generating" ||
-      stored.state.turnCount !== input.expectedTurn - 1 ||
       message.turn !== input.expectedTurn ||
       message.generation.requestId !== input.requestId
     ) {
@@ -274,14 +292,7 @@ export class InMemoryDiscussionStore implements DiscussionStore {
     );
     if (!stored) return { kind: "not_found" };
 
-    const request = stored.requests.get(input.requestId);
-    if (
-      request?.status !== "generating" ||
-      request.attemptId !== input.attemptId ||
-      request.turn !== input.expectedTurn ||
-      stored.state.status !== "generating" ||
-      stored.state.turnCount !== input.expectedTurn - 1
-    ) {
+    if (!isCurrentAttempt(stored, input)) {
       return { kind: "stale", discussion: copyDiscussion(stored.state) };
     }
 
@@ -315,14 +326,7 @@ export class InMemoryDiscussionStore implements DiscussionStore {
     );
     if (!stored) return { kind: "not_found" };
 
-    const request = stored.requests.get(input.requestId);
-    if (
-      request?.status !== "generating" ||
-      request.attemptId !== input.attemptId ||
-      request.turn !== input.expectedTurn ||
-      stored.state.status !== "generating" ||
-      stored.state.turnCount !== input.expectedTurn - 1
-    ) {
+    if (!isCurrentAttempt(stored, input)) {
       return { kind: "stale", discussion: copyDiscussion(stored.state) };
     }
 

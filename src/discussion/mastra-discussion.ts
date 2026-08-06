@@ -59,35 +59,52 @@ const RETRYABLE_PROVIDER_CODES = new Set([
   "UND_ERR_SOCKET",
 ]);
 
+const MAX_PROVIDER_ERROR_CAUSE_DEPTH = 8;
+
 function isRetryableProviderError(error: unknown): boolean {
-  if (typeof error !== "object" || error === null) return false;
+  const seen = new Set<object>();
+  let current = error;
 
-  try {
-    const candidate = error as Record<string, unknown>;
-    if (candidate.isRetryable === true) return true;
+  for (let depth = 0; depth < MAX_PROVIDER_ERROR_CAUSE_DEPTH; depth += 1) {
+    if (typeof current !== "object" || current === null) return false;
+    if (seen.has(current)) return false;
+    seen.add(current);
 
-    const status =
-      typeof candidate.status === "number"
-        ? candidate.status
-        : typeof candidate.statusCode === "number"
-          ? candidate.statusCode
-          : undefined;
-    if (
-      status === 408 ||
-      status === 425 ||
-      status === 429 ||
-      (status !== undefined && status >= 500 && status <= 599)
-    ) {
-      return true;
+    try {
+      const candidate = current as Record<string, unknown>;
+      if (typeof candidate.isRetryable === "boolean") {
+        return candidate.isRetryable;
+      }
+
+      const status =
+        typeof candidate.status === "number"
+          ? candidate.status
+          : typeof candidate.statusCode === "number"
+            ? candidate.statusCode
+            : undefined;
+      if (status !== undefined && status >= 100 && status <= 599) {
+        return (
+          status === 408 ||
+          status === 425 ||
+          status === 429 ||
+          status >= 500
+        );
+      }
+
+      if (
+        typeof candidate.code === "string" &&
+        RETRYABLE_PROVIDER_CODES.has(candidate.code)
+      ) {
+        return true;
+      }
+
+      current = candidate.cause;
+    } catch {
+      return false;
     }
-
-    return (
-      typeof candidate.code === "string" &&
-      RETRYABLE_PROVIDER_CODES.has(candidate.code)
-    );
-  } catch {
-    return false;
   }
+
+  return false;
 }
 
 function normalizeUsage(

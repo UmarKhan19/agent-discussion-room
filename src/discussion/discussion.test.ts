@@ -59,9 +59,21 @@ describe.each(implementations)("Discussion generation contract: $name", ({ creat
 });
 
 describe("MastraDiscussion provider error normalization", () => {
+  const cyclicCause: { cause?: unknown } = {};
+  cyclicCause.cause = cyclicCause;
+
   it.each([
     [{ status: 503, secret: "sk-secret" }, true],
     [{ code: "ECONNRESET", rawResponse: "provider body" }, true],
+    [
+      {
+        id: "AGENT_GENERATE_FAILED",
+        cause: { isRetryable: true, rawResponse: "provider body" },
+      },
+      true,
+    ],
+    [{ isRetryable: false, cause: { isRetryable: true } }, false],
+    [cyclicCause, false],
     [new Error("unclassified provider failure"), false],
   ])("classifies retryability without changing the stable adapter error", async (providerError, retryable) => {
     const agent = {
