@@ -1,6 +1,6 @@
 # Deliver clear lifecycle, error, and recovery UX
 
-Status: ready-for-agent
+Status: done
 
 ## Parent
 
@@ -12,14 +12,14 @@ Make every Discussion lifecycle and recovery state understandable and actionable
 
 ## Acceptance criteria
 
-- [ ] Empty, ready, generating, completed, stopped, and failed states have distinct visible status and appropriate available actions.
-- [ ] Start, Stop, and Retry controls reflect the authoritative server state and prevent accidental duplicate actions while a request is pending.
-- [ ] Turn progress and the active Topic remain visible throughout the Discussion.
-- [ ] Validation and policy errors direct the participant to edit the Topic; rate-limit and quota errors explain when waiting is appropriate; transient provider errors expose a safe Retry action.
-- [ ] Retry preserves the current Discussion and cannot duplicate a successfully committed Turn.
-- [ ] Completion and Stop offer a clear fresh-Discussion action that resets Topic, Transcript, progress, errors, and stale request identities.
-- [ ] Network loss, malformed server data, ownership loss, conflict, timeout, and non-retryable provider failure use stable fallback copy without leaking internals.
-- [ ] Participant-visible component and integration tests cover all states, control availability, double-click protection, retry, and fresh reset.
+- [x] Empty, ready, generating, completed, stopped, and failed states have distinct visible status and appropriate available actions.
+- [x] Start, Stop, and Retry controls reflect the authoritative server state and prevent accidental duplicate actions while a request is pending.
+- [x] Turn progress and the active Topic remain visible throughout the Discussion.
+- [x] Validation and policy errors direct the participant to edit the Topic; rate-limit and quota errors explain when waiting is appropriate; transient provider errors expose a safe Retry action.
+- [x] Retry preserves the current Discussion and cannot duplicate a successfully committed Turn.
+- [x] Completion and Stop offer a clear fresh-Discussion action that resets Topic, Transcript, progress, errors, and stale request identities.
+- [x] Network loss, malformed server data, ownership loss, conflict, timeout, and non-retryable provider failure use stable fallback copy without leaking internals.
+- [x] Participant-visible component and integration tests cover all states, control availability, double-click protection, retry, and fresh reset.
 
 ## Blocked by
 
