@@ -147,6 +147,165 @@ describe("LibSQLDiscussionStore", () => {
     store.close();
   });
 
+  describe("requestStatus ownership", () => {
+    it("lets the owning session observe a succeeded request", async () => {
+      const store = createStore(storeUrl());
+      await store.create(ownerSessionId, idleState());
+      await store.claimTurn({
+        ownerSessionId,
+        discussionId,
+        requestId,
+        attemptId,
+        updatedAt: now.toISOString(),
+      });
+      await store.completeTurn({
+        ownerSessionId,
+        discussionId,
+        requestId,
+        attemptId,
+        expectedTurn: 1,
+        message: message(1),
+        updatedAt: now.toISOString(),
+      });
+
+      expect(
+        await store.requestStatus(ownerSessionId, discussionId, requestId),
+      ).toEqual({ kind: "succeeded" });
+      store.close();
+    });
+
+    it("does not expose any lifecycle state to a different owner", async () => {
+      const store = createStore(storeUrl());
+      await store.create(ownerSessionId, idleState());
+      await store.claimTurn({
+        ownerSessionId,
+        discussionId,
+        requestId,
+        attemptId,
+        updatedAt: now.toISOString(),
+      });
+      await store.completeTurn({
+        ownerSessionId,
+        discussionId,
+        requestId,
+        attemptId,
+        expectedTurn: 1,
+        message: message(1),
+        updatedAt: now.toISOString(),
+      });
+
+      // The unowned lookup must collapse to the not-found sentinel
+      // (`unknown`): it must never surface succeeded/generating/failed,
+      // Turn number, attempt id, or failure details to a different session.
+      expect(
+        await store.requestStatus(otherSessionId, discussionId, requestId),
+      ).toEqual({ kind: "unknown" });
+      store.close();
+    });
+
+    it("hides a live generating attempt from a different owner", async () => {
+      const store = createStore(storeUrl());
+      await store.create(ownerSessionId, idleState());
+      await store.claimTurn({
+        ownerSessionId,
+        discussionId,
+        requestId,
+        attemptId,
+        updatedAt: now.toISOString(),
+      });
+
+      // Owner observes the live attempt.
+      expect(
+        await store.requestStatus(ownerSessionId, discussionId, requestId),
+      ).toEqual({ kind: "generating" });
+      // A different owner observes nothing.
+      expect(
+        await store.requestStatus(otherSessionId, discussionId, requestId),
+      ).toEqual({ kind: "unknown" });
+      store.close();
+    });
+
+    it("reports unknown for a request identity that was never used", async () => {
+      const store = createStore(storeUrl());
+      await store.create(ownerSessionId, idleState());
+      await store.claimTurn({
+        ownerSessionId,
+        discussionId,
+        requestId,
+        attemptId,
+        updatedAt: now.toISOString(),
+      });
+
+      expect(
+        await store.requestStatus(
+          ownerSessionId,
+          discussionId,
+          "99999999-9999-9999-9999-999999999999",
+        ),
+      ).toEqual({ kind: "unknown" });
+      store.close();
+    });
+
+    it("does not leak request status across different Discussions sharing a request id", async () => {
+      // The DB key request is (discussion_id, request_id), so a request id
+      // may legitimately recur in a separate Discussion. Ownership must be
+      // enforced per Discussion, not just per request id.
+      const otherDiscussionId = "21212121-2121-4121-8121-212121212121";
+      const store = createStore(storeUrl());
+      await store.create(ownerSessionId, idleState());
+      await store.create(otherSessionId, { ...idleState(), id: otherDiscussionId });
+
+      await store.claimTurn({
+        ownerSessionId,
+        discussionId,
+        requestId,
+        attemptId,
+        updatedAt: now.toISOString(),
+      });
+      await store.completeTurn({
+        ownerSessionId,
+        discussionId,
+        requestId,
+        attemptId,
+        expectedTurn: 1,
+        message: message(1),
+        updatedAt: now.toISOString(),
+      });
+
+      // Owner of Discussion B uses the SAME request id and observes only B.
+      await store.claimTurn({
+        ownerSessionId: otherSessionId,
+        discussionId: otherDiscussionId,
+        requestId,
+        attemptId,
+        updatedAt: now.toISOString(),
+      });
+
+      expect(
+        await store.requestStatus(
+          ownerSessionId,
+          discussionId,
+          requestId,
+        ),
+      ).toEqual({ kind: "succeeded" });
+      expect(
+        await store.requestStatus(
+          otherSessionId,
+          otherDiscussionId,
+          requestId,
+        ),
+      ).toEqual({ kind: "generating" });
+      // Cross-Discussion, cross-owner: invisible.
+      expect(
+        await store.requestStatus(ownerSessionId, otherDiscussionId, requestId),
+      ).toEqual({ kind: "unknown" });
+      expect(
+        await store.requestStatus(otherSessionId, discussionId, requestId),
+      ).toEqual({ kind: "unknown" });
+      store.close();
+    });
+  });
+
   it("claims a Turn and blocks duplicate or overlapping requests", async () => {
     const store = createStore(storeUrl());
     await store.create(ownerSessionId, idleState());

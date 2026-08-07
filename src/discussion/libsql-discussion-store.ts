@@ -438,8 +438,15 @@ export class LibSQLDiscussionStore
     requestId: string,
   ): Promise<RequestStatusResult> {
     await this.init();
+    const owner = SessionIdentifierSchema.parse(ownerSessionId);
+    // Ownership is enforced at the persistence boundary: a request is only
+    // visible when its parent Discussion belongs to `ownerSessionId`, so a
+    // caller can never observe another session's request lifecycle state.
+    // This mirrors the ownership contract already enforced by `readOwned`
+    // and the in-memory store; unowned lookups collapse to the same
+    // "not visible/not found" answer (`unknown`).
     const request = await this.guardStorage(() =>
-      this.readRequest(this.client, discussionId, requestId),
+      this.readOwnedRequest(this.client, owner, discussionId, requestId),
     );
     if (!request) return { kind: "unknown" };
     if (request.status === "succeeded") return { kind: "succeeded" };
@@ -888,6 +895,27 @@ export class LibSQLDiscussionStore
     const result = await connection.execute({
       sql: "SELECT turn, attempt_id, status, failure, lease_owner_id, lease_expires_at FROM discussion_request WHERE discussion_id = ? AND request_id = ?",
       args: [discussionId, requestId],
+    });
+    const row = result.rows[0];
+    return row ? parseRequestRow(row) : null;
+  }
+
+  /**
+   * Ownership-scoped request lookup used by `requestStatus`. Joins the
+   * request to its parent Discussion and filters by `owner_session_id` so a
+   * request that belongs to another session is indistinguishable from one
+   * that does not exist (`unknown`), avoiding any leakage of lifecycle
+   * state across sessions. A single query enforces both scope and lookup.
+   */
+  private async readOwnedRequest(
+    connection: { execute: Client["execute"] },
+    ownerSessionId: string,
+    discussionId: string,
+    requestId: string,
+  ): Promise<StoredRequest | null> {
+    const result = await connection.execute({
+      sql: "SELECT r.turn, r.attempt_id, r.status, r.failure, r.lease_owner_id, r.lease_expires_at FROM discussion_request AS r JOIN discussion AS d ON d.id = r.discussion_id WHERE r.discussion_id = ? AND r.request_id = ? AND d.owner_session_id = ?",
+      args: [discussionId, requestId, ownerSessionId],
     });
     const row = result.rows[0];
     return row ? parseRequestRow(row) : null;

@@ -311,7 +311,7 @@ describe("Discussion storage-outage handling", () => {
     expect(harness.fake.calls).toHaveLength(0);
     // Nothing was persisted as generating or failed; the identity is clean.
     expect(
-      await harness.fault.requestStatus(ownerCookie.split("=")[1]!, discussionId, requestId),
+      await harness.fault.requestStatus(ownerCookie.split("=")[1]!.split(".")[0]!, discussionId, requestId),
     ).toEqual({ kind: "unknown" });
 
     // Clearing the fault lets the same identity claim and complete exactly

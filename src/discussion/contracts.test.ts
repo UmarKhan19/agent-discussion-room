@@ -4,11 +4,52 @@ import {
   DiscussionStateSchema,
   ErrorResponseSchema,
   NextTurnRequestSchema,
+  speakerForTurn,
   StartDiscussionRequestSchema,
+  type DiscussionMessage,
+  type Speaker,
 } from "./contracts";
 
 const timestamp = "2026-08-02T12:00:00.000Z";
 const requestId = "22222222-2222-4222-8222-222222222222";
+
+function messageFor(turn: number, speaker: Speaker): DiscussionMessage {
+  return DiscussionMessageSchema.parse({
+    id: `33333333-3333-4333-8333-${String(turn).padStart(12, "0")}`,
+    content: `Message for Turn ${turn}`,
+    speaker,
+    createdAt: timestamp,
+    turn,
+    generation: {
+      requestId,
+      outputPolicyOutcome: {
+        decision: "allowed",
+        category: null,
+        checkedAt: timestamp,
+      },
+    },
+  });
+}
+
+/** Builds a structurally valid, Speaker-correct idle Discussion for a transcript. */
+function stateWithTranscript(transcript: DiscussionMessage[]) {
+  return {
+    id: "11111111-1111-4111-8111-111111111111",
+    topic: "Should cities create more public parks?",
+    status: "idle",
+    terminalReason: null,
+    turnLimit: 12,
+    turnCount: transcript.length,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    policyOutcome: {
+      decision: "allowed",
+      category: null,
+      checkedAt: timestamp,
+    },
+    transcript,
+  };
+}
 
 describe("external Discussion contracts", () => {
   it("accepts a complete initial state and rejects drift in state invariants", () => {
@@ -150,6 +191,64 @@ describe("external Discussion contracts", () => {
         ...initialState,
         transcript: [{ ...message, turn: 2 }],
       }).success,
+    ).toBe(false);
+  });
+
+  it("accepts a valid alternating Supporter/Opponent transcript", () => {
+    // Construct the canonical valid transcript via the authoritative
+    // speaker rule, so the test stays correct if the parity ever changes.
+    const transcript = [1, 2, 3, 4].map((turn) =>
+      messageFor(turn, speakerForTurn(turn)),
+    );
+    expect(
+      DiscussionStateSchema.parse(stateWithTranscript(transcript)),
+    ).toEqual(stateWithTranscript(transcript));
+  });
+
+  it("rejects a Speaker mismatch on an odd (Supporter) Turn", () => {
+    const transcript = [
+      messageFor(1, "supporter"),
+      messageFor(2, "opponent"),
+      messageFor(3, "opponent"), // Turn 3 is authored to Supporter
+    ];
+    const result = DiscussionStateSchema.safeParse(
+      stateWithTranscript(transcript),
+    );
+    expect(result.success).toBe(false);
+    expect(result.error?.issues).toContainEqual(
+      expect.objectContaining({
+        path: ["transcript", 2, "speaker"],
+        message: expect.stringContaining("Turn 3"),
+      }),
+    );
+  });
+
+  it("rejects a Speaker mismatch on an even (Opponent) Turn", () => {
+    const transcript = [
+      messageFor(1, "supporter"),
+      messageFor(2, "supporter"), // Turn 2 is authored to Opponent
+    ];
+    const result = DiscussionStateSchema.safeParse(
+      stateWithTranscript(transcript),
+    );
+    expect(result.success).toBe(false);
+    expect(result.error?.issues).toContainEqual(
+      expect.objectContaining({
+        path: ["transcript", 1, "speaker"],
+        message: expect.stringContaining("Turn 2"),
+      }),
+    );
+  });
+
+  it("still enforces Turn contiguity alongside Speaker parity", () => {
+    // Speaker-correct for Turn 3, but Turn 2 is missing: the existing
+    // contiguity invariant must still reject this independently of parity.
+    const transcript = [
+      messageFor(1, "supporter"),
+      messageFor(3, "supporter"),
+    ];
+    expect(
+      DiscussionStateSchema.safeParse(stateWithTranscript(transcript)).success,
     ).toBe(false);
   });
 

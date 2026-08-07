@@ -187,6 +187,19 @@ export const DiscussionStateSchema = z
           path: ["transcript", index, "turn"],
         });
       }
+      // Each Turn has a single authoritative speaker (odd => Supporter,
+      // even => Opponent). A persisted Message whose speaker does not
+      // match its Turn represents an impossible transcript and must not
+      // pass persistence validation, even when the Turn number itself is
+      // well-formed. Reuses `speakerForTurn` so the domain rule has one
+      // source of truth rather than being duplicated here.
+      if (message.speaker !== speakerForTurn(message.turn)) {
+        context.addIssue({
+          code: "custom",
+          message: `Speaker "${message.speaker}" is not valid for Turn ${message.turn} (expected "${speakerForTurn(message.turn)}")`,
+          path: ["transcript", index, "speaker"],
+        });
+      }
     });
   });
 
