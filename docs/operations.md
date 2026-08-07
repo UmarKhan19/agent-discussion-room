@@ -28,9 +28,25 @@ from the runtime variables.
 - In-memory storage exists **only** as the explicit development/test
   default. Production rejects in-memory and ephemeral URLs at startup — there
   is no implicit production fallback.
-- At startup the durable store creates its schema and reconciles any
-  Discussion left `generating` by a previous process into a retryable failed
-  state, so a restart never strands a participant mid-Turn.
+- **Multiple application instances may share one remote libSQL database.**
+  Each claimed generation attempt carries a recovery lease (owner instance
+  and expiry). At startup every instance reconciles only attempts whose
+  lease has expired (or legacy rows without a lease) into a retryable
+  failed state; a healthy in-flight generation owned by another live
+  instance is never recovered. Retrying a request identity whose attempt's
+  lease has expired reclaims the same Turn immediately (lazy recovery),
+  without waiting for a restart. See
+  [docs/architecture.md](docs/architecture.md) for the full lease semantics.
+- **Crash recovery is deferred by the lease duration** (the configured
+  generation timeout plus a fixed 60-second safety margin): after the
+  owning process disappears, the attempt stays `generating` until the lease
+  expires, then becomes retryable. A local `file:` URL remains
+  single-instance: one SQLite file supports one writing process.
+- **Instances need reasonably synchronized clocks.** Each instance
+  evaluates lease expiry on its own clock; the 60-second margin absorbs
+  normal scheduling/network delay and moderate skew, not unbounded skew.
+  Substantial owner-behind skew can make a healthy generation recoverable
+  early. Run instances on normal platform/NTP time synchronization.
 - **Retention expectations**: the store keeps Discussion rows and request
   records until deleted; the service ships no purge or migration tooling.
   Backups, archival, and deletion are the operator's responsibility (the
@@ -93,6 +109,15 @@ budgets.
 | Output characters (enforced post-generation) | 8,000 | 12,000 | `DISCUSSION_MAX_OUTPUT_CHARACTERS` |
 | Generation timeout | 30,000 ms | 300,000 ms | `DISCUSSION_GENERATION_TIMEOUT_MS` |
 | Simultaneous generations | 4 | 16 | `DISCUSSION_MAX_CONCURRENT_GENERATIONS` |
+
+The generation timeout also fixes the recovery lease: a claimed attempt's
+lease is the timeout plus a fixed 60-second margin, so a live instance's own
+timeout always fires before another instance may recover the attempt as
+abandoned. The durable store derives its lease from the generation-timeout
+value it is constructed with (a single derivation in
+`src/discussion/budgets.ts`), and production passes the Runner's budget to
+the store, so the two cannot silently drift apart — there is no independent
+lease knob.
 
 Concurrency ceiling exhaustion → `503 GENERATION_CAPACITY_EXCEEDED`
 (retryable). Timeout → `504 GENERATION_TIMEOUT`. Budget semantics, Speaker

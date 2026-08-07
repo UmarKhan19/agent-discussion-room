@@ -1,5 +1,9 @@
 import { createClient, type Client, type Transaction } from "@libsql/client";
 import {
+  HARD_GENERATION_TIMEOUT_MS,
+  deriveLeaseDurationMs,
+} from "./budgets";
+import {
   DiscussionIdentifierSchema,
   DiscussionMessageSchema,
   DiscussionStateSchema,
@@ -27,6 +31,24 @@ export interface LibSQLDiscussionStoreOptions {
   authToken?: string;
   /** Injectable clock for deterministic tests; defaults to Date. */
   now?: () => Date;
+  /**
+   * Stable identifier of this application instance. Written as the lease
+   * owner of every generation this instance claims, so operators can tell
+   * which instance owned an attempt. Defaults to a fresh random UUID per
+   * store; inject a fixed value in tests. Not authentication and never
+   * exposed to clients.
+   */
+  leaseOwnerId?: string;
+  /**
+   * The generation timeout configured on the DiscussionRunner that will
+   * use this store. The recovery lease of a claimed attempt is derived
+   * from this value (timeout + `RECOVERY_LEASE_GRACE_MS`, via
+   * `deriveLeaseDurationMs`), so a live instance's own hard timeout always
+   * fires before another instance may recover the attempt. Required: there
+   * is deliberately no silent default, so a store and its Runner can never
+   * drift apart by omission — pass the same budget value to both.
+   */
+  generationTimeoutMs: number;
 }
 
 const INTERRUPTED_RECOVERY_FAILURE: TurnFailure = {
@@ -50,6 +72,8 @@ CREATE TABLE IF NOT EXISTS discussion_request (
   attempt_id TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('generating', 'succeeded', 'failed')),
   failure TEXT,
+  lease_owner_id TEXT,
+  lease_expires_at TEXT,
   PRIMARY KEY (discussion_id, request_id)
 );
 CREATE INDEX IF NOT EXISTS discussion_request_status
@@ -57,7 +81,15 @@ CREATE INDEX IF NOT EXISTS discussion_request_status
 `;
 
 type StoredRequest =
-  | { turn: number; attemptId: string; status: "generating" }
+  | {
+      turn: number;
+      attemptId: string;
+      status: "generating";
+      /** Instance that claimed this attempt; null only for legacy rows. */
+      leaseOwnerId: string | null;
+      /** ISO instant after which the attempt may be recovered; null only for legacy rows. */
+      leaseExpiresAt: string | null;
+    }
   | { turn: number; attemptId: string; status: "succeeded" }
   | { turn: number; attemptId: string; status: "failed"; failure: TurnFailure };
 
@@ -72,6 +104,20 @@ function parseRequestRow(raw: unknown): StoredRequest {
     attemptId: String(row.attempt_id),
   };
   const status = String(row.status) as StoredRequest["status"];
+  if (status === "generating") {
+    return {
+      ...base,
+      status,
+      leaseOwnerId:
+        row.lease_owner_id === null || row.lease_owner_id === undefined
+          ? null
+          : String(row.lease_owner_id),
+      leaseExpiresAt:
+        row.lease_expires_at === null || row.lease_expires_at === undefined
+          ? null
+          : String(row.lease_expires_at),
+    };
+  }
   if (status === "failed") {
     return {
       ...base,
@@ -114,18 +160,32 @@ function isCurrentAttempt(
  * state document, and per-request identity records are persisted here, never
  * in raw provider traces.
  *
- * Every mutation runs in a write transaction so the one-Turn boundary and
- * idempotent request outcomes hold across restarts and concurrent callers.
- * Recovery (`recoverInterrupted`) assumes a single process owns the store:
- * a Discussion left generating after a process exit becomes a retryable
- * failed state that the participant can resume with the same request
- * identity.
+ * Every mutation runs in a write transaction (`BEGIN IMMEDIATE`), so the
+ * one-Turn boundary and idempotent request outcomes hold across restarts
+ * and concurrent callers, including multiple application instances sharing
+ * one remote libSQL database.
+ *
+ * Each claimed attempt carries a recovery lease (`lease_owner_id`,
+ * `lease_expires_at`). Recovery (`recoverInterrupted`, and the lazy recovery
+ * inside `claimTurn`) reconciles a Discussion left generating only when its
+ * lease has expired or is absent (legacy rows): a generation actively owned
+ * by a live instance is never recovered, while a generation whose owning
+ * process disappeared becomes a retryable failed state that the participant
+ * can resume with the same request identity.
  */
 export class LibSQLDiscussionStore
   implements DiscussionStore, DurableDiscussionStore
 {
   private readonly client: Client;
   private readonly now: () => Date;
+  /** This application instance's lease-owner identifier. */
+  private readonly leaseOwnerId: string;
+  /**
+   * Maximum time one claimed attempt may remain generating: the configured
+   * generation timeout plus the fixed recovery margin (derived through
+   * `deriveLeaseDurationMs`).
+   */
+  private readonly leaseDurationMs: number;
   private initPromise: Promise<void> | null = null;
   /**
    * Serializes write transactions inside this process. The libSQL client
@@ -137,7 +197,18 @@ export class LibSQLDiscussionStore
   private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(options: LibSQLDiscussionStoreOptions) {
+    if (
+      !Number.isInteger(options.generationTimeoutMs) ||
+      options.generationTimeoutMs <= 0 ||
+      options.generationTimeoutMs > HARD_GENERATION_TIMEOUT_MS
+    ) {
+      throw new Error(
+        `generationTimeoutMs must be a positive integer at most HARD_GENERATION_TIMEOUT_MS (${HARD_GENERATION_TIMEOUT_MS}); received ${String(options.generationTimeoutMs)}`,
+      );
+    }
     this.now = options.now ?? (() => new Date());
+    this.leaseOwnerId = options.leaseOwnerId ?? crypto.randomUUID();
+    this.leaseDurationMs = deriveLeaseDurationMs(options.generationTimeoutMs);
     this.client = createClient({
       url: options.url,
       ...(options.authToken === undefined ? {} : { authToken: options.authToken }),
@@ -160,6 +231,7 @@ export class LibSQLDiscussionStore
     return this.withWriteTransaction(async (tx) => {
       const result = await tx.execute("SELECT id, state FROM discussion");
       let recovered = 0;
+      const updatedAt = this.now().toISOString();
 
       for (const row of result.rows) {
         const parsed = DiscussionStateSchema.safeParse(
@@ -174,19 +246,20 @@ export class LibSQLDiscussionStore
         }
         if (parsed.data.status !== "generating") continue;
 
-        const recoveredState: DiscussionState = {
-          ...parsed.data,
-          status: "failed",
-          updatedAt: this.now().toISOString(),
-        };
-        await tx.execute({
-          sql: "UPDATE discussion SET state = ?, updated_at = ? WHERE id = ?",
-          args: [JSON.stringify(recoveredState), recoveredState.updatedAt, row.id],
-        });
-        await tx.execute({
-          sql: "UPDATE discussion_request SET status = 'failed', failure = ? WHERE discussion_id = ? AND status = 'generating'",
-          args: [serializeFailure(INTERRUPTED_RECOVERY_FAILURE), row.id],
-        });
+        // A generating Discussion whose lease is still valid is owned by a
+        // live instance and must never be recovered. Rows without a lease
+        // are legacy rows from before leasing; they are treated as expired
+        // so an upgrade never strands them permanently.
+        const request = await this.readGeneratingRequest(tx, String(row.id));
+        if (request && !this.isLeaseExpired(request)) continue;
+
+        await this.recoverAttempt(
+          tx,
+          String(row.id),
+          parsed.data,
+          request ?? null,
+          updatedAt,
+        );
         recovered += 1;
       }
 
@@ -233,8 +306,17 @@ export class LibSQLDiscussionStore
     );
     if (!request) return { kind: "unknown" };
     if (request.status === "succeeded") return { kind: "succeeded" };
-    if (request.status === "generating") return { kind: "generating" };
-    return { kind: "failed", retryable: request.failure.retryable };
+    if (request.status === "failed") {
+      return { kind: "failed", retryable: request.failure.retryable };
+    }
+    // An attempt whose lease has expired is no longer owned by a live
+    // instance; report it as the retryable failure it will be recovered
+    // into, so callers observe the recoverable state instead of a stuck
+    // "generating" answer.
+    if (this.isLeaseExpired(request)) {
+      return { kind: "failed", retryable: true };
+    }
+    return { kind: "generating" };
   }
 
   async claimTurn(input: {
@@ -262,28 +344,67 @@ export class LibSQLDiscussionStore
       if (existing?.status === "succeeded") {
         return { kind: "replay", discussion };
       }
-      if (existing?.status === "generating") {
-        return { kind: "request_in_progress" };
-      }
       if (existing?.status === "failed" && !existing.failure.retryable) {
         return { kind: "failed", failure: copyFailure(existing.failure) };
       }
 
       const activeRequest = await this.readGeneratingRequest(tx, discussionId);
-      if (activeRequest) return { kind: "turn_in_progress" };
+      let recoveredOwnIdentity: StoredRequest | null = null;
+      if (activeRequest && !this.isLeaseExpired(activeRequest)) {
+        // The attempt is still owned by a live instance: conflicts are
+        // reported exactly as before, whether or not it is the same request
+        // identity.
+        return existing?.status === "generating"
+          ? { kind: "request_in_progress" }
+          : { kind: "turn_in_progress" };
+      }
+      if (activeRequest) {
+        // The generating attempt's lease has expired (or it is a legacy row
+        // without a lease): the owning instance is presumed gone. Recover it
+        // transactionally before claiming, so the abandoned Turn is
+        // reclaimed atomically and at most one attempt is ever active.
+        await this.recoverAttempt(
+          tx,
+          discussionId,
+          discussion,
+          activeRequest,
+          input.updatedAt,
+        );
+        if (activeRequest.requestId === requestId) {
+          // The abandoned attempt was this identity's own; it now reads as
+          // a retryable failed request, which is exactly the retry path.
+          const refreshed = await this.readRequest(tx, discussionId, requestId);
+          if (refreshed?.status === "failed") {
+            recoveredOwnIdentity = refreshed;
+          }
+        }
+      }
 
       if (discussion.status === "completed") return { kind: "completed" };
 
+      const retryRequest = recoveredOwnIdentity ?? existing;
+      const recoveredActive = activeRequest !== null;
       const isRetry =
-        existing?.status === "failed" && existing.failure.retryable;
-      const eligibleStatus = isRetry
-        ? discussion.status === "failed" && discussion.terminalReason === null
-        : discussion.status === "idle";
-      const turn = isRetry ? existing.turn : discussion.turnCount + 1;
+        retryRequest?.status === "failed" && retryRequest.failure.retryable;
+      // A Discussion whose abandoned attempt was just recovered is claimable
+      // by any request identity (the participant may have lost the original
+      // identity); otherwise only the same identity may retry a failed Turn.
+      // After an in-transaction recovery the Discussion is failed with a
+      // null terminal reason by construction.
+      const eligibleDiscussion = recoveredActive
+        ? { ...discussion, status: "failed", terminalReason: null }
+        : discussion;
+      const eligibleStatus = isRetry || recoveredActive
+        ? eligibleDiscussion.status === "failed" &&
+          eligibleDiscussion.terminalReason === null
+        : eligibleDiscussion.status === "idle";
+      const turn = isRetry
+        ? retryRequest.turn
+        : eligibleDiscussion.turnCount + 1;
       if (
         !eligibleStatus ||
-        discussion.turnCount >= discussion.turnLimit ||
-        turn !== discussion.turnCount + 1
+        eligibleDiscussion.turnCount >= eligibleDiscussion.turnLimit ||
+        turn !== eligibleDiscussion.turnCount + 1
       ) {
         return { kind: "invalid_state" };
       }
@@ -302,6 +423,10 @@ export class LibSQLDiscussionStore
         attemptId,
         status: "generating",
         failure: null,
+        leaseOwnerId: this.leaseOwnerId,
+        leaseExpiresAt: new Date(
+          this.now().getTime() + this.leaseDurationMs,
+        ).toISOString(),
       });
 
       return {
@@ -470,12 +595,44 @@ export class LibSQLDiscussionStore
 
   private async createSchema(): Promise<void> {
     await this.client.executeMultiple(SCHEMA_SQL);
+    await this.migrateRequestLeaseColumns();
     if (this.client.protocol === "file") {
       try {
         await this.client.execute("PRAGMA journal_mode = WAL");
       } catch {
         // WAL is a durability optimization; a store that cannot switch is
         // still correct under the in-process writer queue.
+      }
+    }
+  }
+
+  /**
+   * Adds the recovery-lease columns to databases created before leasing
+   * existed. `CREATE TABLE IF NOT EXISTS` cannot alter an existing table,
+   * so this checks `PRAGMA table_info` and adds only missing columns;
+   * legacy rows keep `NULL` leases, which recovery treats as expired. The
+   * operation is idempotent and safe to run concurrently from multiple
+   * instances: a lost `ALTER TABLE` race surfaces as a duplicate-column
+   * error, which is re-checked and ignored.
+   */
+  private async migrateRequestLeaseColumns(): Promise<void> {
+    const columns = await this.client.execute(
+      "PRAGMA table_info(discussion_request)",
+    );
+    const names = new Set(columns.rows.map((row) => String(row.name)));
+    for (const column of ["lease_owner_id", "lease_expires_at"]) {
+      if (names.has(column)) continue;
+      try {
+        await this.client.execute(
+          `ALTER TABLE discussion_request ADD COLUMN ${column} TEXT`,
+        );
+      } catch (error) {
+        const recheck = await this.client.execute(
+          "PRAGMA table_info(discussion_request)",
+        );
+        if (!recheck.rows.some((row) => String(row.name) === column)) {
+          throw error;
+        }
       }
     }
   }
@@ -509,6 +666,49 @@ export class LibSQLDiscussionStore
     }
   }
 
+  /**
+   * Whether a generating attempt may be recovered: its lease is absent
+   * (legacy row, treated as expired) or has passed. ISO-8601 UTC strings
+   * from `toISOString()` compare chronologically under `<`.
+   */
+  private isLeaseExpired(request: StoredRequest): boolean {
+    if (request.status !== "generating") return false;
+    return (
+      request.leaseExpiresAt === null ||
+      request.leaseExpiresAt < this.now().toISOString()
+    );
+  }
+
+  /**
+   * Converts one abandoned generating attempt into a retryable failed
+   * state, both in the Discussion document and in its request record.
+   * Must be called inside the write transaction that owns the row.
+   */
+  private async recoverAttempt(
+    tx: Transaction,
+    discussionId: string,
+    discussion: DiscussionState,
+    request: (StoredRequest & { requestId: string }) | null,
+    updatedAt: string,
+  ): Promise<void> {
+    const recoveredState: DiscussionState = {
+      ...discussion,
+      status: "failed",
+      terminalReason: null,
+      updatedAt,
+    };
+    await tx.execute({
+      sql: "UPDATE discussion SET state = ?, updated_at = ? WHERE id = ?",
+      args: [JSON.stringify(recoveredState), recoveredState.updatedAt, discussionId],
+    });
+    if (request) {
+      await tx.execute({
+        sql: "UPDATE discussion_request SET status = 'failed', failure = ? WHERE discussion_id = ? AND request_id = ? AND status = 'generating'",
+        args: [serializeFailure(INTERRUPTED_RECOVERY_FAILURE), discussionId, request.requestId],
+      });
+    }
+  }
+
   private async readOwnedState(
     connection: { execute: Client["execute"] },
     ownerSessionId: string,
@@ -528,7 +728,7 @@ export class LibSQLDiscussionStore
     requestId: string,
   ): Promise<StoredRequest | null> {
     const result = await connection.execute({
-      sql: "SELECT turn, attempt_id, status, failure FROM discussion_request WHERE discussion_id = ? AND request_id = ?",
+      sql: "SELECT turn, attempt_id, status, failure, lease_owner_id, lease_expires_at FROM discussion_request WHERE discussion_id = ? AND request_id = ?",
       args: [discussionId, requestId],
     });
     const row = result.rows[0];
@@ -540,7 +740,7 @@ export class LibSQLDiscussionStore
     discussionId: string,
   ): Promise<StoredRequest & { requestId: string } | null> {
     const result = await connection.execute({
-      sql: "SELECT request_id, turn, attempt_id, status, failure FROM discussion_request WHERE discussion_id = ? AND status = 'generating' LIMIT 1",
+      sql: "SELECT request_id, turn, attempt_id, status, failure, lease_owner_id, lease_expires_at FROM discussion_request WHERE discussion_id = ? AND status = 'generating' LIMIT 1",
       args: [discussionId],
     });
     const row = result.rows[0];
@@ -569,16 +769,21 @@ export class LibSQLDiscussionStore
       attemptId: string;
       status: StoredRequest["status"];
       failure: TurnFailure | null;
+      /** Recovery lease; only meaningful for the generating status. */
+      leaseOwnerId?: string;
+      leaseExpiresAt?: string;
     },
   ): Promise<void> {
     await tx.execute({
-      sql: `INSERT INTO discussion_request (discussion_id, request_id, turn, attempt_id, status, failure)
-        VALUES (?, ?, ?, ?, ?, ?)
+      sql: `INSERT INTO discussion_request (discussion_id, request_id, turn, attempt_id, status, failure, lease_owner_id, lease_expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (discussion_id, request_id) DO UPDATE SET
           turn = excluded.turn,
           attempt_id = excluded.attempt_id,
           status = excluded.status,
-          failure = excluded.failure`,
+          failure = excluded.failure,
+          lease_owner_id = excluded.lease_owner_id,
+          lease_expires_at = excluded.lease_expires_at`,
       args: [
         request.discussionId,
         request.requestId,
@@ -586,6 +791,8 @@ export class LibSQLDiscussionStore
         request.attemptId,
         request.status,
         request.failure === null ? null : serializeFailure(request.failure),
+        request.leaseOwnerId ?? null,
+        request.leaseExpiresAt ?? null,
       ],
     });
   }

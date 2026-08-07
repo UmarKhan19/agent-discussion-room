@@ -208,9 +208,10 @@ The production system of record is a **libSQL** database
 - `discussion` — `id` (PK), `owner_session_id`, `state` (validated
   `DiscussionState` JSON), `updated_at`.
 - `discussion_request` — `discussion_id` + `request_id` (PK), `turn`,
-  `attempt_id`, `status` (`generating`/`succeeded`/`failed`), `failure`.
-  This table is what makes retry, replay, and one-attempt commit reliable
-  across restarts.
+  `attempt_id`, `status` (`generating`/`succeeded`/`failed`), `failure`,
+  `lease_owner_id`, `lease_expires_at`. This table is what makes retry,
+  replay, one-attempt commit, and abandoned-generation recovery reliable
+  across restarts and multiple application instances.
 
 Ownership, Topic, ordered Messages, status, Turn counts, timestamps, policy
 outcomes, and request identities are all persisted; raw provider traces are
@@ -218,12 +219,73 @@ never the system of record. The central Mastra runtime gets its own storage
 (a sibling `mastra.db` for local files; the shared remote URL when the
 Discussion store is remote) so the two never contend on one SQLite file.
 
-On startup the durable store initializes its schema and **reconciles
-interrupted generations**: Discussions left `generating` by a previous
-process become a retryable failed state so the participant can resume with
-the same request identity (`recoverInterrupted`). Development and test use
-an explicit in-memory store; production refuses in-memory URLs and fails
-startup instead of falling back (see [docs/operations.md](docs/operations.md)).
+### Generation leases
+
+Every claimed attempt writes a **recovery lease** onto its request record:
+
+- `lease_owner_id` — the application instance that claimed the attempt (a
+  server-generated random UUID per process; not authentication, never
+  exposed to clients, useful only for operational diagnosis).
+- `lease_expires_at` — claim time plus the lease duration. The lease
+  duration is **derived from the generation timeout** the store is
+  constructed with (`deriveLeaseDurationMs` in `src/discussion/budgets.ts`,
+  the single derivation for every construction site): the configured
+  generation timeout (`DISCUSSION_GENERATION_TIMEOUT_MS`) plus a fixed
+  60-second safety margin (`RECOVERY_LEASE_GRACE_MS`). Because the durable
+  store takes the same generation-timeout value the Runner enforces, a
+  live instance's own hard timeout always fires before its lease expires.
+
+Each instance evaluates lease expiry on its own clock. The 60-second
+margin absorbs normal scheduling and network delays and **moderate** clock
+skew; it is not a guarantee against arbitrary skew. Production instances
+are expected to run reasonably synchronized clocks (normal
+platform/NTP synchronization); substantial owner-behind skew can cause a
+healthy generation to be recovered early.
+
+The hard server-side generation timeout is what makes heartbeats
+unnecessary: a healthy attempt either completes or is cancelled well within
+its lease, so an unexpired lease is proof that the owning instance is still
+responsible for the attempt.
+
+### Interrupted-generation recovery
+
+Recovery reconciles only attempts that are actually eligible:
+
+- **Startup recovery** — every instance runs `recoverInterrupted()` during
+  startup readiness. It flips a `generating` attempt to a retryable failed
+  state (and its Discussion to `failed` with a null terminal reason) **only**
+  when the attempt's lease has expired or is absent. An attempt whose lease
+  is still valid is owned by a live instance and is never touched, so one
+  instance starting up cannot invalidate a generation running on another.
+- **Lazy recovery** — a next-Turn claim for a request identity whose
+  generating attempt has an expired lease recovers it inside the same
+  transaction before reclaiming the Turn, so participants are not stranded
+  waiting for a restart. A recovered Discussion may also be reclaimed by a
+  fresh request identity (the participant may have lost the original
+  identity); either way the abandoned Turn is reclaimed at the same
+  position — nothing is skipped or duplicated.
+- **Legacy rows** — request records written before leasing existed have
+  `NULL` leases and are treated as expired, so upgrading an existing
+  database never strands a `generating` row. The columns are added by an
+  idempotent migration safe to run concurrently from several instances.
+
+A consequence of leasing is that crash recovery is **deferred**: after the
+owning process disappears, the attempt stays `generating` (and retries
+answer `REQUEST_IN_PROGRESS`) until the lease expires, then becomes
+retryable. That deferral is the price of never mistaking a slow-but-live
+generation for an abandoned one. `stopped` and timeout-`failed` Discussions
+are terminal and are never recovered; explicit Stop and the product timeout
+remain authoritative.
+
+All recovery and claim mutations run in `BEGIN IMMEDIATE` write
+transactions, so concurrent completion, cancellation, retry, and recovery
+from different instances serialize at the database: whichever commits
+first wins, and the loser observes the winner's state (a late provider
+result is rejected as stale by `isCurrentAttempt`).
+
+Development and test use an explicit in-memory store; production refuses
+in-memory URLs and fails startup instead of falling back (see
+[docs/operations.md](docs/operations.md)).
 
 ## Mastra production registry
 

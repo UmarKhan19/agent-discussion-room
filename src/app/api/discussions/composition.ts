@@ -65,41 +65,7 @@ async function createProcessHandlers(): Promise<DiscussionHttpHandlers> {
   // Production uses the explicit durable adapter from the environment; the
   // in-memory store is chosen only by the explicit development/test
   // configuration (production fails startup when storage is missing).
-  if (environment.storage.kind === "durable") {
-    ensureStorageDirectory(environment.storage.url);
-  }
-  const store =
-    environment.storage.kind === "durable"
-      ? new LibSQLDiscussionStore({
-          url: environment.storage.url,
-          ...(environment.storage.authToken === undefined
-            ? {}
-            : { authToken: environment.storage.authToken }),
-        })
-      : new InMemoryDiscussionStore();
-
-  // Startup readiness: initialize the durable store and reconcile any
-  // Discussion left generating by a previous process before serving. A
-  // store failure is logged and surfaces as a stable 500 on every request.
-  const ready = isDurableDiscussionStore(store)
-    ? store.init().then(async () => {
-        await store.recoverInterrupted();
-      })
-    : Promise.resolve();
-  void ready.catch((error) => {
-    console.error(
-      "[discussion] Durable storage initialization failed; Discussion requests will fail until storage is available.",
-      error,
-    );
-  });
-
   const configuredTurnLimit = process.env.DISCUSSION_TURN_LIMIT;
-  const service = new DiscussionService({
-    store,
-    ...(configuredTurnLimit === undefined
-      ? {}
-      : { turnLimit: Number(configuredTurnLimit) }),
-  });
   const budgets = DiscussionBudgetSchema.parse({
     recentTranscriptTurns: envBudgetInt(
       "DISCUSSION_RECENT_TRANSCRIPT_TURNS",
@@ -129,6 +95,45 @@ async function createProcessHandlers(): Promise<DiscussionHttpHandlers> {
       "DISCUSSION_SESSION_GENERATION_QUOTA",
       DEFAULT_DISCUSSION_BUDGETS.sessionGenerationQuota,
     ),
+  });
+  if (environment.storage.kind === "durable") {
+    ensureStorageDirectory(environment.storage.url);
+  }
+  const store =
+    environment.storage.kind === "durable"
+      ? new LibSQLDiscussionStore({
+          url: environment.storage.url,
+          ...(environment.storage.authToken === undefined
+            ? {}
+            : { authToken: environment.storage.authToken }),
+          // The store derives its recovery lease from the same generation
+          // timeout the Runner enforces (see budgets.ts): the lease always
+          // outlives a legitimate generation by the fixed safety margin,
+          // and the two cannot drift apart because there is one value.
+          generationTimeoutMs: budgets.generationTimeoutMs,
+        })
+      : new InMemoryDiscussionStore();
+
+  // Startup readiness: initialize the durable store and reconcile any
+  // Discussion left generating by a previous process before serving. A
+  // store failure is logged and surfaces as a stable 500 on every request.
+  const ready = isDurableDiscussionStore(store)
+    ? store.init().then(async () => {
+        await store.recoverInterrupted();
+      })
+    : Promise.resolve();
+  void ready.catch((error) => {
+    console.error(
+      "[discussion] Durable storage initialization failed; Discussion requests will fail until storage is available.",
+      error,
+    );
+  });
+
+  const service = new DiscussionService({
+    store,
+    ...(configuredTurnLimit === undefined
+      ? {}
+      : { turnLimit: Number(configuredTurnLimit) }),
   });
   // Structured, privacy-safe operational telemetry: JSON lines on stdout.
   // Conversation content is structurally impossible to record; see

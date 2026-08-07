@@ -8,6 +8,7 @@ import {
 } from "@/discussion/contracts";
 import { DiscussionRunner } from "@/discussion/discussion-runner";
 import { DiscussionService } from "@/discussion/discussion-service";
+import { DEFAULT_GENERATION_TIMEOUT_MS } from "@/discussion/budgets";
 import { LibSQLDiscussionStore } from "@/discussion/libsql-discussion-store";
 import {
   DiscussionOutputPolicy,
@@ -23,6 +24,20 @@ import { createDiscussionHttpHandlers } from "./handler";
 const now = new Date("2026-08-02T12:00:00.000Z");
 const signingKey = "test-signing-key-that-is-at-least-32-characters";
 const requestId = "22222222-2222-4222-8222-222222222222";
+
+/** Deterministic clock that can be advanced past a recovery lease. */
+function mutableClock(start: Date): {
+  now: () => Date;
+  advance: (ms: number) => void;
+} {
+  let current = start.getTime();
+  return {
+    now: () => new Date(current),
+    advance: (ms: number) => {
+      current += ms;
+    },
+  };
+}
 
 function turnRequestId(turn: number): string {
   return `22222222-2222-4222-8222-${String(turn).padStart(12, "0")}`;
@@ -81,19 +96,26 @@ interface Harness {
  * file, exactly as a process restart would: a fresh store connection,
  * fresh service and Runner, fresh session manager, and the startup
  * readiness promise (schema init plus interrupted-generation recovery).
+ * Pass `clock` to share a mutable time source across restarts, so tests
+ * can advance time past a recovery lease.
  */
 function restartHarness(
   url: string,
   outcomes: readonly FakeDiscussionOutcome[],
+  clock: { now: () => Date } = { now: () => now },
 ): Harness {
   let idCalls = 0;
   let messageIdCalls = 0;
-  const store = new LibSQLDiscussionStore({ url, now: () => now });
+  const store = new LibSQLDiscussionStore({
+    url,
+    now: clock.now,
+    generationTimeoutMs: DEFAULT_GENERATION_TIMEOUT_MS,
+  });
   const service = new DiscussionService({
     store,
-    policy: new DiscussionPolicy(() => now),
+    policy: new DiscussionPolicy(clock.now),
     turnLimit: 3,
-    now: () => now,
+    now: clock.now,
     createId: () => {
       idCalls += 1;
       return `11111111-1111-4111-8111-${String(idCalls).padStart(12, "0")}`;
@@ -103,8 +125,8 @@ function restartHarness(
   const runner = new DiscussionRunner({
     store,
     discussion: fake,
-    outputPolicy: new DiscussionOutputPolicy(() => now),
-    now: () => now,
+    outputPolicy: new DiscussionOutputPolicy(clock.now),
+    now: clock.now,
     createMessageId: () => {
       messageIdCalls += 1;
       return turnMessageId(messageIdCalls);
@@ -362,7 +384,8 @@ describe("Discussion persistence across restarts", () => {
 
   it("recovers an interrupted generating state and retries without duplication", async () => {
     const url = databaseUrl();
-    const first = restartHarness(url, []);
+    const clock = mutableClock(now);
+    const first = restartHarness(url, [], clock);
     const created = await first.handlers.post(
       jsonRequest({ topic: "Should cities create more public parks?" }),
     );
@@ -376,12 +399,15 @@ describe("Discussion persistence across restarts", () => {
       discussionId,
       requestId,
       attemptId: "55555555-5555-4555-8555-555555555555",
-      updatedAt: now.toISOString(),
+      updatedAt: clock.now().toISOString(),
     });
     expect(claimed.kind).toBe("claimed");
     first.store.close();
+    // The abandoned attempt becomes recoverable only after its lease
+    // expires (generation timeout plus the recovery grace margin).
+    clock.advance(90_001);
 
-    const second = restartHarness(url, successfulOutcomes(["Recovered Turn"]));
+    const second = restartHarness(url, successfulOutcomes(["Recovered Turn"]), clock);
     const read = await second.handlers.get(
       new Request(`http://localhost/api/discussions/${discussionId}`, {
         headers: { Cookie: ownerCookie },
@@ -467,7 +493,11 @@ describe("Discussion persistence across restarts", () => {
     const ready = new Promise<void>((resolve) => {
       releaseReady = resolve;
     });
-    const store = new LibSQLDiscussionStore({ url, now: () => now });
+    const store = new LibSQLDiscussionStore({
+      url,
+      now: () => now,
+      generationTimeoutMs: DEFAULT_GENERATION_TIMEOUT_MS,
+    });
     const service = new DiscussionService({
       store,
       policy: new DiscussionPolicy(() => now),
@@ -521,7 +551,11 @@ describe("Discussion persistence across restarts", () => {
     const discussionId = DiscussionStateSchema.parse(await created.json()).id;
     first.store.close();
 
-    const store = new LibSQLDiscussionStore({ url, now: () => now });
+    const store = new LibSQLDiscussionStore({
+      url,
+      now: () => now,
+      generationTimeoutMs: DEFAULT_GENERATION_TIMEOUT_MS,
+    });
     const service = new DiscussionService({
       store,
       policy: new DiscussionPolicy(() => now),

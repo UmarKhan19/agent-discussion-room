@@ -95,3 +95,31 @@ agents, tools, workflows, and scorers are registered:
 5. Put the application behind a trusted proxy that sets `X-Forwarded-For`
    (the network rate limit trusts its first entry) and terminates HTTPS
    (session cookies become `Secure` on `https:` origins).
+
+## Multi-instance deployments
+
+Multiple application instances may serve the same remote libSQL
+(`libsql:`, `http(s):`, or `ws(s):`) store. Ownership, Turn claims, retry,
+and interrupted-generation recovery are enforced by the shared database
+(every mutation is a `BEGIN IMMEDIATE` write transaction), so instances can
+be added, removed, or restarted without coordinating among themselves:
+
+- Startup recovery runs on **every** instance, but only reconciles attempts
+  whose recovery lease has expired (or legacy rows without a lease). A
+  generation actively running on another instance is never recovered.
+- A crashed instance's attempts become retryable once their lease expires
+  (generation timeout + 60 s); a retry with the same request identity
+  reclaims the same Turn immediately (lazy recovery).
+- Instances must run **reasonably synchronized clocks** (normal
+  platform/NTP synchronization): each instance judges lease expiry on its
+  own clock, and the 60-second margin absorbs moderate skew but not
+  arbitrary skew. Substantial owner-behind skew can recover a healthy
+  generation early.
+- Process-local budgets (rate limits, concurrency ceiling, session quota)
+  remain per-instance; see [docs/known-limitations.md](docs/known-limitations.md).
+
+During a **rolling upgrade** from a pre-lease version, a `generating` row
+written by an old-version instance has no lease and is therefore treated as
+abandoned by the new version. Drain in-flight generations before upgrading,
+or accept that pre-upgrade in-flight generations are recovered as
+retryable (the participant can resume them with the same request identity).

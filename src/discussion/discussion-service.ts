@@ -156,9 +156,11 @@ export interface DurableDiscussionStore extends DiscussionStore {
   /** Creates the store schema; must complete before any other method. */
   init(): Promise<void>;
   /**
-   * Reconciles Discussions left generating by a process that exited before
-   * the generation finished: each becomes a retryable failed state so the
-   * participant can resume with the same request identity.
+   * Reconciles Discussions whose generation attempt was abandoned: a
+   * generating attempt whose recovery lease has expired (or a legacy row
+   * without a lease) becomes a retryable failed state so the participant
+   * can resume with the same request identity. Attempts whose lease is
+   * still valid are owned by a live instance and are never recovered.
    */
   recoverInterrupted(): Promise<number>;
 }

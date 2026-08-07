@@ -28,6 +28,7 @@ import {
   type DiscussionBudgets,
 } from "./budgets";
 import type {
+  ClaimTurnResult,
   DiscussionStore,
   TurnFailure,
   TurnMutationResult,
@@ -311,27 +312,26 @@ export class DiscussionRunner {
       throw new DiscussionSessionQuotaExceededError();
     }
 
-    // Capacity guard: only requests that can start a fresh generation
-    // reserve a process-wide slot. Observing a prior outcome (replay,
-    // conflict, non-retryable failure) never reserves capacity.
-    const status = await this.store.requestStatus(sessionId, id, stableRequestId);
-    const needsCapacity =
-      status.kind === "unknown" ||
-      (status.kind === "failed" && status.retryable);
-    const capacityHeld = needsCapacity && this.capacity.tryAcquire();
-    if (needsCapacity && !capacityHeld) {
-      throw new DiscussionGenerationCapacityError();
-    }
+    // Capacity guard: the claim result is the only authoritative signal
+    // that this process will start new provider work, and the slot is
+    // reserved from it. A pre-claim status hint can go stale: an attempt
+    // observed as generating with a valid lease may have its lease expire,
+    // be recovered by another instance, and then be claimed (as a retry)
+    // by this request before `claimTurn` runs — a hint-based guard could
+    // therefore let a fresh generation start without a slot. Observing a
+    // prior outcome (replay, conflict, non-retryable failure) never
+    // reserves capacity, because no claim — and so no provider work —
+    // occurs.
+    const claim = await this.store.claimTurn({
+      ownerSessionId: sessionId,
+      discussionId: id,
+      requestId: stableRequestId,
+      attemptId,
+      updatedAt: this.now().toISOString(),
+    });
 
+    let capacityHeld = false;
     try {
-      const claim = await this.store.claimTurn({
-        ownerSessionId: sessionId,
-        discussionId: id,
-        requestId: stableRequestId,
-        attemptId,
-        updatedAt: this.now().toISOString(),
-      });
-
       switch (claim.kind) {
         case "not_found":
           return null;
@@ -348,10 +348,26 @@ export class DiscussionRunner {
         case "invalid_state":
           throw new DiscussionInvalidStateError();
         case "claimed":
-          sessionCharges.add(chargeKey);
-          this.chargedGenerationKeys.set(sessionId, sessionCharges);
           break;
       }
+
+      if (!this.capacity.tryAcquire()) {
+        // The durable claim must not be abandoned: resolve it into the
+        // same retryable failed state recovery produces, so the Turn is
+        // not stranded until lease expiry and a later retry can claim it.
+        // The caller still receives the stable capacity error, and quota
+        // is never charged for an attempt that did not generate.
+        await this.resolveCapacityRejectedClaim(
+          sessionId,
+          id,
+          stableRequestId,
+          claim,
+        );
+        throw new DiscussionGenerationCapacityError();
+      }
+      capacityHeld = true;
+      sessionCharges.add(chargeKey);
+      this.chargedGenerationKeys.set(sessionId, sessionCharges);
 
       const generating = claim.discussion;
       const turn = claim.turn;
@@ -498,6 +514,37 @@ export class DiscussionRunner {
       // timeout, Stop, disconnect, late results, and claims that turned out
       // to be replays or conflicts.
       if (capacityHeld) this.capacity.release();
+    }
+  }
+
+  /**
+   * Resolves a freshly claimed attempt that cannot start because the
+   * process-wide capacity slot was unavailable: the claim is converted to
+   * a retryable failed state (the same outcome recovery produces for an
+   * abandoned attempt), so the Turn is not stranded for the lease duration
+   * and a later retry can claim it. If the store cannot record the
+   * resolution, the attempt's lease will expire and startup recovery will
+   * reconcile it; the caller still receives the capacity error either way.
+   */
+  private async resolveCapacityRejectedClaim(
+    ownerSessionId: string,
+    discussionId: string,
+    requestId: string,
+    claim: Extract<ClaimTurnResult, { kind: "claimed" }>,
+  ): Promise<void> {
+    try {
+      await this.store.failTurn({
+        ownerSessionId,
+        discussionId,
+        requestId,
+        attemptId: claim.attemptId,
+        expectedTurn: claim.turn,
+        failure: { kind: "generation_failed", retryable: true },
+        updatedAt: this.now().toISOString(),
+      });
+    } catch {
+      // Best-effort resolution; lease-expiry recovery reconciles the
+      // attempt if the store could not record this failure.
     }
   }
 

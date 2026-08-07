@@ -32,6 +32,37 @@ export const HARD_MAX_OUTPUT_CHARACTERS = MESSAGE_MAX_LENGTH;
 export const DEFAULT_GENERATION_TIMEOUT_MS = 30_000;
 export const HARD_GENERATION_TIMEOUT_MS = 300_000;
 
+/**
+ * Fixed safety margin added to the configured generation timeout to form
+ * the recovery-lease duration of a claimed attempt. A live instance's own
+ * hard timeout always fires before the lease expires, so the lease is
+ * exclusively the signal that the owning process disappeared. The margin
+ * absorbs scheduling latency, store round-trips, and event-loop stalls,
+ * plus moderate clock skew between instances; it is not a substitute for
+ * time synchronization (substantial owner-behind skew can still cause a
+ * healthy attempt to be recovered early). Production instances are
+ * expected to run reasonably synchronized clocks (normal platform/NTP
+ * synchronization). Not operator-configurable: the generation timeout
+ * environment variable effectively controls the lease length.
+ */
+export const RECOVERY_LEASE_GRACE_MS = 60_000;
+
+/**
+ * Single derivation of the recovery-lease duration from a configured
+ * generation timeout: the timeout plus the fixed safety margin. The lease
+ * is therefore derived from the generation timeout supplied to the store,
+ * and there is no independent lease-duration knob or default that could
+ * silently drift out of sync with that timeout. Production composition
+ * passes the same `generationTimeoutMs` to both the store and the Runner,
+ * so the invariant "lease duration outlives a legitimate generation
+ * lifetime" holds there. Direct callers are still responsible for
+ * supplying the same generation timeout to the store and the Runner;
+ * deriving the lease through this function alone cannot guarantee that.
+ */
+export function deriveLeaseDurationMs(generationTimeoutMs: number): number {
+  return generationTimeoutMs + RECOVERY_LEASE_GRACE_MS;
+}
+
 /** Process-wide simultaneous generations across all Discussions. */
 export const DEFAULT_MAX_CONCURRENT_GENERATIONS = 4;
 export const HARD_MAX_CONCURRENT_GENERATIONS = 16;

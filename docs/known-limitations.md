@@ -47,7 +47,23 @@ explicitly changed.
   (hard-bounded). Counters reset on restart; multi-instance deployments get
   per-instance budgets unless they add a shared limiting layer.
 - **Single-instance local storage.** A `file:` libSQL URL supports one
-  instance; horizontal scaling requires a remote libSQL endpoint.
+  instance; horizontal scaling requires a remote libSQL endpoint. Remote
+  libSQL deployments may run multiple instances against the shared store:
+  interrupted-generation recovery is lease-protected, so a live instance's
+  in-flight generations are never recovered by another instance, while
+  abandoned attempts become retryable after their lease expires.
+- **Crash recovery is deferred by the lease duration.** After a process
+  disappears mid-generation, the Turn stays `generating` (and same-identity
+  retries answer `REQUEST_IN_PROGRESS`) until the recovery lease expires
+  (generation timeout + 60 s), then the attempt becomes retryable. This
+  delay is the trade-off for never treating a slow-but-live generation as
+  abandoned.
+- **Clock-skew sensitivity.** Lease expiry is evaluated on each instance's
+  own clock. Normal scheduling/network delay and moderate skew are absorbed
+  by the 60-second recovery margin, but the lease does not protect against
+  arbitrary skew: an instance whose clock lags substantially can have its
+  healthy in-flight generations recovered by other instances. Instances are
+  expected to run normal platform/NTP time synchronization.
 - **Bounded model context.** The model sees only the recent-Transcript
   window (default 8 completed Turns / 32,000 characters), so very long
   Discussions lose early context by design.
