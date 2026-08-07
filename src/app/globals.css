@@ -1,37 +1,112 @@
 @import "tailwindcss";
 
+/*
+ * Product theme: semantic tokens, one light-dark pair each, selected to meet
+ * WCAG AA contrast in both system themes. Tokens are the only theme
+ * mechanism: the stylesheet deliberately contains no per-scheme media
+ * queries, so a system theme change cannot leave content or controls
+ * unstyled. The theme test (theme.test.ts) verifies every pair mechanically.
+ */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  color-scheme: light dark;
+
+  --background: light-dark(#ffffff, #0a0a0a);
+  --foreground: light-dark(#18181b, #f4f4f5);
+  --muted: light-dark(#52525b, #d4d4d8);
+  --border: light-dark(#737373, #71717a);
+  --surface: light-dark(#f4f4f5, #1c1c1f);
+  --accent: light-dark(#166534, #22c55e);
+  --accent-foreground: light-dark(#ffffff, #052e16);
+  --danger: light-dark(#b91c1c, #f87171);
+  --danger-foreground: light-dark(#ffffff, #450a0a);
+  --supporter: light-dark(#1d4ed8, #1e40af);
+  --supporter-foreground: light-dark(#ffffff, #ffffff);
+  --opponent: light-dark(#15803d, #166534);
+  --opponent-foreground: light-dark(#ffffff, #ffffff);
+  --success: light-dark(#15803d, #86efac);
+  --warning: light-dark(#b45309, #fcd34d);
+  --error: light-dark(#b91c1c, #fca5a5);
+  --focus: light-dark(#1d4ed8, #93c5fd);
+
+  /* System font stack: no framework starter fonts in the product identity. */
+  --font-body: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --color-muted: var(--muted);
+  --color-border: var(--border);
+  --color-surface: var(--surface);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-danger: var(--danger);
+  --color-danger-foreground: var(--danger-foreground);
+  --color-supporter: var(--supporter);
+  --color-supporter-foreground: var(--supporter-foreground);
+  --color-opponent: var(--opponent);
+  --color-opponent-foreground: var(--opponent-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-error: var(--error);
+  --font-sans: var(--font-body);
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", monospace;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-body);
 }
 
 :focus-visible {
-  outline: 2px solid #1d4ed8;
+  outline: 2px solid var(--focus);
   outline-offset: 2px;
 }
 
-@media (prefers-color-scheme: dark) {
-  :focus-visible {
-    outline-color: #93c5fd;
+@layer components {
+  /*
+   * Reliable touch target for pointer-operated controls (Start, Stop, Retry,
+   * Jump to Latest). Minimum 44px in both dimensions; the theme test asserts
+   * this contract against this stylesheet.
+   */
+  .control {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  /*
+   * Narrow-screen-first: primary controls span the viewport width so they
+   * are large and unreachable-proof on touch devices, and return to content
+   * width at the Tailwind sm breakpoint.
+   */
+  .control-block {
+    width: 100%;
+  }
+
+  /*
+   * Long Topics and Messages reflow instead of forcing page-level horizontal
+   * scrolling, including at enlarged text sizes.
+   */
+  .reflow {
+    overflow-wrap: anywhere;
+  }
+
+  /*
+   * The page shell is full-width and bounded by a readable measure with no
+   * minimum width, so content never exceeds the viewport.
+   */
+  .page-shell {
+    width: 100%;
+    max-width: 56rem;
+    margin-inline: auto;
+  }
+}
+
+@media (min-width: 40rem) {
+  .control-block {
+    width: auto;
   }
 }

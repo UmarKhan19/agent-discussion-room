@@ -485,11 +485,14 @@ export default function Home() {
   const topicInvalid = error?.family === "topic";
 
   return (
-    <main className="mx-auto flex min-h-screen w-full max-w-4xl flex-col gap-8 px-5 py-10 sm:px-10">
+    <main className="page-shell flex min-h-dvh flex-col gap-6 px-4 py-6 sm:gap-8 sm:px-8 sm:py-10">
       <header>
-        <h1 className="text-3xl font-semibold">Agent Discussion Room</h1>
-        <p className="mt-2 text-neutral-600 dark:text-neutral-300">
-          Choose a permitted Topic, then explicitly start a bounded Discussion.
+        <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">
+          Agent Discussion Room
+        </h1>
+        <p className="mt-2 text-muted">
+          Choose a permitted Topic, then explicitly start a bounded Discussion
+          between a Supporter and an Opponent.
         </p>
       </header>
 
@@ -507,21 +510,21 @@ export default function Home() {
           aria-describedby="topic-help"
           aria-invalid={topicInvalid || undefined}
           onChange={(event) => setTopic(event.target.value)}
-          className="rounded-lg border border-neutral-500 bg-transparent p-3"
+          className="rounded-lg border border-border bg-surface p-3"
         />
-        <p id="topic-help" className="text-sm text-neutral-600 dark:text-neutral-300">
+        <p id="topic-help" className="text-sm text-muted">
           Enter plain text, up to {TOPIC_MAX_LENGTH} characters.
         </p>
         <button
           type="submit"
           disabled={isStarting || isGenerating || isStopping}
-          className="min-h-11 self-start rounded-lg bg-green-700 px-5 py-2 font-semibold text-white disabled:opacity-60"
+          className="control control-block rounded-lg bg-accent px-5 py-2 font-semibold text-accent-foreground disabled:opacity-60"
         >
           {isStarting ? "Starting Discussion…" : "Start Discussion"}
         </button>
       </form>
 
-      <p role="alert" aria-live="polite" className="min-h-6 text-red-700 dark:text-red-300">
+      <p role="alert" aria-live="polite" className="min-h-6 text-error">
         {error?.message}
       </p>
 
@@ -534,23 +537,29 @@ export default function Home() {
           className="flex flex-col gap-4"
         >
           <div>
-            <p className="text-sm font-semibold uppercase tracking-wide">
+            <p className="text-sm font-semibold tracking-wide text-muted uppercase">
               Active Topic
             </p>
-            <h2 id="active-topic" className="text-2xl font-semibold">
+            <h2
+              id="active-topic"
+              className="reflow text-xl font-semibold sm:text-2xl"
+            >
               {discussion.topic}
             </h2>
           </div>
-          <p aria-label="Turn progress">
+          <p
+            aria-label="Turn progress"
+            className="font-medium text-muted tabular-nums"
+          >
             {discussion.turnCount} / {discussion.turnLimit} Turns
           </p>
-          <div className="flex flex-wrap gap-3">
+          <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap">
             {stopVisible ? (
               <button
                 type="button"
                 onClick={() => void stopDiscussion()}
                 disabled={isStopping}
-                className="min-h-11 self-start rounded-lg bg-red-700 px-5 py-2 font-semibold text-white disabled:opacity-60"
+                className="control control-block rounded-lg bg-danger px-5 py-2 font-semibold text-danger-foreground disabled:opacity-60"
               >
                 Stop Discussion
               </button>
@@ -560,7 +569,7 @@ export default function Home() {
                 type="button"
                 onClick={retryTurn}
                 disabled={isStopping}
-                className="min-h-11 self-start rounded-lg bg-green-700 px-5 py-2 font-semibold text-white disabled:opacity-60"
+                className="control control-block rounded-lg bg-accent px-5 py-2 font-semibold text-accent-foreground disabled:opacity-60"
               >
                 Retry Turn
               </button>
@@ -569,7 +578,7 @@ export default function Home() {
               <button
                 type="button"
                 onClick={startFreshDiscussion}
-                className="min-h-11 self-start rounded-lg border border-neutral-500 px-5 py-2 font-semibold"
+                className="control control-block rounded-lg border border-border bg-surface px-5 py-2 font-semibold text-foreground"
               >
                 Start a New Discussion
               </button>

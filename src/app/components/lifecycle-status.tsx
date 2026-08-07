@@ -93,12 +93,12 @@ export function LifecycleStatus({ phase }: { phase: LifecyclePhase }) {
   const copy = lifecycleStatusCopy(phase);
   const tone =
     phase.kind === "completed"
-      ? "text-green-700 dark:text-green-300"
+      ? "text-success"
       : phase.kind === "failed"
-        ? "text-red-700 dark:text-red-300"
+        ? "text-error"
         : phase.kind === "stopped"
-          ? "text-amber-700 dark:text-amber-300"
-          : "text-neutral-700 dark:text-neutral-200";
+          ? "text-warning"
+          : "text-muted";
   return (
     <p role="status" className={`font-semibold ${tone}`}>
       {copy}

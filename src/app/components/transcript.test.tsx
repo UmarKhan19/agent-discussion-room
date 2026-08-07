@@ -134,7 +134,7 @@ describe("Transcript structure and labeling", () => {
       .querySelector("p");
     expect(paragraph?.textContent).toContain("\n\n");
     expect(paragraph?.className).toContain("whitespace-pre-wrap");
-    expect(paragraph?.className).toContain("wrap-anywhere");
+    expect(paragraph?.className).toContain("reflow");
   });
 });
 
