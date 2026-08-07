@@ -36,7 +36,11 @@ export default defineConfig({
   webServer: {
     command: "bun run dev -- --port 3100",
     url: "http://localhost:3100",
-    reuseExistingServer: !process.env.CI,
+    // Always boot the suite's own server: reusing an already-running dev
+    // server on 3100 could silently run the suite against a non-deterministic
+    // composition (harness 404s, live provider calls). A busy port is a loud
+    // failure; reuse would be a quiet, wrong one.
+    reuseExistingServer: false,
     timeout: 120_000,
     env: {
       // Deterministic, credential-free generation (rejected in production).
