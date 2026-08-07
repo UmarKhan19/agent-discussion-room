@@ -31,6 +31,16 @@ export const DISCUSSION_SESSION_SECRET_ENV = "DISCUSSION_SESSION_SECRET";
 export const PROVIDER_KEY_ENV = "OPENCODE_API_KEY";
 
 /**
+ * Selects the credential-free scripted generation adapter used by the
+ * deterministic browser suite. Development and test may set exactly
+ * `deterministic`; production rejects it because the scripted adapter is
+ * never a production model path.
+ */
+export const GENERATION_MODE_ENV = "DISCUSSION_GENERATION_MODE";
+
+export type GenerationMode = "mastra" | "deterministic";
+
+/**
  * External observability export switch. Export is disabled unless this is
  * exactly the string `true`; any other present value is a misconfiguration
  * and fails startup. See docs/observability-privacy.md for the retention and
@@ -71,6 +81,12 @@ export interface DiscussionEnvironment {
    * required in production). Local telemetry never depends on this flag.
    */
   observabilityExportEnabled: boolean;
+  /**
+   * Which generation adapter serves next-Turn requests. Production always
+   * resolves to `mastra`; the deterministic scripted adapter is a
+   * development/test-only path for the credential-free browser suite.
+   */
+  generationMode: GenerationMode;
 }
 
 /** Raised when required runtime values are absent or invalid. */
@@ -231,6 +247,26 @@ export function resolveDiscussionEnvironment(
     problems.push(...validateProviderKey(env[PROVIDER_KEY_ENV]));
   }
 
+  // The deterministic generation mode is a test-only seam: it never calls a
+  // provider, so enabling it in production would silently disable the real
+  // model path. Any value other than the exact word "deterministic" (or
+  // unset) is a misconfiguration and fails startup loudly.
+  const generationModeRaw = env[GENERATION_MODE_ENV];
+  let generationMode: GenerationMode = "mastra";
+  if (generationModeRaw === undefined) {
+    generationMode = "mastra";
+  } else if (generationModeRaw === "deterministic" && isProduction) {
+    problems.push(
+      `${GENERATION_MODE_ENV}=deterministic is a credential-free test mode and cannot be used in production; unset it so the Supporter and Opponent agents serve next-Turn requests.`,
+    );
+  } else if (generationModeRaw === "deterministic") {
+    generationMode = "deterministic";
+  } else {
+    problems.push(
+      `${GENERATION_MODE_ENV} must be exactly \"deterministic\" or unset; any other value is a misconfiguration.`,
+    );
+  }
+
   // External observability export is opt-in only: the exact string "true"
   // enables it, any other present value is a misconfiguration, and an enabled
   // production deployment must supply platform credentials or the export
@@ -268,5 +304,6 @@ export function resolveDiscussionEnvironment(
     sessionSecret: env[DISCUSSION_SESSION_SECRET_ENV] ?? null,
     providerKey: env[PROVIDER_KEY_ENV] ?? null,
     observabilityExportEnabled,
+    generationMode,
   };
 }

@@ -5,6 +5,7 @@ import {
   DISCUSSION_STORE_AUTH_TOKEN_ENV,
   DISCUSSION_STORE_URL_ENV,
   EnvironmentValidationError,
+  GENERATION_MODE_ENV,
   MASTRA_PLATFORM_ACCESS_TOKEN_ENV,
   OBSERVABILITY_EXPORT_ENABLED_ENV,
   PROVIDER_KEY_ENV,
@@ -187,6 +188,7 @@ describe("resolveDiscussionEnvironment", () => {
       sessionSecret: null,
       providerKey: null,
       observabilityExportEnabled: false,
+      generationMode: "mastra",
     });
   });
 
@@ -318,5 +320,55 @@ describe("deriveMastraStorageUrl", () => {
     ]) {
       expect(deriveMastraStorageUrl({ kind: "durable", url })).toBe(url);
     }
+  });
+
+  describe("generation mode", () => {
+    it("defaults to the Mastra adapter everywhere", () => {
+      expect(
+        resolveDiscussionEnvironment({ NODE_ENV: "development" })
+          .generationMode,
+      ).toBe("mastra");
+      expect(
+        resolveDiscussionEnvironment(environment()).generationMode,
+      ).toBe("mastra");
+    });
+
+    it("enables the deterministic mode in development and test", () => {
+      expect(
+        resolveDiscussionEnvironment({
+          NODE_ENV: "development",
+          [GENERATION_MODE_ENV]: "deterministic",
+        }).generationMode,
+      ).toBe("deterministic");
+      expect(
+        resolveDiscussionEnvironment({
+          NODE_ENV: "test",
+          [GENERATION_MODE_ENV]: "deterministic",
+        }).generationMode,
+      ).toBe("deterministic");
+    });
+
+    it("rejects the deterministic mode in production as a non-production test path", () => {
+      const problems = problemsOf(
+        environment({ [GENERATION_MODE_ENV]: "deterministic" }),
+      );
+
+      expect(problems.join("\n")).toContain(GENERATION_MODE_ENV);
+      expect(problems.join("\n")).toContain("deterministic");
+      expect(problems.join("\n")).toContain("test mode");
+    });
+
+    it("rejects any generation-mode value that is not the exact deterministic marker", () => {
+      for (const value of ["scripted", "fake", "Deterministic", "true", ""]) {
+        const problems = problemsOf(
+          environment({
+            NODE_ENV: "development",
+            [GENERATION_MODE_ENV]: value,
+          }),
+        );
+
+        expect(problems.join("\n")).toContain(GENERATION_MODE_ENV);
+      }
+    });
   });
 });

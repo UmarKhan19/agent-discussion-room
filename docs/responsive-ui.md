@@ -79,18 +79,18 @@ fonts.
 ## Remaining visual checks (browser suite)
 
 These checks need a real layout engine and belong to the deterministic
-browser suite ([issue 15](../.scratch/production-hardening/issues/15-deterministic-browser-tests.md)),
-which is blocked on this issue:
+browser suite ([issue 15](../.scratch/production-hardening/issues/15-deterministic-browser-tests.md));
+they are implemented in `e2e/accessibility.spec.ts` (see docs/browser-tests.md):
 
-- [ ] Render the complete journey at 320px, 375px, and 768px viewport widths
+- [x] Render the complete journey at 320px, 375px, and 768px viewport widths
       and assert no page-level horizontal scrollbar appears.
-- [ ] At 200% browser zoom, Topics, Messages, status, and controls reflow
+- [x] At 200% browser zoom, Topics, Messages, status, and controls reflow
       without horizontal scrolling, including a near-limit Topic and long
       unbroken model words.
-- [ ] Start, Stop, Retry, and Jump to Latest are tappable within their
+- [x] Start, Stop, Retry, and Jump to Latest are tappable within their
       44px minimum target at a touch emulation viewport.
-- [ ] Both system themes render every state (empty, ready, generating,
+- [x] Both system themes render every state (empty, ready, generating,
       completed, stopped, failed) with visible text and controls.
-- [ ] The focus indicator is visible on every interactive control in both
+- [x] The focus indicator is visible on every interactive control in both
       themes.
-- [ ] Jump to Latest does not cover the newest Message at narrow widths.
+- [x] Jump to Latest does not cover the newest Message at narrow widths.

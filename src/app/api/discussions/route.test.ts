@@ -152,7 +152,8 @@ describe("Discussion routes", () => {
       delete (globalThis as { discussionHttpHandlers?: unknown })
         .discussionHttpHandlers;
       vi.resetModules();
-      await expect(import("./route")).rejects.toThrow();
+      const { discussionHttpHandlers } = await import("./composition");
+      await expect(discussionHttpHandlers).rejects.toThrow();
     },
   );
 });

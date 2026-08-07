@@ -622,6 +622,52 @@ describe("Discussion HTTP interface", () => {
     );
   });
 
+  it("accepts a bodyless Stop as browsers send it", async () => {
+    vi.useFakeTimers();
+    useFake([
+      { type: "success", result: generatedTurn, delayMs: 100 },
+    ]);
+    const created = await handlers.post(
+      jsonRequest({ topic: "Should cities create more public parks?" }),
+    );
+    const ownerCookie = cookiePair(created);
+    const pendingTurn = handlers.postTurn(
+      jsonRequest({ requestId }, ownerCookie),
+      discussionId,
+    );
+    await waitForFakeCall();
+
+    // Browsers POST without a body, sending Content-Length: 0 and no
+    // Content-Type; an empty body must not be treated as non-JSON content.
+    const stopResponse = await handlers.postStop(
+      new Request(
+        `http://localhost/api/discussions/${discussionId}/stop`,
+        {
+          method: "POST",
+          headers: {
+            Cookie: ownerCookie,
+            "Content-Length": "0",
+          },
+          body: "",
+        },
+      ),
+      discussionId,
+    );
+
+    expect(stopResponse.status).toBe(200);
+    expect(
+      DiscussionStateSchema.parse(await stopResponse.json()),
+    ).toMatchObject({ status: "stopped", terminalReason: "stop" });
+
+    // The in-flight Turn resolves as cancelled, not as a committed Message.
+    await vi.advanceTimersByTimeAsync(100);
+    const turnResponse = await pendingTurn;
+    expect(turnResponse.status).toBe(409);
+    expect(
+      ErrorResponseSchema.parse(await turnResponse.json()).error.code,
+    ).toBe("DISCUSSION_STOPPED");
+  });
+
   it("treats client disconnect as terminal cancellation", async () => {
     vi.useFakeTimers();
     useFake([
@@ -1732,7 +1778,9 @@ describe("Discussion HTTP interface", () => {
       ),
       discussionId,
     );
-    expect(oversizedStop.status).toBe(415);
+    // Size violations take precedence over media-type checks: a body too
+    // large to read cannot be classified as JSON or non-JSON content.
+    expect(oversizedStop.status).toBe(413);
   });
 
   it("honors a server-configured recent-Transcript Turn window", async () => {

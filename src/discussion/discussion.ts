@@ -14,6 +14,8 @@ export type {
 
 export interface GenerateDiscussionTurnInput {
   topic: string;
+  /** Server-owned one-based Turn position this generation must produce. */
+  turn: number;
   speaker: Speaker;
   transcript: readonly DiscussionMessage[];
   signal?: AbortSignal;

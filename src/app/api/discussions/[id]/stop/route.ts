@@ -7,5 +7,5 @@ export async function POST(
   context: DiscussionStopRouteContext,
 ): Promise<Response> {
   const { id } = await context.params;
-  return discussionHttpHandlers.postStop(request, id);
+  return (await discussionHttpHandlers).postStop(request, id);
 }

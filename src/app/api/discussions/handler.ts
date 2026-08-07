@@ -294,25 +294,15 @@ export function createDiscussionHttpHandlers(
    * Applies content-type, body-size, session, and rate-limit guards and
    * returns either a rejection response or an authenticated session with
    * the bounded raw body text (empty when the request carries no body).
+   *
+   * JSON content type is required only when the request actually carries
+   * content: action requests without a body (Stop) send `Content-Length: 0`
+   * from browsers and must not be rejected for omitting a media type.
    */
   async function authenticateRequest(
     request: Request,
     meta: RequestMeta,
   ): Promise<AuthenticatedRequest> {
-    if (request.body !== null && !hasJsonContentType(request)) {
-      return {
-        response: errorResponse(
-          telemetry,
-          415,
-          {
-            code: "CONTENT_TYPE_UNSUPPORTED",
-            message: "Discussion requests must be sent as JSON.",
-            action: 'Send the request with "Content-Type: application/json".',
-          },
-          meta,
-        ),
-      };
-    }
     const bounded = await readBoundedBody(request, maxBodyBytes);
     if (!bounded.ok) {
       return {
@@ -323,6 +313,20 @@ export function createDiscussionHttpHandlers(
             code: "BODY_TOO_LARGE",
             message: `The request body exceeds the ${maxBodyBytes}-byte limit.`,
             action: "Send only the required fields in a compact JSON body.",
+          },
+          meta,
+        ),
+      };
+    }
+    if (bounded.text.length > 0 && !hasJsonContentType(request)) {
+      return {
+        response: errorResponse(
+          telemetry,
+          415,
+          {
+            code: "CONTENT_TYPE_UNSUPPORTED",
+            message: "Discussion requests must be sent as JSON.",
+            action: 'Send the request with "Content-Type: application/json".',
           },
           meta,
         ),

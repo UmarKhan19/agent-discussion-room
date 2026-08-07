@@ -12,6 +12,7 @@ import { FakeDiscussion } from "./testing/fake-discussion";
 
 const request: GenerateDiscussionTurnInput = {
   topic: "Remote work is better than working from an office",
+  turn: 1,
   speaker: "supporter",
   transcript: [],
 };

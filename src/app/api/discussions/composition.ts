@@ -14,11 +14,11 @@ import {
   isDurableDiscussionStore,
 } from "@/discussion/discussion-service";
 import { LibSQLDiscussionStore } from "@/discussion/libsql-discussion-store";
+import { scriptedDiscussion } from "@/discussion/scripted-discussion";
 import {
   DEFAULT_MAX_REQUEST_BODY_BYTES,
 } from "@/discussion/request-protection";
 import { SignedSessionManager } from "@/discussion/signed-session";
-import { discussion } from "@/mastra";
 import { JsonLineTelemetry } from "@/observability/telemetry";
 import {
   DEFAULT_NETWORK_RATE_LIMIT,
@@ -32,7 +32,7 @@ import {
 type DiscussionHttpHandlers = ReturnType<typeof createDiscussionHttpHandlers>;
 
 const processState = globalThis as typeof globalThis & {
-  discussionHttpHandlers?: DiscussionHttpHandlers;
+  discussionHttpHandlers?: Promise<DiscussionHttpHandlers>;
 };
 
 function envPositiveInt(name: string, fallback: number): number {
@@ -54,9 +54,14 @@ function envBudgetInt(name: string, fallback: number): number {
   return Number(raw);
 }
 
-function createProcessHandlers(): DiscussionHttpHandlers {
+async function createProcessHandlers(): Promise<DiscussionHttpHandlers> {
   const environment = resolveDiscussionEnvironment(process.env);
 
+  // The deterministic browser suite runs the credential-free scripted
+  // adapter; every other configuration uses the registered Mastra debate
+  // agents. The Mastra composition is imported lazily so deterministic runs
+  // never construct agents, storage, or observability that could touch a
+  // provider or produce durable data.
   // Production uses the explicit durable adapter from the environment; the
   // in-memory store is chosen only by the explicit development/test
   // configuration (production fails startup when storage is missing).
@@ -129,7 +134,16 @@ function createProcessHandlers(): DiscussionHttpHandlers {
   // Conversation content is structurally impossible to record; see
   // src/observability/telemetry.ts and docs/observability-privacy.md.
   const telemetry = new JsonLineTelemetry();
-  const runner = new DiscussionRunner({ store, discussion, budgets, telemetry });
+  const generationDiscussion =
+    environment.generationMode === "deterministic"
+      ? scriptedDiscussion
+      : (await import("@/mastra")).discussion;
+  const runner = new DiscussionRunner({
+    store,
+    discussion: generationDiscussion,
+    budgets,
+    telemetry,
+  });
   const processSigningKey =
     environment.sessionSecret ??
     randomBytes(32).toString("base64url");

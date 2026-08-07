@@ -31,6 +31,7 @@ function environment(
     sessionSecret: "a-stable-session-secret-that-is-long-enough",
     providerKey: "sk-provider-key",
     observabilityExportEnabled,
+    generationMode: "mastra",
   };
 }
 

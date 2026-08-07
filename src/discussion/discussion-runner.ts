@@ -373,6 +373,7 @@ export class DiscussionRunner {
           ? active.cancellation
           : this.discussion.generateTurn({
               topic: generating.topic,
+              turn,
               speaker,
               transcript: generationTranscript,
               signal: active.controller.signal,

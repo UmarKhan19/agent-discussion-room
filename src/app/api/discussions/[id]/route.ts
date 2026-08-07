@@ -7,7 +7,7 @@ export async function GET(
   context: DiscussionRouteContext,
 ): Promise<Response> {
   const { id } = await context.params;
-  return discussionHttpHandlers.get(request, id);
+  return (await discussionHttpHandlers).get(request, id);
 }
 
 export async function POST(
@@ -15,5 +15,5 @@ export async function POST(
   context: DiscussionRouteContext,
 ): Promise<Response> {
   const { id } = await context.params;
-  return discussionHttpHandlers.postTurn(request, id);
+  return (await discussionHttpHandlers).postTurn(request, id);
 }
