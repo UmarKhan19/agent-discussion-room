@@ -30,6 +30,59 @@ describe("output Discussion Policy", () => {
       checkedAt: checkedAt.toISOString(),
     });
   });
+
+  // Regression: discussing hate-speech law legitimately mentions violence
+  // against protected classes while opposing it. Advocacy must be adjacent
+  // to the harm phrase, not merely co-present anywhere in the message.
+  it.each([
+    "You argue that restrictions are necessary to prevent violence against Jews and Muslims, yet every regime that banned hate speech used it against its critics first.",
+    "Defending laws that punish violence against women is not the same as defending censorship of offensive ideas.",
+    "Supporting protections for religious groups against attacks does not require banning speech.",
+    "Should we really support laws that punish violence against Muslims?",
+    "I argue that violence against Jews should be illegal.",
+    "I do not support violence against Muslims.",
+    "No one should support violence against Muslims.",
+    "Violence against Jews should not be supported.",
+    "Violence against Jews is wrong.",
+    "The right to protest violence against Jews is protected speech.",
+    "Supporting laws that prevent genocide against ethnic minorities is urgent.",
+    "Genocide should be prevented.",
+    "Prevention of genocide is necessary.",
+    "Hate speech laws are often weaponized against the very people they claim to protect.",
+    "Nazi marches in Skokie terrorized Holocaust survivors, but banning them would set a dangerous precedent.",
+  ])("allows critical discussion that mentions harm: %s", (text) => {
+    expect(outputPolicy.evaluate(text)).toEqual({
+      decision: "allowed",
+      category: null,
+      checkedAt: checkedAt.toISOString(),
+    });
+  });
+
+  it.each([
+    "We should support violence against Jews",
+    "Violence against Jews is justified",
+    "Violence against women is necessary",
+    "I support killing Muslims",
+    "Jews deserve violence",
+    "Jews are being attacked, and I support that",
+    "Attacks on Muslims are praiseworthy",
+  ])("still blocks adjacent advocacy of harm: %s", (text) => {
+    expect(
+      outputPolicy.evaluate(text),
+    ).toEqual({
+      decision: "blocked",
+      category: "protected_class_violence_advocacy",
+      checkedAt: checkedAt.toISOString(),
+    });
+  });
+
+  it("classifies genocide advocacy separately", () => {
+    for (const text of ["I support genocide", "Genocide against Jews is justified"]) {
+      expect(outputPolicy.evaluate(text)).toEqual(
+        expect.objectContaining({ decision: "blocked", category: "genocide_advocacy" }),
+      );
+    }
+  });
 });
 
 describe("input Discussion Policy", () => {
