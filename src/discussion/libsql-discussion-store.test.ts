@@ -1,4 +1,4 @@
-import { createClient } from "@libsql/client";
+import { createClient, LibsqlError } from "@libsql/client";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,7 +14,13 @@ import {
   type DiscussionMessage,
   type DiscussionState,
 } from "./contracts";
-import { LibSQLDiscussionStore } from "./libsql-discussion-store";
+import {
+  DiscussionStorageUnavailableError,
+} from "./discussion-service";
+import {
+  LibSQLDiscussionStore,
+  isStorageUnavailableError,
+} from "./libsql-discussion-store";
 
 const now = new Date("2026-08-02T12:00:00.000Z");
 const ownerSessionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -1831,5 +1837,205 @@ CREATE INDEX discussion_request_status ON discussion_request (discussion_id, sta
       storeB.close();
       storeC.close();
     }, 15_000);
+  });
+
+  describe("storage-unavailability classification", () => {
+    const classifiedAsUnavailable: string[] = [
+      "SERVER_ERROR",
+      "HRANA_CLOSED_ERROR",
+      "HRANA_WEBSOCKET_ERROR",
+      "HRANA_PROTO_ERROR",
+      "PROTOCOL_VERSION_ERROR",
+      "INTERNAL_ERROR",
+      "UNKNOWN",
+      "SQLITE_IOERR",
+      "SQLITE_FULL",
+      "SQLITE_CANTOPEN",
+      "SQLITE_CORRUPT",
+      "SQLITE_NOTADB",
+      "SQLITE_READONLY",
+      "SQLITE_BUSY",
+      "SQLITE_LOCKED",
+      "SQLITE_NOMEM",
+      "SQLITE_PERM",
+      "SQLITE_AUTH",
+    ];
+    const classifiedAsNotUnavailable: string[] = [
+      "SQLITE_ERROR",
+      "SQLITE_CONSTRAINT",
+      "SQLITE_MISUSE",
+      "SQLITE_MISMATCH",
+      "SQLITE_RANGE",
+      "CLIENT_CLOSED",
+      "TRANSACTION_CLOSED",
+      "URL_INVALID",
+      "ENCRYPTION_KEY_NOT_SUPPORTED",
+      "SYNC_NOT_SUPPORTED",
+    ];
+
+    it.each(classifiedAsUnavailable)(
+      "classifies %s as storage-unavailable",
+      (code) => {
+        expect(isStorageUnavailableError(new LibsqlError("db down", code))).toBe(true);
+      },
+    );
+
+    it.each(classifiedAsNotUnavailable)(
+      "does not classify %s as storage-unavailable",
+      (code) => {
+        expect(isStorageUnavailableError(new LibsqlError("bad data", code))).toBe(false);
+      },
+    );
+
+    it("classifies a constrained-violation extended code as not storage-unavailable", () => {
+      const error = new LibsqlError(
+        "UNIQUE constraint failed",
+        "SQLITE_CONSTRAINT",
+        "SQLITE_CONSTRAINT_PRIMARYKEY",
+        2064,
+      );
+      expect(isStorageUnavailableError(error)).toBe(false);
+    });
+
+    it("classifies a raw undici transport TypeError as storage-unavailable", () => {
+      // Node/undici surfaces unreachable hosts as TypeError("fetch failed")
+      // whose `cause` is a system error carrying the errno code. The
+      // classifier recognizes the undici "fetch failed" signature by message
+      // alone; the cause is not, and need not be, inspected.
+      const error = Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("connect ECONNREFUSED"), {
+          code: "ECONNREFUSED",
+        }),
+      });
+      expect(isStorageUnavailableError(error)).toBe(true);
+    });
+
+    it("classifies a raw Node system error directly as storage-unavailable", () => {
+      expect(
+        isStorageUnavailableError(
+          Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
+        ),
+      ).toBe(true);
+    });
+
+    it("classifies DNS failure codes as storage-unavailable", () => {
+      expect(
+        isStorageUnavailableError(
+          Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" }),
+        ),
+      ).toBe(true);
+    });
+
+    it.each([
+      ["SyntaxError", new SyntaxError("Unexpected token < in JSON")],
+      [
+        "TypeError without a system code",
+        new TypeError("undefined cannot be passed as argument"),
+      ],
+      ["RangeError", new RangeError("bigint is too large")],
+      ["plain Error without code or cause", new Error("internal thing")],
+      [
+        "ERR_ prefixed Node code",
+        Object.assign(new Error("bad"), { code: "ERR_INVALID_ARG_TYPE" }),
+      ],
+    ])("does not classify %s as storage-unavailable", (_label, error) => {
+      expect(isStorageUnavailableError(error)).toBe(false);
+    });
+
+    it("does not classify a programming TypeError carrying a system-error cause", () => {
+      // A programming TypeError (e.g. a coerced non-function) is not a
+      // transport failure, even if a system error was attached as its
+      // `cause`. The classifier recognizes only the undici
+      // `TypeError("fetch failed")` signature for TypeErrors and never
+      // recurses into `cause`, so this stays a programming error.
+      const cause = Object.assign(new Error("connect ECONNREFUSED"), {
+        code: "ECONNREFUSED",
+      });
+      const error = Object.assign(new TypeError("undefined value"), { cause });
+      expect(isStorageUnavailableError(error)).toBe(false);
+    });
+  });
+
+  describe("storage-unavailability classification at the store boundary", () => {
+    it("does not wrap programming/constraint errors as storage-unavailable", async () => {
+      // A duplicate primary key is a data/programming error, not a storage
+      // outage: it must reject with the raw libSQL error and never be
+      // converted to a DiscussionStorageUnavailableError, even though it
+      // travels through the storage-boundary guard. This exercises the
+      // guard's "classification failed -> rethrow raw" branch on the real
+      // client (the negative half of the normalization contract).
+      const store = createStore(storeUrl());
+      await store.init();
+      await store.create(ownerSessionId, idleState());
+
+      let classified = false;
+      let raw: unknown = undefined;
+      try {
+        await store.create(ownerSessionId, idleState());
+      } catch (error) {
+        classified = error instanceof DiscussionStorageUnavailableError;
+        raw = error;
+      }
+      expect(classified).toBe(false);
+      expect(raw).toBeInstanceOf(LibsqlError);
+      expect((raw as LibsqlError).code).toBe("SQLITE_CONSTRAINT");
+      store.close();
+    });
+
+    it("classifies a real unreachable-server transport failure as storage-unavailable", async () => {
+      // The durable store contacts the server during `init` (schema
+      // creation). Against an unreachable host the libSQL HTTP client throws
+      // a real raw transport error (undici `TypeError: fetch failed` with a
+      // system error as `cause` under Node, or an `Error` with a
+      // `ConnectionRefused` code under Bun); the classifier must recognize
+      // that real shape — it is the same class of failure a runtime outage
+      // surfaces from the guarded operational methods after a successful
+      // startup.
+      const store = new LibSQLDiscussionStore({
+        url: "http://127.0.0.1:1", // nothing listens here
+        now: () => now,
+        generationTimeoutMs: DEFAULT_GENERATION_TIMEOUT_MS,
+      });
+      try {
+        const error: unknown = await store
+          .init()
+          .catch((error: unknown) => error);
+        expect(error).toBeDefined();
+        expect(isStorageUnavailableError(error)).toBe(true);
+      } finally {
+        store.close();
+      }
+    });
+
+    it("classifies a real 5xx server response as storage-unavailable", async () => {
+      // A libSQL HTTP client maps a non-OK server response onto a LibsqlError
+      // with code SERVER_ERROR (asserted against a real HTTP server that
+      // always 500s); that code is exactly what a runtime server outage
+      // surfaces from the guarded operational methods.
+      const { createServer } = await import("node:http");
+      const server = createServer((_req, res) => {
+        res.writeHead(500, { "content-type": "text/plain" });
+        res.end("server down");
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      const port = (server.address() as { port: number }).port;
+
+      const store = new LibSQLDiscussionStore({
+        url: `http://127.0.0.1:${port}`,
+        now: () => now,
+        generationTimeoutMs: DEFAULT_GENERATION_TIMEOUT_MS,
+      });
+      try {
+        const error: unknown = await store
+          .init()
+          .catch((error: unknown) => error);
+        expect(error).toBeInstanceOf(LibsqlError);
+        expect((error as LibsqlError).code).toBe("SERVER_ERROR");
+        expect(isStorageUnavailableError(error)).toBe(true);
+      } finally {
+        store.close();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
   });
 });

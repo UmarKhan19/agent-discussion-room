@@ -75,3 +75,44 @@ explicitly changed.
   deletion are operator-managed (see [docs/operations.md](docs/operations.md)).
 - **No internationalization.** The UI and error copy are English-only;
   layout avoids obvious localization barriers but no i18n pipeline exists.
+
+## Storage-outage classification
+
+- **Classification is code- and signature-based, with no cause traversal.** A
+  libSQL failure is treated as a storage outage (`500 STORAGE_UNAVAILABLE`)
+  when its own `code` is one of the recognized transport/server/storage
+  codes — refused connections, HTTP 5xx (`SERVER_ERROR`), the `HRANA_*`
+  protocol/socket codes, and the `SQLITE_IOERR` / `SQLITE_FULL` /
+  `SQLITE_CANTOPEN` / `SQLITE_CORRUPT` / `SQLITE_NOTADB` / `SQLITE_READONLY`
+  / `SQLITE_BUSY` / `SQLITE_LOCKED` / `SQLITE_NOMEM` / `SQLITE_PERM` /
+  `SQLITE_AUTH` / `INTERNAL` / `UNKNOWN` family; or, for Node/undici
+  transport failures, when the error matches the single exact signature
+  `TypeError("fetch failed")`. Arbitrary message text is not parsed and the
+  `cause` chain is **not** traversed: a *programming* `TypeError` that
+  happens to carry a system error as its `cause` is classified as **not** an
+  outage and surfaces through the generic error path, so genuine bugs do not
+  get disguised as transient unavailability.
+- **Transport-error shapes differ by runtime.** Under Node/undici the libSQL
+  HTTP client surfaces transport failures as `TypeError("fetch failed")`
+  (with the system `code` on `cause`, e.g. `ECONNREFUSED`; a DNS miss carries
+  no cause), while Bun surfaces the system error directly as an own `code`
+  (e.g. `"ConnectionRefused"`). The classifier handles both shapes; exotic
+  or unrecognized transport failures fall through to the generic path.
+- **In-memory/dev stores never throw it.** The in-memory test store cannot
+  fail to be "unavailable," so the typed error is only ever produced by the
+  real durable store boundary; test fakes propagate either the typed error
+  or raw libSQL shapes naturally.
+- **Filesystem fault injection is unreliable for `file:` stores.** A local
+  libSQL file database keeps persistent file descriptors open (WAL mode), so
+  `chmod`-based denial does **not** reliably block the native client's reads
+  or writes — it is not a viable runtime-outage injection. Outage coverage is
+  instead provided by classifier tests on the raw error shapes and by
+  real-client boundary tests (`init()` against an unreachable host
+  `http://127.0.0.1:1` and a real local HTTP 500 server, plus the
+  duplicate-primary-key `SQLITE_CONSTRAINT` false branch) rather than by
+  filesystem mutation.
+- **Startup failures remain raw and loud.** A storage failure that occurs
+  *during startup* is not wrapped — startup still fails loudly and the
+  `ready` gate maps it to `STORAGE_UNAVAILABLE` at the API contract layer;
+  the boundary wrapping only applies to failures *after* a successful
+  startup.

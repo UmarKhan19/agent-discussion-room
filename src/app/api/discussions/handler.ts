@@ -5,6 +5,7 @@ import {
   NextTurnRequestSchema,
   StartDiscussionRequestSchema,
   TOPIC_MAX_LENGTH,
+  type DiscussionState,
   type ProductError,
 } from "@/discussion/contracts";
 import {
@@ -53,6 +54,7 @@ import {
 } from "@/discussion/discussion-runner";
 import {
   DiscussionPolicyBlockedError,
+  DiscussionStorageUnavailableError,
   type DiscussionService,
 } from "@/discussion/discussion-service";
 import {
@@ -372,9 +374,36 @@ export function createDiscussionHttpHandlers(
   }
 
   /**
-   * Returns a 500 envelope while the durable store is initializing, or a
-   * null to proceed. Production startup validates configuration before any
-   * request is served; this covers store failures after process start.
+   * Stable `500 STORAGE_UNAVAILABLE` envelope, used both while the durable
+   * store is still initializing and, after startup, when a runtime storage
+   * outage makes the required storage operation impossible. Retryable: the
+   * failure is request-scoped and later requests succeed automatically once
+   * storage is reachable again (see `docs/operations.md`).
+   */
+  function storageUnavailableResponse(
+    meta: RequestMeta,
+    setCookie?: string,
+  ): Response {
+    return errorResponse(
+      telemetry,
+      500,
+      {
+        code: "STORAGE_UNAVAILABLE",
+        message: "Discussion storage is not available right now.",
+        action:
+          "Wait briefly and retry; check the server logs for storage errors.",
+        retryable: true,
+      },
+      meta,
+      setCookie,
+    );
+  }
+
+  /**
+   * Returns a `STORAGE_UNAVAILABLE` envelope while the durable store is still
+   * initializing, or `null` to proceed. Production startup validates
+   * configuration before any request is served; this gate covers store
+   * failures during and immediately after process start.
    */
   async function storageReadyResponse(
     meta: RequestMeta,
@@ -383,17 +412,7 @@ export function createDiscussionHttpHandlers(
       await ready;
       return null;
     } catch {
-      return errorResponse(
-        telemetry,
-        500,
-        {
-          code: "STORAGE_UNAVAILABLE",
-          message: "Discussion storage is not available; the server is still starting or storage is misconfigured.",
-          action: "Wait briefly and retry; check the server logs for storage errors.",
-          retryable: true,
-        },
-        meta,
-      );
+      return storageUnavailableResponse(meta);
     }
   }
 
@@ -433,6 +452,9 @@ export function createDiscussionHttpHandlers(
         meta.discussionId = discussion.id;
         return discussionResponse(telemetry, discussion, 201, meta, session.setCookie);
       } catch (error) {
+        if (error instanceof DiscussionStorageUnavailableError) {
+          return storageUnavailableResponse(meta, session.setCookie);
+        }
         if (error instanceof DiscussionPolicyBlockedError) {
           return errorResponse(
             telemetry,
@@ -522,6 +544,9 @@ export function createDiscussionHttpHandlers(
 
         return discussionResponse(telemetry, discussion, 200, meta, session.setCookie);
       } catch (error) {
+        if (error instanceof DiscussionStorageUnavailableError) {
+          return storageUnavailableResponse(meta, session.setCookie);
+        }
         if (error instanceof DiscussionRequestInProgressError) {
           return errorResponse(
             telemetry,
@@ -746,6 +771,9 @@ export function createDiscussionHttpHandlers(
 
         return discussionResponse(telemetry, discussion, 200, meta, session.setCookie);
       } catch (error) {
+        if (error instanceof DiscussionStorageUnavailableError) {
+          return storageUnavailableResponse(meta, session.setCookie);
+        }
         if (error instanceof DiscussionInvalidStateError) {
           return errorResponse(
             telemetry,
@@ -789,7 +817,25 @@ export function createDiscussionHttpHandlers(
       if ("response" in guarded) return guarded.response;
       const { session } = guarded;
 
-      const discussion = await service.read(session.id, parsedId.id);
+      let discussion: DiscussionState | null;
+      try {
+        discussion = await service.read(session.id, parsedId.id);
+      } catch (error) {
+        if (error instanceof DiscussionStorageUnavailableError) {
+          return storageUnavailableResponse(meta, session.setCookie);
+        }
+        return errorResponse(
+          telemetry,
+          500,
+          {
+            code: "INVALID_RESPONSE",
+            message: "The Discussion could not be read safely.",
+            action: "Start a new Discussion or try again later.",
+          },
+          meta,
+          session.setCookie,
+        );
+      }
       if (!discussion) {
         return errorResponse(
           telemetry,

@@ -1,4 +1,4 @@
-import { createClient, type Client, type Transaction } from "@libsql/client";
+import { createClient, LibsqlError, type Client, type Transaction } from "@libsql/client";
 import {
   HARD_GENERATION_TIMEOUT_MS,
   deriveLeaseDurationMs,
@@ -22,7 +22,11 @@ import type {
   TurnFailure,
   TurnMutationResult,
 } from "./discussion-service";
-import { TurnFailureSchema, copyFailure } from "./discussion-service";
+import {
+  DiscussionStorageUnavailableError,
+  TurnFailureSchema,
+  copyFailure,
+} from "./discussion-service";
 
 export interface LibSQLDiscussionStoreOptions {
   /** libSQL URL: file:, libsql:, http(s):, or ws(s):. */
@@ -55,6 +59,142 @@ const INTERRUPTED_RECOVERY_FAILURE: TurnFailure = {
   kind: "generation_failed",
   retryable: true,
 };
+
+/**
+ * libSQL error codes that mean the database itself cannot be reached or
+ * used: remote transport failures (HTTP/WebSocket), server-side errors,
+ * and storage-level SQLite failures (I/O errors, disk full, cannot open,
+ * corrupt or not-a-database, read-only, busy/locked, out of memory,
+ * permission or authorization denied). Everything else — `SQLITE_ERROR`
+ * malformed SQL, `SQLITE_CONSTRAINT` violations, client misuse like
+ * `CLIENT_CLOSED`/`TRANSACTION_CLOSED`, URL/config errors — is a
+ * programming, data, or invariant error and must never be mislabeled as
+ * an outage. See `isStorageUnavailableError` for the full classification
+ * contract and its documented limitation.
+ */
+const STORAGE_UNAVAILABLE_LIBSQL_CODES = new Set<string>([
+  "SERVER_ERROR",
+  "HRANA_CLOSED_ERROR",
+  "HRANA_WEBSOCKET_ERROR",
+  "HRANA_PROTO_ERROR",
+  "PROTOCOL_VERSION_ERROR",
+  "INTERNAL_ERROR",
+  "UNKNOWN",
+  "SQLITE_IOERR",
+  "SQLITE_FULL",
+  "SQLITE_CANTOPEN",
+  "SQLITE_CORRUPT",
+  "SQLITE_NOTADB",
+  "SQLITE_READONLY",
+  "SQLITE_BUSY",
+  "SQLITE_LOCKED",
+  "SQLITE_NOMEM",
+  "SQLITE_PERM",
+  "SQLITE_AUTH",
+]);
+
+/**
+ * Node system error codes (from `errno`) and libSQL HTTP-client fetch error
+ * codes that mean the storage backend could not be reached. The libSQL
+ * HTTP client surfaces transport failures as raw (non-`LibsqlError`)
+ * errors — for example `TypeError: fetch failed` whose `cause` carries
+ * `ECONNREFUSED` under Node, or an `Error` with `code: "ConnectionRefused"`
+ * under Bun — so availability classification must also recognize these codes
+ * written directly on the error itself: the HTTP client surfaces transport
+ * failures as the error's own `code` (e.g. `ConnectionRefused` under Bun),
+ * and the undici `TypeError("fetch failed")` signature is recognized by that
+ * exact message. `cause` chains are intentionally never inspected (see
+ * `isStorageUnavailableError`): a programming `TypeError` carrying a
+ * system-error `cause` is never misclassified as an outage. `ERR_*`
+ * Node.js-internal codes and ordinary programming `TypeError`s are never
+ * matched.
+ */
+const STORAGE_TRANSPORT_CODES = new Set<string>([
+  // Node errno codes (socket/HTTP transport) and TLS/IO failures:
+  "EADDRNOTAVAIL",
+  "EAI_AGAIN",
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTDOWN",
+  "EHOSTUNREACH",
+  "EIO",
+  "EMFILE",
+  "ENETDOWN",
+  "ENETRESET",
+  "ENETUNREACH",
+  "ENFILE",
+  "ENOSPC",
+  "ENOTFOUND",
+  "EPIPE",
+  "EROFS",
+  "ETIMEDOUT",
+  // Bun libSQL HTTP fetch error codes:
+  "ConnectionAborted",
+  "ConnectionClosed",
+  "ConnectionRefused",
+  "ConnectionReset",
+  "ConnectionTimedOut",
+  "HostUnreachable",
+  "NameResolution",
+  "NetworkUnreachable",
+  "Timeout",
+]);
+
+function hasOwnTransportCode(error: unknown): boolean {
+  // Matches a recognized transport/system error code written *directly* on
+  // the error itself (not via `cause`). This is how Bun's libSQL HTTP client
+  // surfaces transport failures (`Error` with `code: "ConnectionRefused"`,
+  // `"ConnectionReset"`, ...) and how Node surfaces system errors raised
+  // directly. The cause chain is intentionally not inspected here: a
+  // system error buried in `cause` of an otherwise ordinary error is not, on
+  // its own, evidence of an outage, and only the undici
+  // `TypeError("fetch failed")` signature is trusted for Node TypeErrors
+  // (see `isStorageUnavailableError`).
+  if (error === null || typeof error !== "object") return false;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && STORAGE_TRANSPORT_CODES.has(code);
+}
+
+/**
+ * Whether a store failure means the storage backend is unavailable.
+ * Only classified transport/server/storage failures return true; malformed
+ * SQL, constraint violations, client misuse, serialization, and programming
+ * errors are deliberately not classified as outages.
+ *
+ * Classification is code/signature based, applied only at the store
+ * (infrastructure) boundary: libSQL `LibsqlError` codes, the undici
+ * `TypeError("fetch failed")` signature that Node uses for every HTTP
+ * transport failure, and direct transport/system `code` values (Bun's
+ * `ConnectionRefused`, Node system errors). The cause chain is not
+ * recursed into, so a programming `TypeError` can never be rescued by an
+ * unrelated system error attached as its `cause`.
+ *
+ * Classification limitation: undici reports every Node HTTP failure —
+ * connection refused, reset, DNS, timeout, and TLS/certificate problems —
+ * through the single `TypeError("fetch failed")` signature, so all of them
+ * are treated as retryable `STORAGE_UNAVAILABLE`. This cannot be narrowed
+ * to "only transient network errors" without cause-chain inspection, which
+ * is rejected because it would over-classify programming TypeErrors; in
+ * practice a TLS/cert problem is also a transient, retryable backend
+ * reachability failure, so mapping it onto `STORAGE_UNAVAILABLE` is the
+ * safe, non-leaky contract.
+ */
+export function isStorageUnavailableError(error: unknown): boolean {
+  if (error instanceof LibsqlError) {
+    return STORAGE_UNAVAILABLE_LIBSQL_CODES.has(error.code);
+  }
+  if (error instanceof TypeError) {
+    // Node/undici surfaces every HTTP transport failure from the libSQL
+    // client as `TypeError("fetch failed")`; recognize that signature
+    // alone (no cause inspection) so the dominant Node runtime outage is
+    // classified alongside Bun, while a programming TypeError such as
+    // `TypeError("undefined value")` is never mistaken for a transport
+    // failure, even if it carries a system-error cause.
+    return error.message === "fetch failed";
+  }
+  return hasOwnTransportCode(error);
+}
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS discussion (
@@ -274,10 +414,12 @@ export class LibSQLDiscussionStore
     await this.init();
     const owner = SessionIdentifierSchema.parse(ownerSessionId);
     const state = DiscussionStateSchema.parse(discussion);
-    await this.client.execute({
-      sql: "INSERT INTO discussion (id, owner_session_id, state, updated_at) VALUES (?, ?, ?, ?)",
-      args: [state.id, owner, JSON.stringify(state), state.updatedAt],
-    });
+    await this.guardStorage(() =>
+      this.client.execute({
+        sql: "INSERT INTO discussion (id, owner_session_id, state, updated_at) VALUES (?, ?, ?, ?)",
+        args: [state.id, owner, JSON.stringify(state), state.updatedAt],
+      }),
+    );
   }
 
   async readOwned(
@@ -285,12 +427,9 @@ export class LibSQLDiscussionStore
     discussionId: string,
   ): Promise<DiscussionState | null> {
     await this.init();
-    const state = await this.readOwnedState(
-      this.client,
-      ownerSessionId,
-      discussionId,
+    return this.guardStorage(() =>
+      this.readOwnedState(this.client, ownerSessionId, discussionId),
     );
-    return state;
   }
 
   async requestStatus(
@@ -299,10 +438,8 @@ export class LibSQLDiscussionStore
     requestId: string,
   ): Promise<RequestStatusResult> {
     await this.init();
-    const request = await this.readRequest(
-      this.client,
-      discussionId,
-      requestId,
+    const request = await this.guardStorage(() =>
+      this.readRequest(this.client, discussionId, requestId),
     );
     if (!request) return { kind: "unknown" };
     if (request.status === "succeeded") return { kind: "succeeded" };
@@ -647,7 +784,7 @@ export class LibSQLDiscussionStore
     });
     await previous;
 
-    try {
+    return this.guardStorage(async () => {
       const tx = await this.client.transaction("write");
       try {
         const result = await work(tx);
@@ -661,8 +798,29 @@ export class LibSQLDiscussionStore
         }
         throw error;
       }
-    } finally {
+    }).finally(() => {
       release();
+    });
+  }
+
+  /**
+   * Normalizes failures at the storage boundary: errors that mean the
+   * database itself is unavailable become a typed
+   * `DiscussionStorageUnavailableError`; every other error is rethrown
+   * unchanged, so programming, data, and invariant errors keep their own
+   * semantics and are never mislabeled as outages. Applied around every
+   * client interaction (`create`, `readOwned`, `requestStatus`, and the
+   * write transaction used by claim/complete/fail/cancel/stop and
+   * interrupted-generation recovery).
+   */
+  private async guardStorage<T>(work: () => Promise<T>): Promise<T> {
+    try {
+      return await work();
+    } catch (error) {
+      if (isStorageUnavailableError(error)) {
+        throw new DiscussionStorageUnavailableError(error);
+      }
+      throw error;
     }
   }
 

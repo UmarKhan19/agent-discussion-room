@@ -74,9 +74,24 @@ environment variable names and constraints are named — never values) when:
 - Any budget value is non-numeric or above its hard maximum (schema-validated
   at composition time).
 
-After startup, a storage failure (for example the database becoming
-unavailable) does not crash the process: every Discussion request returns a
-stable `500 STORAGE_UNAVAILABLE` (retryable) until storage recovers.
+After startup, a storage failure (for example the libSQL server, HTTP/WebSocket
+endpoint, or local database becoming unreachable) does not crash the process:
+every Discussion request returns a stable `500 STORAGE_UNAVAILABLE`
+(retryable) until storage recovers. Classification happens once, at the
+durable-store boundary (`LibSQLDiscussionStore`), on the error's own `code`/shape rather than on message text, with one
+narrow exception — Node/undici's `TypeError("fetch failed")` is matched
+by that exact message signature — and never by traversing the `cause`
+chain: transport-refused, HTTP 5xx, and recognized libSQL/storage
+codes (`SERVER_ERROR`, `HRANA_*`, `SQLITE_IOERR`, `SQLITE_FULL`,
+`SQLITE_CANTOPEN`, `SQLITE_CORRUPT`, `SQLITE_NOTADB`, `SQLITE_READONLY`,
+`SQLITE_BUSY`, `SQLITE_LOCKED`, `SQLITE_NOMEM`, `SQLITE_PERM`, `SQLITE_AUTH`,
+`INTERNAL`, `UNKNOWN`) map to `STORAGE_UNAVAILABLE`; programming, data, and
+invariant errors — malformed SQL, constraint violations
+(`SQLITE_CONSTRAINT*`), schema assumptions, serialization bugs, and the
+client/closed-transaction/connection states — are left raw and surface as
+`INVALID_RESPONSE`/`INTERNAL` rather than masquerading as an outage. See
+[docs/architecture.md](docs/architecture.md) and
+[docs/known-limitations.md](docs/known-limitations.md).
 
 ## Rate, quota, and concurrency budgets
 

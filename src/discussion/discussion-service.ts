@@ -171,6 +171,27 @@ export function isDurableDiscussionStore(
   return typeof (store as DurableDiscussionStore).recoverInterrupted === "function";
 }
 
+/**
+ * First-class storage-unavailability error, thrown by durable stores when
+ * the required storage operation cannot be performed because the database
+ * itself is unavailable (connection/network outage, remote server error,
+ * storage-level I/O failure). HTTP handlers map it to the stable
+ * `STORAGE_UNAVAILABLE` product envelope; the original error stays
+ * available as `cause` for internal diagnostics and is never shown to
+ * participants. Programming and data errors (malformed SQL, constraint
+ * violations, state invariants, serialization bugs) are never converted
+ * into this class.
+ */
+export class DiscussionStorageUnavailableError extends Error {
+  constructor(cause?: unknown) {
+    super("Discussion storage is unavailable");
+    this.name = "DiscussionStorageUnavailableError";
+    if (cause !== undefined) {
+      this.cause = cause;
+    }
+  }
+}
+
 function copyDiscussion(discussion: DiscussionState): DiscussionState {
   return DiscussionStateSchema.parse(structuredClone(discussion));
 }

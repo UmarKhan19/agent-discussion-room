@@ -33,6 +33,7 @@ import type {
   TurnFailure,
   TurnMutationResult,
 } from "./discussion-service";
+import { DiscussionStorageUnavailableError } from "./discussion-service";
 import {
   DiscussionOutputPolicy,
   type DiscussionOutputPolicyEvaluator,
@@ -355,8 +356,10 @@ export class DiscussionRunner {
         // The durable claim must not be abandoned: resolve it into the
         // same retryable failed state recovery produces, so the Turn is
         // not stranded until lease expiry and a later retry can claim it.
-        // The caller still receives the stable capacity error, and quota
-        // is never charged for an attempt that did not generate.
+        // Quota is never charged for an attempt that did not generate.
+        // A storage-unavailability failure here is propagated (not
+        // swallowed) so it surfaces as STORAGE_UNAVAILABLE instead of a
+        // capacity rejection; see `resolveCapacityRejectedClaim`.
         await this.resolveCapacityRejectedClaim(
           sessionId,
           id,
@@ -482,6 +485,17 @@ export class DiscussionRunner {
           throw new DiscussionStoppedError();
         }
 
+        // Storage unavailable: the authoritative persisted state could not
+        // be updated. Do not convert the outage into a Turn failure and do
+        // not attempt to persist one while the store is down: the attempt
+        // keeps its recovery lease and is reclaimed through the normal
+        // recovery path, so a retry of the same request identity can never
+        // duplicate a committed Turn. The caller surfaces the stable
+        // storage error.
+        if (error instanceof DiscussionStorageUnavailableError) {
+          throw error;
+        }
+
         const failure = failureForError(error);
         const failed = await this.store.failTurn({
           ownerSessionId: sessionId,
@@ -522,9 +536,20 @@ export class DiscussionRunner {
    * process-wide capacity slot was unavailable: the claim is converted to
    * a retryable failed state (the same outcome recovery produces for an
    * abandoned attempt), so the Turn is not stranded for the lease duration
-   * and a later retry can claim it. If the store cannot record the
-   * resolution, the attempt's lease will expire and startup recovery will
-   * reconcile it; the caller still receives the capacity error either way.
+   * and a later retry can claim it.
+   *
+   * Reconciliation is best-effort for non-storage failures: if the store
+   * cannot record the resolution for a transient reason other than an
+   * outage, the attempt's lease will expire and recovery will reconcile it,
+   * and the caller still receives the capacity error.
+   *
+   * A storage-unavailability failure is authoritative, not best-effort: the
+   * persisted lifecycle state could not be updated, so swallowing it would
+   * misreport the outcome as a capacity rejection. It is propagated so the
+   * request surfaces as `500 STORAGE_UNAVAILABLE`; the attempt keeps its
+   * recovery lease and is reconciled through the normal lease/recovery
+   * path, so a retry of the same request identity can never duplicate a
+   * committed Turn.
    */
   private async resolveCapacityRejectedClaim(
     ownerSessionId: string,
@@ -542,9 +567,17 @@ export class DiscussionRunner {
         failure: { kind: "generation_failed", retryable: true },
         updatedAt: this.now().toISOString(),
       });
-    } catch {
-      // Best-effort resolution; lease-expiry recovery reconciles the
-      // attempt if the store could not record this failure.
+    } catch (error) {
+      // Storage unavailable is authoritative: the persisted lifecycle state
+      // could not be updated, so it must surface as STORAGE_UNAVAILABLE
+      // rather than be disguised as a capacity rejection. Propagate it; the
+      // attempt keeps its recovery lease and is reconciled via recovery.
+      if (error instanceof DiscussionStorageUnavailableError) {
+        throw error;
+      }
+
+      // Best-effort resolution for any other failure; lease-expiry recovery
+      // reconciles the attempt if the store could not record this failure.
     }
   }
 

@@ -87,6 +87,21 @@ network-level and per-session fixed-window rate limits (`429` with
 `Retry-After`). See [docs/operations.md](docs/operations.md) for the budget
 and limit tables.
 
+### Runtime storage outages
+
+After a successful startup, a later libSQL/database outage is handled in
+**one** place and one place only — the durable store normalizes the failure
+into `DiscussionStorageUnavailableError`, which every endpoint handler maps
+to the same stable envelope. There is no per-endpoint `try/catch` for
+storage: the store is the normalization boundary (see `guardStorage` and
+`isStorageUnavailableError` in `src/discussion/libsql-discussion-store.ts`),
+and HTTP handlers never inspect libSQL error shapes. The four endpoints —
+Start, Read, Next Turn, and Stop — therefore all return
+`500 STORAGE_UNAVAILABLE` (retryable) when storage is unreachable, while
+non-storage failures (programming, data, or invariant errors such as
+constraint violations) continue to surface as their own product codes
+(`INVALID_RESPONSE`/`INTERNAL`) and are never relabeled as an outage.
+
 ## Signed-session ownership
 
 - Every request carries an `HttpOnly` cookie (`discussion_session`) holding
