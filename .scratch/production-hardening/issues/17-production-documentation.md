@@ -1,6 +1,6 @@
 # Publish production operations and contributor documentation
 
-Status: ready-for-agent
+Status: done
 
 ## Parent
 

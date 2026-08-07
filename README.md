@@ -1,50 +1,103 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Agent Discussion Room
 
-## Verification
+A bounded, server-owned debate between a Supporter and an Opponent. A
+participant enters a permitted Discussion Topic, explicitly starts a
+Discussion, and watches alternating Turns until a finite completion — with
+Stop, Retry, and fresh-Discussion controls, durable storage, privacy-safe
+telemetry, and a deterministic credential-free test path.
 
-Bun is the only supported package manager (pinned in `package.json`).
-Install from the frozen lockfile and run the aggregate verification gate:
+The server owns the entire Discussion lifecycle: Speaker order, Transcript,
+policy, budgets, and state transitions are never trusted to the browser.
+See [docs/architecture.md](docs/architecture.md) for the domain vocabulary
+and system design.
+
+## Requirements
+
+| Requirement | Version | Notes |
+| --- | --- | --- |
+| [Bun](https://bun.sh) | `1.3.14` | **Only supported package manager.** Pinned in `package.json` (`packageManager`, `engines.bun`) and enforced in CI. |
+| [Node.js](https://nodejs.org) | `>=20.9.0` | `engines.node` in `package.json` (Next.js 16 requirement; Bun supplies Node-compatible APIs). |
+
+## Setup
+
+Install from the frozen lockfile (fails if `package.json` and `bun.lock`
+disagree):
 
 ```bash
 bun install --frozen-lockfile
-bun run verify          # lint, typecheck, tests, dependency audit, build
-bun run verify:full     # verify + deterministic browser suite
 ```
 
-The full verification contract — scripts, CI behavior, and the dependency
-audit gate with its exceptions — is documented in [`docs/verification.md`](docs/verification.md).
-
-## Getting Started
-
-First, run the development server:
+Development runs with **no credentials and no configuration**: the
+environment contract (`.env.example`, also documented in
+[docs/operations.md](docs/operations.md)) falls back to explicit in-memory
+storage, an ephemeral session-signing secret, and no provider key. To
+document a local environment, copy the example into `.env.local` (that
+file is ignored by git; the example itself is tracked and contains only
+safe placeholders, never real secrets):
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+cp .env.example .env.local
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Do not keep the example values in a deployed environment: production
+startup **fails loudly** when any required value is absent or invalid, and
+never falls back to unsafe defaults. `DISCUSSION_GENERATION_MODE=deterministic`
+in the example is a test-only mode (scripted Turns, no provider) and is
+rejected in production.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Development
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+bun run dev        # development server on http://localhost:3000
+bun run build      # production build
+bun run start      # serve the production build
+```
 
-## Learn More
+Use these package scripts rather than running `mastra dev` / `mastra build`
+directly.
 
-To learn more about Next.js, take a look at the following resources:
+## Tests
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```bash
+bun run test                  # unit and integration tests (no credentials, no network)
+bun run test:browser:install  # one-time: download Chromium for the browser suite
+bun run test:browser          # deterministic credential-free browser suite
+bun run verify                # lint + typecheck + test + dependency audit + build
+bun run verify:full           # verify + browser suite (the complete gate CI runs)
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+The browser suite needs **no provider credentials and makes no network model
+calls**: it runs the real application against a scripted, deterministic
+generation adapter (`DISCUSSION_GENERATION_MODE=deterministic`,
+development/test only). See [docs/browser-tests.md](docs/browser-tests.md).
 
-## Deploy on Vercel
+Live provider generation requires a real credential (`OPENCODE_API_KEY`);
+that is an opt-in manual verification, never part of the automated suite
+(see [docs/deployment.md](docs/deployment.md)).
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Documentation index
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+| Document | Contents |
+| --- | --- |
+| [docs/architecture.md](docs/architecture.md) | Domain vocabulary (Discussion, Topic, Turn, Message, Speaker, Supporter, Opponent, Transcript, Runner, Policy), server-owned HTTP interface, signed sessions, state machine, budgets, persistence, Mastra registry |
+| [docs/safety.md](docs/safety.md) | Input and output Discussion Policy: what is blocked, how enforcement works, and how participants recover |
+| [docs/operations.md](docs/operations.md) | Durable storage, startup failure conditions, rate/quota/concurrency budgets, telemetry fields, export opt-in, retention, redaction |
+| [docs/observability-privacy.md](docs/observability-privacy.md) | The operational privacy contract: recorded fields, impossible-to-record content, retention, accountability |
+| [docs/verification.md](docs/verification.md) | The verification contract: runtimes, scripts, CI, dependency audit gate and exceptions |
+| [docs/deployment.md](docs/deployment.md) | Deployment, reproducible CI, audit exceptions, provider integration testing, production Mastra registry convention |
+| [docs/browser-tests.md](docs/browser-tests.md) | The deterministic credential-free browser suite: how it runs, what it covers, maintainer notes |
+| [docs/responsive-ui.md](docs/responsive-ui.md) | UI contract: theme tokens, touch targets, reflow, accessibility, product identity |
+| [docs/known-limitations.md](docs/known-limitations.md) | Known limitations of the current release |
+
+## Contributing
+
+- Register all agents, tools, workflows, and scorers in
+  `src/mastra/index.ts` — the production registry must stay focused on the
+  Discussion Room (the registry test `src/mastra/index.test.ts` enforces
+  this).
+- Use the package scripts above; do not bypass the aggregate verification
+  gate.
+- Follow the domain vocabulary in [docs/architecture.md](docs/architecture.md)
+  in code, tests, issues, and UI copy.
+- Review the contributor conventions in `docs/agents/` and `AGENTS.md`
+  before starting work.
