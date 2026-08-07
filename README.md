@@ -1,5 +1,19 @@
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
+## Verification
+
+Bun is the only supported package manager (pinned in `package.json`).
+Install from the frozen lockfile and run the aggregate verification gate:
+
+```bash
+bun install --frozen-lockfile
+bun run verify          # lint, typecheck, tests, dependency audit, build
+bun run verify:full     # verify + deterministic browser suite
+```
+
+The full verification contract — scripts, CI behavior, and the dependency
+audit gate with its exceptions — is documented in [`docs/verification.md`](docs/verification.md).
+
 ## Getting Started
 
 First, run the development server:
