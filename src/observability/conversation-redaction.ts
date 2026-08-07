@@ -38,16 +38,21 @@ export class ConversationRedactionSpanProcessor implements SpanOutputProcessor {
 
   process(span?: AnySpan): AnySpan | undefined {
     if (span === undefined) return undefined;
-    // Mastra's SpanErrorInfo type requires `message`, which redaction must
-    // drop; the cast is confined to the redaction boundary and never touches
-    // values — the returned object is `input`/`output`/`errorInfo`-stripped.
-    return {
-      ...span,
-      input: undefined,
-      output: undefined,
-      errorInfo:
-        span.errorInfo === undefined ? undefined : redactErrorInfo(span.errorInfo),
-    } as AnySpan;
+    // Redact in place, mirroring `SensitiveDataFilter`. A `SpanOutputProcessor`
+    // must return the same Span instance: the observability runtime calls
+    // methods on the processed span (e.g. `exportSpan` in
+    // `getSpanForExport`). Returning a plain-object copy (`{ ...span, ... }`)
+    // silently drops the prototype methods, so every agent generation fails
+    // with "exportSpan is not a function".
+    span.input = undefined;
+    span.output = undefined;
+    span.errorInfo =
+      span.errorInfo === undefined
+        ? undefined
+        : (redactErrorInfo(span.errorInfo) as NonNullable<
+            AnySpan["errorInfo"]
+          >);
+    return span;
   }
 
   async shutdown(): Promise<void> {}

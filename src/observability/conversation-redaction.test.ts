@@ -112,6 +112,22 @@ describe("ConversationRedactionSpanProcessor", () => {
     expect(processed.endTime).toBe(original.endTime);
   });
 
+  it("returns the same span instance so the observability runtime can call its methods after processing", () => {
+    const original = fakeSpan();
+    const exportSpan = () => ({ id: "exported" });
+    (original as unknown as { exportSpan: unknown }).exportSpan = exportSpan;
+
+    const processed = processor.process(original)!;
+
+    // Regression: returning a `{ ...span }` plain-object copy drops the
+    // prototype methods (e.g. `exportSpan`), which made every agent
+    // generation fail with "exportSpan is not a function".
+    expect(processed).toBe(original);
+    expect(
+      (processed as unknown as { exportSpan: typeof exportSpan }).exportSpan,
+    ).toBe(exportSpan);
+  });
+
   it("returns undefined for an undefined span and shuts down without work", async () => {
     expect(processor.process(undefined)).toBeUndefined();
     await expect(processor.shutdown()).resolves.toBeUndefined();
