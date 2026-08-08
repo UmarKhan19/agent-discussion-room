@@ -12,6 +12,7 @@ import {
 } from "./contracts";
 import {
   InMemoryDiscussionStore,
+  type ClaimSynthesisResult,
   type ClaimTurnResult,
   type CreateDiscussionResult,
   type DiscussionStore,
@@ -196,6 +197,27 @@ class StaleHintStore implements DiscussionStore {
 
   async stopOwned(): Promise<StopTurnResult> {
     return { kind: "invalid_state" };
+  }
+
+  async claimSynthesis(): Promise<ClaimSynthesisResult> {
+    return {
+      kind: "invalid_state",
+      discussion: stateFor("stale-test", { status: "completed" }),
+    };
+  }
+
+  async completeSynthesis(): Promise<TurnMutationResult> {
+    return {
+      kind: "stale",
+      discussion: completedStateFor("stale-test"),
+    };
+  }
+
+  async failSynthesis(): Promise<TurnMutationResult> {
+    return {
+      kind: "stale",
+      discussion: completedStateFor("stale-test"),
+    };
   }
 }
 

@@ -42,7 +42,7 @@ const implementations: Array<{
         }),
       };
 
-      return new MastraDiscussion({ supporter: agent, opponent: agent });
+      return new MastraDiscussion({ supporter: agent, opponent: agent, synthesizer: agent });
     },
     expected: { ...controlledResult, model: "test-model" },
   },
@@ -92,6 +92,7 @@ describe("MastraDiscussion provider error normalization", () => {
     const discussion = new MastraDiscussion({
       supporter: agent,
       opponent: agent,
+      synthesizer: agent,
     });
 
     try {
@@ -128,6 +129,7 @@ describe("MastraDiscussion output budgets", () => {
     const discussion = new MastraDiscussion({
       supporter: agent,
       opponent: agent,
+      synthesizer: agent,
     });
 
     await discussion.generateTurn({
@@ -147,6 +149,7 @@ describe("MastraDiscussion output budgets", () => {
     const discussion = new MastraDiscussion({
       supporter: agent,
       opponent: agent,
+      synthesizer: agent,
     });
 
     await expect(
@@ -162,6 +165,7 @@ describe("MastraDiscussion output budgets", () => {
     const discussion = new MastraDiscussion({
       supporter: agent,
       opponent: agent,
+      synthesizer: agent,
     });
 
     await expect(

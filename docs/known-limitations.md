@@ -102,6 +102,42 @@ explicitly changed.
 - **No internationalization.** The UI and error copy are English-only;
   layout avoids obvious localization barriers but no i18n pipeline exists.
 
+- **The synthesis extends the final Turn response.** The completion synthesis is
+  generated in-band on the final Turn POST, so its latency extends that
+  response (bounded by the generation timeout). A synthesis that times out,
+  is malformed, or is policy-blocked is a persisted, non-retryable failure
+  with the completed debate still fully visible; a transient (retryable)
+  failure is resumed through the dedicated server-owned retry endpoint.
+- **A synthesis missing because of an outage is resumable from durable state
+  alone.** If the process crashes or storage is unavailable exactly between
+  the final Turn commit and the synthesis claim, the Discussion stays
+  `completed` with no synthesis. The Retry control and `POST
+  /api/discussions/:id/synthesis` produce the synthesis from the canonical
+  URL plus the ownership cookie — no browser-held request identity is
+  involved — so any tab (including a fresh one) can recover it. Until then
+  the Discussion remains a valid completed Discussion with no synthesis,
+  exactly like a legacy one.
+- **The output policy can block a neutral synthesis that repeats a
+  prohibited argument verbatim.** The synthesis rides the same windowed
+  output policy as Turns, which distinguishes condemnation and prevention
+  from advocacy only within a bounded window. A synthesis that quotes a
+  tightly-phrased prohibited claim without an immediately-following
+  condemnation is blocked (`output_blocked`, non-retryable) even though the
+  Synthesizer is neutral by instruction; the completed debate remains fully
+  visible. This is deliberate conservatism, not a safety bypass.
+- **Synthesis retries are charge-once but still bounded.** The synthesis is
+  one logical provider generation per Discussion and its retries reuse the
+  same charge key, so a retry never consumes an additional quota unit; each
+  retry is still a real provider call and counts toward the per-process
+  concurrency ceiling and the configured generation timeout. If the quota
+  window is exhausted when a retry lands, the retry is deferred (persisted
+  retryable-failed) until the window resets.
+- **Synthesis context is bounded by a character budget.** Very long debates
+  give the Synthesizer the newest Messages that fit the
+  `DISCUSSION_SYNTHESIS_TRANSCRIPT_CHARACTER_BUDGET` (48,000 default /
+  64,000 hard ceiling), so a synthesis may not reflect the earliest Turns of
+  an extremely long debate.
+
 ## Storage-outage classification
 
 - **Classification is code- and signature-based, with no cause traversal.** A

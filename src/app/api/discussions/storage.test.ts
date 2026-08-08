@@ -168,6 +168,24 @@ class FaultStore implements DiscussionStore {
     this.assertFault("stopOwned");
     return this.inner.stopOwned(ownerSessionId, discussionId, updatedAt);
   }
+  claimSynthesis(
+    input: Parameters<DiscussionStore["claimSynthesis"]>[0],
+  ): ReturnType<DiscussionStore["claimSynthesis"]> {
+    this.assertFault("claimSynthesis");
+    return this.inner.claimSynthesis(input);
+  }
+  completeSynthesis(
+    input: Parameters<DiscussionStore["completeSynthesis"]>[0],
+  ): ReturnType<DiscussionStore["completeSynthesis"]> {
+    this.assertFault("completeSynthesis");
+    return this.inner.completeSynthesis(input);
+  }
+  failSynthesis(
+    input: Parameters<DiscussionStore["failSynthesis"]>[0],
+  ): ReturnType<DiscussionStore["failSynthesis"]> {
+    this.assertFault("failSynthesis");
+    return this.inner.failSynthesis(input);
+  }
 
   private assertFault(method: keyof DiscussionStore): void {
     if (this.faults.has(method)) {

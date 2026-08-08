@@ -20,6 +20,16 @@ export const HARD_RECENT_TRANSCRIPT_TURNS = 32;
 export const DEFAULT_TRANSCRIPT_CHARACTER_BUDGET = 32_000;
 export const HARD_TRANSCRIPT_CHARACTER_BUDGET = 64_000;
 
+/**
+ * Maximum characters of Transcript provided as synthesis context (input
+ * ceiling). The synthesis ideally reads the whole debate, so this is larger
+ * than the per-Turn recent window; the Discussion is hard-capped at the Turn
+ * limit and per-Turn output, so normally the full Transcript fits and only
+ * an unusually verbose debate falls back to a bounded recent selection.
+ */
+export const DEFAULT_SYNTHESIS_TRANSCRIPT_CHARACTER_BUDGET = 48_000;
+export const HARD_SYNTHESIS_TRANSCRIPT_CHARACTER_BUDGET = 64_000;
+
 /** Output-token ceiling passed to the provider when it supports one. */
 export const DEFAULT_MAX_OUTPUT_TOKENS = 2_000;
 export const HARD_MAX_OUTPUT_TOKENS = 8_000;
@@ -67,7 +77,7 @@ export function deriveLeaseDurationMs(generationTimeoutMs: number): number {
 export const DEFAULT_MAX_CONCURRENT_GENERATIONS = 4;
 export const HARD_MAX_CONCURRENT_GENERATIONS = 16;
 
-/** Model-generating next-Turn requests one signed session may claim per time window. */
+/** Model-generating requests one signed session may claim per time window. */
 export const DEFAULT_SESSION_GENERATION_QUOTA = 500;
 export const HARD_SESSION_GENERATION_QUOTA = 10_000;
 
@@ -92,6 +102,11 @@ export const DiscussionBudgetSchema = z
       .int()
       .positive()
       .max(HARD_TRANSCRIPT_CHARACTER_BUDGET),
+    synthesisTranscriptCharacterBudget: z
+      .number()
+      .int()
+      .positive()
+      .max(HARD_SYNTHESIS_TRANSCRIPT_CHARACTER_BUDGET),
     maxOutputTokens: z.number().int().positive().max(HARD_MAX_OUTPUT_TOKENS),
     maxOutputCharacters: z
       .number()
@@ -126,6 +141,8 @@ export type DiscussionBudgets = z.infer<typeof DiscussionBudgetSchema>;
 export const DEFAULT_DISCUSSION_BUDGETS: DiscussionBudgets = {
   recentTranscriptTurns: DEFAULT_RECENT_TRANSCRIPT_TURNS,
   transcriptCharacterBudget: DEFAULT_TRANSCRIPT_CHARACTER_BUDGET,
+  synthesisTranscriptCharacterBudget:
+    DEFAULT_SYNTHESIS_TRANSCRIPT_CHARACTER_BUDGET,
   maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
   maxOutputCharacters: DEFAULT_MAX_OUTPUT_CHARACTERS,
   generationTimeoutMs: DEFAULT_GENERATION_TIMEOUT_MS,

@@ -559,7 +559,25 @@ describe("privacy-safe operational telemetry at the HTTP seam", () => {
 
   it("marks the generation event completed when the Turn limit is reached", async () => {
     configureService(1);
-    useFake([{ type: "success", result: { content: MESSAGE_CONTENT } }]);
+    fakeDiscussion = new FakeDiscussion(
+      [{ type: "success", result: { content: MESSAGE_CONTENT } }],
+      [
+        {
+          type: "success",
+          result: {
+            content: JSON.stringify({
+              strongestSupport: "Strongest case for.",
+              strongestOpposition: "Strongest case against.",
+              agreements: [],
+              unresolved: "Unresolved tradeoff.",
+              claimsToVerify: [],
+              takeaway: "Takeaway.",
+            }),
+          },
+        },
+      ],
+    );
+    install(fakeDiscussion);
     const created = await handlers.post(jsonRequest({ topic: TOPIC }));
     const ownerCookie = cookiePair(created);
 
@@ -573,12 +591,19 @@ describe("privacy-safe operational telemetry at the HTTP seam", () => {
     );
     expect(turn.status).toBe(200);
 
-    expect(generationEvents()).toHaveLength(1);
+    // The final Turn committed, so the in-band completion synthesis also
+    // generated: one Turn event and one synthesis event, both schema-valid.
+    expect(generationEvents()).toHaveLength(2);
     expect(generationEvents()[0]).toMatchObject({
       event: "generation",
       outcome: "success",
       turn: 1,
       completed: true,
+    });
+    expect(generationEvents()[1]).toMatchObject({
+      event: "generation",
+      operation: "synthesis",
+      outcome: "success",
     });
     expectNoConversationContent();
   });

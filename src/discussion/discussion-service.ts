@@ -8,11 +8,18 @@ import {
   PolicyCategorySchema,
   RequestIdentifierSchema,
   SessionIdentifierSchema,
+  SYNTHESIS_REQUEST_ID,
+  SynthesisContentSchema,
+  SynthesisFailureSchema,
+  type AllowedPolicyOutcome,
   type DiscussionMessage,
   type DiscussionState,
   type DiscussionTerminalReason,
   type DiscussionTopic,
+  type GenerationUsage,
   type PolicyOutcome,
+  type SynthesisContent,
+  type SynthesisFailure,
 } from "./contracts";
 import { DiscussionPolicy } from "./policy";
 
@@ -80,6 +87,16 @@ export type ClaimTurnResult =
 export type TurnMutationResult =
   | { kind: "updated"; discussion: DiscussionState }
   | { kind: "stale"; discussion: DiscussionState }
+  | { kind: "not_found" };
+
+export type ClaimSynthesisResult =
+  | { kind: "claimed"; discussion: DiscussionState }
+  /** A synthesis is already committed; the caller must not generate again. */
+  | { kind: "already_present"; discussion: DiscussionState }
+  /** Another live attempt owns the synthesis (valid lease); observe, don't claim. */
+  | { kind: "in_progress"; discussion: DiscussionState }
+  /** The synthesis exists in a terminal non-retryable failure, or the state forbids one. */
+  | { kind: "invalid_state"; discussion: DiscussionState }
   | { kind: "not_found" };
 
 export type StopTurnResult =
@@ -163,6 +180,38 @@ export interface DiscussionStore {
     discussionId: string,
     updatedAt: string,
   ): Promise<StopTurnResult>;
+  /**
+   * Claims the one logical synthesis of a completed Discussion. Exactly one
+   * attempt can ever be `generating`: an existing committed synthesis is
+   * `already_present`, a live attempt (valid lease) is `in_progress`, and a
+   * terminal non-retryable failure is `invalid_state`. Retrying after a
+   * retryable failure (or after crash recovery) claims a fresh attempt with
+   * a new attempt identity, so a stale late result can never commit.
+   */
+  claimSynthesis(input: {
+    ownerSessionId: string;
+    discussionId: string;
+    attemptId: string;
+    updatedAt: string;
+  }): Promise<ClaimSynthesisResult>;
+  /** Commits the validated synthesis content for the exact claimed attempt. */
+  completeSynthesis(input: {
+    ownerSessionId: string;
+    discussionId: string;
+    attemptId: string;
+    content: SynthesisContent;
+    usage?: GenerationUsage;
+    outputPolicyOutcome: AllowedPolicyOutcome;
+    updatedAt: string;
+  }): Promise<TurnMutationResult>;
+  /** Records a synthesis failure for the exact claimed attempt. */
+  failSynthesis(input: {
+    ownerSessionId: string;
+    discussionId: string;
+    attemptId: string;
+    failure: SynthesisFailure;
+    updatedAt: string;
+  }): Promise<TurnMutationResult>;
 }
 
 /**
@@ -522,6 +571,135 @@ export class InMemoryDiscussionStore implements DiscussionStore {
       failure: { kind: "stopped", retryable: false },
     });
     return { kind: "stopped", discussion: copyDiscussion(stored.state) };
+  }
+
+  async claimSynthesis(input: {
+    ownerSessionId: string;
+    discussionId: string;
+    attemptId: string;
+    updatedAt: string;
+  }): Promise<ClaimSynthesisResult> {
+    const stored = ownedRecord(
+      this.discussions,
+      input.ownerSessionId,
+      input.discussionId,
+    );
+    if (!stored) return { kind: "not_found" };
+
+    const attemptId = RequestIdentifierSchema.parse(input.attemptId);
+    const existing = stored.state.synthesis;
+    if (existing?.status === "completed") {
+      return { kind: "already_present", discussion: copyDiscussion(stored.state) };
+    }
+    if (existing?.status === "generating") {
+      // In-memory state cannot outlive its process, so a generating attempt
+      // is always owned by a live runner in this process; observe it.
+      return { kind: "in_progress", discussion: copyDiscussion(stored.state) };
+    }
+    if (existing?.status === "failed" && !existing.failure.retryable) {
+      return { kind: "invalid_state", discussion: copyDiscussion(stored.state) };
+    }
+    if (stored.state.status !== "completed") {
+      return { kind: "invalid_state", discussion: copyDiscussion(stored.state) };
+    }
+
+    stored.state = copyDiscussion({
+      ...stored.state,
+      synthesis: {
+        status: "generating",
+        requestId: SYNTHESIS_REQUEST_ID,
+        attemptId,
+        startedAt: input.updatedAt,
+        updatedAt: input.updatedAt,
+        leaseOwnerId: null,
+        leaseExpiresAt: null,
+      },
+    });
+    return { kind: "claimed", discussion: copyDiscussion(stored.state) };
+  }
+
+  async completeSynthesis(input: {
+    ownerSessionId: string;
+    discussionId: string;
+    attemptId: string;
+    content: SynthesisContent;
+    usage?: GenerationUsage;
+    outputPolicyOutcome: AllowedPolicyOutcome;
+    updatedAt: string;
+  }): Promise<TurnMutationResult> {
+    const stored = ownedRecord(
+      this.discussions,
+      input.ownerSessionId,
+      input.discussionId,
+    );
+    if (!stored) return { kind: "not_found" };
+
+    const content = SynthesisContentSchema.parse(input.content);
+    const existing = stored.state.synthesis;
+    if (
+      stored.state.status !== "completed" ||
+      existing?.status !== "generating" ||
+      existing.attemptId !== input.attemptId
+    ) {
+      return { kind: "stale", discussion: copyDiscussion(stored.state) };
+    }
+
+    stored.state = copyDiscussion({
+      ...stored.state,
+      synthesis: {
+        status: "completed",
+        requestId: SYNTHESIS_REQUEST_ID,
+        attemptId: input.attemptId,
+        content,
+        ...(input.usage === undefined ? {} : { usage: input.usage }),
+        outputPolicyOutcome: input.outputPolicyOutcome,
+        startedAt: existing.startedAt,
+        updatedAt: input.updatedAt,
+        leaseOwnerId: null,
+        leaseExpiresAt: null,
+      },
+    });
+    return { kind: "updated", discussion: copyDiscussion(stored.state) };
+  }
+
+  async failSynthesis(input: {
+    ownerSessionId: string;
+    discussionId: string;
+    attemptId: string;
+    failure: SynthesisFailure;
+    updatedAt: string;
+  }): Promise<TurnMutationResult> {
+    const stored = ownedRecord(
+      this.discussions,
+      input.ownerSessionId,
+      input.discussionId,
+    );
+    if (!stored) return { kind: "not_found" };
+
+    const failure = SynthesisFailureSchema.parse(input.failure);
+    const existing = stored.state.synthesis;
+    if (
+      stored.state.status !== "completed" ||
+      existing?.status !== "generating" ||
+      existing.attemptId !== input.attemptId
+    ) {
+      return { kind: "stale", discussion: copyDiscussion(stored.state) };
+    }
+
+    stored.state = copyDiscussion({
+      ...stored.state,
+      synthesis: {
+        status: "failed",
+        requestId: SYNTHESIS_REQUEST_ID,
+        attemptId: input.attemptId,
+        failure,
+        startedAt: existing.startedAt,
+        updatedAt: input.updatedAt,
+        leaseOwnerId: null,
+        leaseExpiresAt: null,
+      },
+    });
+    return { kind: "updated", discussion: copyDiscussion(stored.state) };
   }
 }
 

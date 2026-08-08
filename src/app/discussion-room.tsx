@@ -23,6 +23,7 @@ import {
   LifecycleStatus,
   derivePhase,
 } from "./components/lifecycle-status";
+import { DiscussionSynthesis } from "./components/synthesis";
 import {
   combinedErrorCopy,
   errorFamilyForCode,
@@ -135,6 +136,23 @@ function readPendingTurn(): PendingTurnIdentity | null {
     return null;
   }
   return null;
+}
+
+/**
+ * Whether the durable state allows the completion synthesis to be resumed:
+ * the Discussion is naturally completed and either has no synthesis yet (a
+ * crash between the final Turn commit and the synthesis claim, or a legacy
+ * pre-synthesis Discussion) or carries a retryable synthesis failure.
+ * Deliberately ignores any browser-held request identity: the server owns
+ * the retry decision from persisted state alone.
+ */
+function synthesisResumable(discussion: DiscussionState): boolean {
+  return (
+    discussion.status === "completed" &&
+    (discussion.synthesis === undefined ||
+      (discussion.synthesis.status === "failed" &&
+        discussion.synthesis.failure.retryable))
+  );
 }
 
 function topicError(topic: string): string {
@@ -288,6 +306,8 @@ export default function DiscussionRoom({
   const [isGenerating, setIsGenerating] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [canRetryTurn, setCanRetryTurn] = useState(false);
+  /** Whether the server reports a retryable synthesis failure to resume. */
+  const [canRetrySynthesis, setCanRetrySynthesis] = useState(false);
   const [generatingSpeaker, setGeneratingSpeaker] = useState<Speaker | null>(
     null,
   );
@@ -327,6 +347,7 @@ export default function DiscussionRoom({
     setPrevHydrateDiscussionId(discussionId);
     setHydrateStatus("loading");
     setCanRetryTurn(false);
+    setCanRetrySynthesis(false);
     setGeneratingSpeaker(null);
     setIsGenerating(false);
     setIsStopping(false);
@@ -372,6 +393,7 @@ export default function DiscussionRoom({
   function beginFreshRun(): number {
     const runId = resetRunRefs();
     setCanRetryTurn(false);
+    setCanRetrySynthesis(false);
     setGeneratingSpeaker(null);
     setIsGenerating(false);
     setIsStopping(false);
@@ -451,6 +473,11 @@ export default function DiscussionRoom({
           persistedDiscussion
         ) {
           setDiscussion(persistedDiscussion);
+          // Reconcile the synthesis retry affordance with the authoritative
+          // state too: a storage outage during the synthesis phase leaves a
+          // completed Discussion with a retryable/missing synthesis, and the
+          // button must follow the server rather than the failed POST.
+          setCanRetrySynthesis(synthesisResumable(persistedDiscussion));
         }
       });
     },
@@ -468,6 +495,7 @@ export default function DiscussionRoom({
       const controller = new AbortController();
       generationControllerRef.current = controller;
       setCanRetryTurn(false);
+      setCanRetrySynthesis(false);
       setIsGenerating(true);
       let current = initialDiscussion;
 
@@ -535,6 +563,11 @@ export default function DiscussionRoom({
           current = result.discussion;
           setDiscussion(current);
           setError(null);
+          // The Turn request identity's job is done once the server
+          // confirms the outcome. A retryable or missing synthesis is
+          // resumed through its own server-owned seam (the synthesis
+          // endpoint), never by replaying the final-Turn request.
+          setCanRetrySynthesis(synthesisResumable(current));
         }
       } catch {
         if (generationRunRef.current !== runId || controller.signal.aborted) {
@@ -570,7 +603,96 @@ export default function DiscussionRoom({
     refreshControllerRef.current?.abort();
     refreshControllerRef.current = null;
     setError(null);
+    if (discussion.status === "completed") {
+      // The debate already committed (a mid-debate retry cannot leave a
+      // completed Discussion): the pending identity is the final-Turn
+      // request, so the server routes the replay to the synthesis resume.
+      // Without this, a retryable error after the final Turn committed
+      // (e.g. a storage outage during the synthesis phase) would leave a
+      // dead Retry button: `advanceDiscussion` only re-POSTs idle/failed
+      // Discussions.
+      void resumeSynthesis(discussion, generationRunRef.current);
+      return;
+    }
     void advanceDiscussion(discussion, generationRunRef.current, true);
+  }
+
+  /**
+   * Resumes the completion synthesis through the server-owned retry seam
+   * (`POST /api/discussions/:id/synthesis`). The server derives everything
+   * from durable state — ownership from the signed session, the resource
+   * from the Discussion id, and the retry decision from the persisted
+   * `synthesis` sub-state — so no Turn request identity is involved and
+   * the retry works from a totally fresh tab with only the canonical URL
+   * and the ownership cookie. A new HTTP request never creates a second
+   * logical synthesis: the server's claim is idempotent and at most one
+   * attempt ever commits.
+   */
+  const resumeSynthesis = useCallback(
+    async (initialDiscussion: DiscussionState, runId: number) => {
+      if (generationRunRef.current !== runId) return;
+
+      const controller = new AbortController();
+      generationControllerRef.current = controller;
+      setCanRetrySynthesis(false);
+      setIsGenerating(true);
+
+      try {
+        const response = await fetch(
+          `/api/discussions/${initialDiscussion.id}/synthesis`,
+          {
+            method: "POST",
+            signal: controller.signal,
+          },
+        );
+        if (generationRunRef.current !== runId) return;
+
+        const result = await readDiscussionResponse(response);
+        if (generationRunRef.current !== runId) return;
+        if (!result.ok) {
+          // Network, quota, or state error: the persisted synthesis state
+          // is authoritative, so the retry affordance follows it.
+          setError(result.error);
+          setCanRetrySynthesis(result.retryable);
+          return;
+        }
+
+        const current = result.discussion;
+        setDiscussion(current);
+        setError(null);
+        setCanRetrySynthesis(synthesisResumable(current));
+      } catch {
+        if (generationRunRef.current === runId) {
+          setError(networkError("retry"));
+          setCanRetrySynthesis(true);
+        }
+      } finally {
+        if (generationRunRef.current === runId) {
+          generationControllerRef.current = null;
+          setIsGenerating(false);
+          retryGuardRef.current = false;
+        }
+      }
+    },
+    [],
+  );
+
+  function retrySynthesis() {
+    if (
+      !discussion ||
+      !synthesisResumable(discussion) ||
+      isGenerating ||
+      isStopping ||
+      retryGuardRef.current
+    ) {
+      return;
+    }
+
+    retryGuardRef.current = true;
+    refreshControllerRef.current?.abort();
+    refreshControllerRef.current = null;
+    setError(null);
+    void resumeSynthesis(discussion, generationRunRef.current);
   }
 
   /**
@@ -597,6 +719,7 @@ export default function DiscussionRoom({
 
       if (persisted.status === "idle") {
         setCanRetryTurn(false);
+        setCanRetrySynthesis(false);
         pendingTurnRef.current = null;
         void advanceDiscussion(persisted, runId);
       } else if (
@@ -607,16 +730,29 @@ export default function DiscussionRoom({
         if (pendingTurn && pendingTurn.discussionId === persisted.id) {
           pendingTurnRef.current = pendingTurn;
           setCanRetryTurn(true);
+          setCanRetrySynthesis(false);
         } else {
           pendingTurnRef.current = null;
           setCanRetryTurn(false);
+          setCanRetrySynthesis(false);
         }
+      } else if (persisted.status === "completed" && synthesisResumable(persisted)) {
+        // The debate is durable; only the synthesis needs a resume (missing
+        // or retryable-failed). The retry is driven purely by persisted
+        // state: the server derives ownership from the session and the
+        // resource from the Discussion id, so no browser-held Turn request
+        // identity is required and a fresh tab with only the canonical URL
+        // works.
+        pendingTurnRef.current = null;
+        setCanRetryTurn(false);
+        setCanRetrySynthesis(true);
       } else {
         // completed / stopped / failed-terminal: render as-is, no Turn
         // continuation and no Retry.
         pendingTurnRef.current = null;
         removeSessionStorage(PENDING_TURN_KEY);
         setCanRetryTurn(false);
+        setCanRetrySynthesis(false);
       }
     },
     [advanceDiscussion],
@@ -669,9 +805,15 @@ export default function DiscussionRoom({
       let current = initial.discussion;
       setDiscussion(current);
 
-      if (current.status === "generating") {
-        // The server owns the in-flight Turn; the page only observes it.
-        // Polling never re-claims: the moment the state resolves it is
+      // Polling covers both an in-flight Turn and the server-owned synthesis
+      // running after the final Turn commits: the page only observes.
+      const observing = (state: DiscussionState) =>
+        state.status === "generating" ||
+        (state.status === "completed" &&
+          state.synthesis?.status === "generating");
+      if (observing(current)) {
+        // The server owns the in-flight generation; the page only observes
+        // it. Polling never re-claims: the moment the state resolves it is
         // reconciled, and a Stop or fresh run aborts the poll.
         let attempts = 0;
         while (attempts < HYDRATION_POLL_LIMIT) {
@@ -689,12 +831,12 @@ export default function DiscussionRoom({
           if (snapshot.kind === "found") {
             current = snapshot.discussion;
             setDiscussion(current);
-            if (current.status !== "generating") break;
+            if (!observing(current)) break;
           }
           attempts += 1;
         }
         if (stale()) return;
-        if (current.status === "generating") {
+        if (observing(current)) {
           // Poll cap reached while the server is still generating: stop
           // observing and hand control back. The persisted state is
           // authoritative; a reload resumes hydration.
@@ -1121,6 +1263,15 @@ export default function DiscussionRoom({
             ) : null}
           </div>
           <Transcript messages={discussion.transcript} />
+          {discussion.status === "completed" &&
+          (discussion.synthesis !== undefined || canRetrySynthesis) ? (
+            <DiscussionSynthesis
+              synthesis={discussion.synthesis ?? null}
+              retrying={isGenerating}
+              canRetry={canRetrySynthesis}
+              onRetry={retrySynthesis}
+            />
+          ) : null}
         </section>
       ) : null}
     </main>

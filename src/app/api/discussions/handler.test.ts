@@ -61,6 +61,18 @@ const generatedTurn = {
   },
 };
 
+const generatedSynthesis = {
+  content: JSON.stringify({
+    strongestSupport: "Parks serve residents who lack private green space.",
+    strongestOpposition: "Parks divert funds from other public services.",
+    agreements: ["Green space is broadly valued."],
+    unresolved: "How to fund long-term maintenance.",
+    claimsToVerify: ["Property values near parks rise."],
+    takeaway: "Pilot one park before a city-wide rollout.",
+  }),
+  usage: { inputTokens: 20, outputTokens: 15, totalTokens: 35 },
+};
+
 /**
  * Unique deterministic Start identity per call, so every test Start is a
  * distinct logical action (idempotency is asserted explicitly where it
@@ -2522,4 +2534,146 @@ describe("Discussion HTTP interface", () => {
       ).toBe(200);
     });
   });
+  describe("synthesis retry endpoint", () => {
+  /** Completes a one-Turn Discussion whose synthesis fails transiently. */
+  async function completeWithFailedSynthesis(): Promise<{
+    ownerCookie: string;
+  }> {
+    configureService(1);
+    fakeDiscussion = new FakeDiscussion(
+      [{ type: "success", result: generatedTurn }],
+      [
+        {
+          type: "failure",
+          error: new DiscussionGenerationError(
+            new Error("scripted provider outage"),
+            true,
+          ),
+        },
+      ],
+    );
+    installDiscussion(fakeDiscussion);
+    const created = await handlers.post(
+      jsonRequest({ topic: "Should cities create more public parks?" }),
+    );
+    const ownerCookie = cookiePair(created);
+    const turnRequest = jsonRequest(
+      { requestId },
+      ownerCookie,
+      `http://localhost/api/discussions/${discussionId}`,
+    );
+    const completed = await handlers.postTurn(turnRequest, discussionId);
+    const state = DiscussionStateSchema.parse(await completed.json());
+    expect(state.status).toBe("completed");
+    expect(state.synthesis?.status).toBe("failed");
+    return { ownerCookie };
+  }
+
+  it("resumes a retryable-failed synthesis from durable state without a Turn identity", async () => {
+    const { ownerCookie } = await completeWithFailedSynthesis();
+    fakeDiscussion.enqueueSynthesis({
+      type: "success",
+      result: generatedSynthesis,
+    });
+
+    // No body and no request identity: ownership from the signed session,
+    // the resource from the URL, the retry decision from persisted state.
+    const retried = await handlers.postSynthesisRetry(
+      new Request(
+        `http://localhost/api/discussions/${discussionId}/synthesis`,
+        { method: "POST", headers: { Cookie: ownerCookie } },
+      ),
+      discussionId,
+    );
+    expect(retried.status).toBe(200);
+    const resumed = DiscussionStateSchema.parse(await retried.json());
+    expect(resumed.synthesis?.status).toBe("completed");
+    expect(resumed.turnCount).toBe(1);
+    // The debate Turn was neither replayed nor regenerated.
+    expect(fakeDiscussion.calls).toHaveLength(1);
+    expect(fakeDiscussion.synthesisCalls).toHaveLength(2);
+  });
+
+  it("returns the committed synthesis idempotently without regenerating it", async () => {
+    configureService(1);
+    fakeDiscussion = new FakeDiscussion(
+      [{ type: "success", result: generatedTurn }],
+      [{ type: "success", result: generatedSynthesis }],
+    );
+    installDiscussion(fakeDiscussion);
+    const created = await handlers.post(
+      jsonRequest({ topic: "Should cities create more public parks?" }),
+    );
+    const ownerCookie = cookiePair(created);
+    const turnRequest = jsonRequest(
+      { requestId },
+      ownerCookie,
+      `http://localhost/api/discussions/${discussionId}`,
+    );
+    const completed = await handlers.postTurn(turnRequest, discussionId);
+    expect(
+      DiscussionStateSchema.parse(await completed.json()).synthesis?.status,
+    ).toBe("completed");
+
+    const retried = await handlers.postSynthesisRetry(
+      new Request(
+        `http://localhost/api/discussions/${discussionId}/synthesis`,
+        { method: "POST", headers: { Cookie: ownerCookie } },
+      ),
+      discussionId,
+    );
+    expect(retried.status).toBe(200);
+    const resumed = DiscussionStateSchema.parse(await retried.json());
+    expect(resumed.synthesis?.status).toBe("completed");
+    // A duplicate retry click never invokes the provider again.
+    expect(fakeDiscussion.synthesisCalls).toHaveLength(1);
+    expect(fakeDiscussion.calls).toHaveLength(1);
+  });
+
+  it("rejects a synthesis retry on a Discussion that is not completed", async () => {
+    const created = await handlers.post(
+      jsonRequest({ topic: "Should cities create more public parks?" }),
+    );
+    const ownerCookie = cookiePair(created);
+
+    const retried = await handlers.postSynthesisRetry(
+      new Request(
+        `http://localhost/api/discussions/${discussionId}/synthesis`,
+        { method: "POST", headers: { Cookie: ownerCookie } },
+      ),
+      discussionId,
+    );
+    expect(retried.status).toBe(409);
+    const error = ErrorResponseSchema.parse(await retried.json());
+    expect(error.error.code).toBe("INVALID_DISCUSSION_STATE");
+    expect(fakeDiscussion.synthesisCalls).toHaveLength(0);
+  });
+
+  it("does not disclose or resume another session's Discussion synthesis", async () => {
+    const { ownerCookie } = await completeWithFailedSynthesis();
+    // A different session (no cookie) cannot see or resume the synthesis.
+    const unowned = await handlers.postSynthesisRetry(
+      new Request(
+        `http://localhost/api/discussions/${discussionId}/synthesis`,
+        { method: "POST" },
+      ),
+      discussionId,
+    );
+    expect(unowned.status).toBe(404);
+    expect(ErrorResponseSchema.parse(await unowned.json()).error.code).toBe(
+      "DISCUSSION_NOT_FOUND",
+    );
+    // The owner's persisted state is untouched by the denied request.
+    const persisted = await handlers.get(
+      new Request(`http://localhost/api/discussions/${discussionId}`, {
+        headers: { Cookie: ownerCookie },
+      }),
+      discussionId,
+    );
+    expect(
+      DiscussionStateSchema.parse(await persisted.json()).synthesis?.status,
+    ).toBe("failed");
+    expect(fakeDiscussion.synthesisCalls).toHaveLength(1);
+  });
+});
 });

@@ -6,7 +6,8 @@ import {
   type DiscussionUsage,
   type GenerateDiscussionTurnInput,
   type GeneratedDiscussionTurn,
-  type Speaker,
+  type GenerateSynthesisInput,
+  type GeneratedSynthesis,
 } from "./discussion";
 
 interface MastraGenerationResponse {
@@ -33,7 +34,63 @@ export interface MastraDiscussionAgent {
   ): Promise<MastraGenerationResponse>;
 }
 
-export type MastraDiscussionAgents = Record<Speaker, MastraDiscussionAgent>;
+export interface MastraDiscussionAgents {
+  readonly supporter: MastraDiscussionAgent;
+  readonly opponent: MastraDiscussionAgent;
+  /**
+   * Neutral synthesis of a completed debate. Consumed only by the
+   * server-owned completion step; the agent is not a "third judge" — it
+   * never speaks in the debate, never enters the Transcript, and never
+   * advances the Turn count.
+   */
+  readonly synthesizer: MastraDiscussionAgent;
+}
+
+const SYNTHESIS_OUTPUT_INSTRUCTION = `
+Output STRICT JSON only, with exactly this shape and nothing else:
+{
+  "strongestSupport": string,
+  "strongestOpposition": string,
+  "agreements": string[],
+  "unresolved": string,
+  "claimsToVerify": string[],
+  "takeaway": string
+}
+Rules:
+- Every field must be non-empty (agreements and claimsToVerify may be empty arrays).
+- strongestSupport: the strongest case FOR the topic as actually argued.
+- strongestOpposition: the strongest case AGAINST the topic as actually argued.
+- agreements: points both sides actually converged on (may be empty).
+- unresolved: the tradeoffs or questions neither side resolved.
+- claimsToVerify: factual claims from either side that deserve independent verification (may be empty).
+- takeaway: one practical takeaway a neutral reader can act on.
+- Be strictly neutral: argue neither side, favor neither side, and never invent arguments that did not appear.
+`.trim();
+
+/** Neutral, identity-free prompt for the completion synthesis. */
+export function buildSynthesisPrompt(input: {
+  topic: string;
+  transcript: readonly { speaker: string; content: string }[];
+}): string {
+  const transcript = input.transcript
+    .map(
+      (message) =>
+        `${message.speaker === "supporter" ? "Supporter" : "Opponent"}: ${message.content}`,
+    )
+    .join("\n\n");
+
+  return `
+You are a neutral synthesis assistant. Produce a balanced, bounded synthesis of the completed debate below. You are NOT a participant, a judge, or a third debater: you never take a side, never reply to either speaker, and never add new arguments.
+
+Topic:
+${input.topic}
+
+Debate transcript:
+${transcript}
+
+${SYNTHESIS_OUTPUT_INSTRUCTION}
+    `.trim();
+}
 
 function buildPrompt(input: GenerateDiscussionTurnInput): string {
   const transcript = input.transcript
@@ -171,6 +228,60 @@ export class MastraDiscussion implements Discussion {
         content: response.text,
         usage: normalizeUsage(response.usage),
         model: this.agents[input.speaker].modelId,
+      };
+    } catch (error) {
+      if (error instanceof DiscussionGenerationOutputLimitError) {
+        throw error;
+      }
+      if (error instanceof DiscussionCancelledError || input.signal?.aborted) {
+        throw new DiscussionCancelledError();
+      }
+
+      throw new DiscussionGenerationError(
+        error,
+        isRetryableProviderError(error),
+      );
+    }
+  }
+
+  async generateSynthesis(
+    input: GenerateSynthesisInput,
+  ): Promise<GeneratedSynthesis> {
+    if (input.signal?.aborted) {
+      throw new DiscussionCancelledError();
+    }
+
+    try {
+      const response = await this.agents.synthesizer.generate(
+        buildSynthesisPrompt({
+          topic: input.topic,
+          transcript: input.transcript.map((message) => ({
+            speaker: message.speaker,
+            content: message.content,
+          })),
+        }),
+        {
+          abortSignal: input.signal,
+          ...(input.maxOutputTokens !== undefined
+            ? { modelSettings: { maxOutputTokens: input.maxOutputTokens } }
+            : {}),
+        },
+      );
+
+      if (input.signal?.aborted) {
+        throw new DiscussionCancelledError();
+      }
+      if (
+        input.maxOutputCharacters !== undefined &&
+        response.text.length > input.maxOutputCharacters
+      ) {
+        throw new DiscussionGenerationOutputLimitError();
+      }
+
+      return {
+        content: response.text,
+        usage: normalizeUsage(response.usage),
+        model: this.agents.synthesizer.modelId,
       };
     } catch (error) {
       if (error instanceof DiscussionGenerationOutputLimitError) {

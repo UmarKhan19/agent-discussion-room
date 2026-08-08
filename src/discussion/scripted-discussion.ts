@@ -5,6 +5,8 @@ import {
   type Discussion,
   type GenerateDiscussionTurnInput,
   type GeneratedDiscussionTurn,
+  type GenerateSynthesisInput,
+  type GeneratedSynthesis,
   type Speaker,
 } from "./discussion";
 import { MESSAGE_MAX_LENGTH } from "./contracts";
@@ -83,6 +85,65 @@ export const ScriptedTurnSchema = z.discriminatedUnion("outcome", [
 
 export type ScriptedTurn = z.infer<typeof ScriptedTurnSchema>;
 
+const ScriptedSynthesisSuccessSchema = ScriptedDelayOptionsSchema.extend({
+  outcome: z.literal("success"),
+  /**
+   * Raw provider output (verbatim JSON) to produce; defaults to a stable
+   * distinguishable deterministic synthesis.
+   */
+  content: z.string().trim().min(1).optional(),
+}).strict();
+
+const ScriptedSynthesisTransientFailureSchema =
+  ScriptedDelayOptionsSchema.extend({
+    outcome: z.literal("transient-failure"),
+  }).strict();
+
+const ScriptedSynthesisPolicyViolationSchema =
+  ScriptedDelayOptionsSchema.extend({
+    outcome: z.literal("policy-violation"),
+  }).strict();
+
+const ScriptedSynthesisInvalidResponseSchema =
+  ScriptedDelayOptionsSchema.extend({
+    outcome: z.literal("invalid-response"),
+  }).strict();
+
+/** Scripted provider outcome for the completion synthesis. */
+export const ScriptedSynthesisSchema = z.discriminatedUnion("outcome", [
+  ScriptedSynthesisSuccessSchema,
+  ScriptedSynthesisTransientFailureSchema,
+  ScriptedSynthesisPolicyViolationSchema,
+  ScriptedSynthesisInvalidResponseSchema,
+]);
+
+export type ScriptedSynthesis = z.infer<typeof ScriptedSynthesisSchema>;
+
+/**
+ * Scripted synthesis outcomes in call order, mirroring `turns`: entry 0
+ * applies to the first synthesis generation, and so on; generations beyond
+ * the list use `synthesisFallback`.
+ */
+export const ScriptedSynthesisScenarioSchema = z
+  .object({
+    syntheses: z.array(ScriptedSynthesisSchema).max(8),
+    synthesisFallback: ScriptedSynthesisSchema.optional(),
+  })
+  .strict();
+
+export type ScriptedSynthesisScenario = z.infer<
+  typeof ScriptedSynthesisScenarioSchema
+>;
+
+export const DEFAULT_SCRIPTED_SYNTHESIS_FALLBACK: ScriptedSynthesis = {
+  outcome: "success",
+};
+
+export const DEFAULT_SCRIPTED_SYNTHESIS_SCENARIO: ScriptedSynthesisScenario = {
+  syntheses: [],
+  synthesisFallback: DEFAULT_SCRIPTED_SYNTHESIS_FALLBACK,
+};
+
 export const ScriptedScenarioSchema = z
   .object({
     /**
@@ -93,6 +154,8 @@ export const ScriptedScenarioSchema = z
     turns: z.array(ScriptedTurnSchema).max(64),
     /** Outcome for generations beyond the scripted list. */
     fallback: ScriptedTurnSchema.optional(),
+    /** Outcome for the completion synthesis (optional; defaults to success). */
+    synthesis: ScriptedSynthesisScenarioSchema.optional(),
   })
   .strict();
 
@@ -105,6 +168,7 @@ export const DEFAULT_SCRIPTED_FALLBACK: ScriptedTurn = {
 export const DEFAULT_SCRIPTED_SCENARIO: ScriptedScenario = {
   turns: [],
   fallback: DEFAULT_SCRIPTED_FALLBACK,
+  synthesis: DEFAULT_SCRIPTED_SYNTHESIS_SCENARIO,
 };
 
 function speakerLabel(speaker: Speaker): string {
@@ -118,6 +182,24 @@ export function defaultScriptedContent(
   topic: string,
 ): string {
   return `Deterministic ${speakerLabel(speaker)} reply for Turn ${turn} on "${topic}".`;
+}
+
+/**
+ * Stable, distinguishable, valid synthesis JSON so browser assertions never
+ * depend on provider text and never conflate synthesis output with a Turn.
+ */
+export function defaultScriptedSynthesisContent(
+  topic: string,
+  turnCount: number,
+): string {
+  return JSON.stringify({
+    strongestSupport: `Deterministic strongest case for "${topic}".`,
+    strongestOpposition: `Deterministic strongest case against "${topic}".`,
+    agreements: ["Deterministic agreement between the sides."],
+    unresolved: "Deterministic tradeoff the debate left unresolved.",
+    claimsToVerify: ["Deterministic claim worth verifying."],
+    takeaway: `Deterministic takeaway after ${turnCount} turns.`,
+  });
 }
 
 function cancellationError(): DiscussionCancelledError {
@@ -148,6 +230,8 @@ interface ScriptedRuntimeState {
   scenario: ScriptedScenario;
   /** Generations produced since the scenario was last set. */
   generationCount: number;
+  /** Synthesis generations produced since the scenario was last set. */
+  synthesisGenerationCount: number;
 }
 
 /**
@@ -167,6 +251,7 @@ function runtimeState(): ScriptedRuntimeState {
   return (globalState[SCRIPTED_RUNTIME_KEY] ??= {
     scenario: DEFAULT_SCRIPTED_SCENARIO,
     generationCount: 0,
+    synthesisGenerationCount: 0,
   });
 }
 
@@ -182,6 +267,7 @@ export function setScriptedScenario(
   const state = runtimeState();
   state.scenario = parsed;
   state.generationCount = 0;
+  state.synthesisGenerationCount = 0;
   return parsed;
 }
 
@@ -195,6 +281,7 @@ export function resetScriptedScenario(): void {
   const state = runtimeState();
   state.scenario = DEFAULT_SCRIPTED_SCENARIO;
   state.generationCount = 0;
+  state.synthesisGenerationCount = 0;
 }
 
 /**
@@ -205,6 +292,9 @@ export function resetScriptedScenario(): void {
 export class ScriptedDiscussion implements Discussion {
   /** Every generation call in arrival order, for deterministic assertions. */
   readonly calls: GenerateDiscussionTurnInput[] = [];
+
+  /** Every synthesis generation call in arrival order, for assertions. */
+  readonly synthesisCalls: GenerateSynthesisInput[] = [];
 
   async generateTurn(
     input: GenerateDiscussionTurnInput,
@@ -243,6 +333,67 @@ export class ScriptedDiscussion implements Discussion {
           content:
             outcome.content ??
             defaultScriptedContent(input.speaker, input.turn, input.topic),
+          model: SCRIPTED_MODEL_ID,
+        };
+    }
+  }
+
+  async generateSynthesis(
+    input: GenerateSynthesisInput,
+  ): Promise<GeneratedSynthesis> {
+    this.synthesisCalls.push(input);
+
+    const state = runtimeState();
+    const scenario =
+      state.scenario.synthesis ?? DEFAULT_SCRIPTED_SYNTHESIS_SCENARIO;
+    const outcome =
+      scenario.syntheses[state.synthesisGenerationCount] ??
+      scenario.synthesisFallback ??
+      DEFAULT_SCRIPTED_SYNTHESIS_FALLBACK;
+    state.synthesisGenerationCount += 1;
+
+    await wait(
+      outcome.delayMs ?? 0,
+      outcome.ignoreAbort ? undefined : input.signal,
+    );
+
+    if (!outcome.ignoreAbort && input.signal?.aborted) {
+      throw cancellationError();
+    }
+
+    switch (outcome.outcome) {
+      case "transient-failure":
+        throw new DiscussionGenerationError(
+          new Error("Scripted transient synthesis failure"),
+          true,
+        );
+      case "policy-violation":
+        // Structurally valid synthesis JSON whose content trips the
+        // server-owned output policy (the same way a real provider would).
+        return {
+          content: JSON.stringify({
+            strongestSupport: SCRIPTED_POLICY_VIOLATION_CONTENT,
+            strongestOpposition: "Deterministic strongest case against.",
+            agreements: [],
+            unresolved: "Deterministic unresolved tradeoff.",
+            claimsToVerify: [],
+            takeaway: "Deterministic takeaway.",
+          }),
+          model: SCRIPTED_MODEL_ID,
+        };
+      case "invalid-response":
+        return {
+          content: "this is not valid synthesis JSON at all",
+          model: SCRIPTED_MODEL_ID,
+        };
+      case "success":
+        return {
+          content:
+            outcome.content ??
+            defaultScriptedSynthesisContent(
+              input.topic,
+              input.transcript.length,
+            ),
           model: SCRIPTED_MODEL_ID,
         };
     }

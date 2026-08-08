@@ -57,6 +57,14 @@ Neither the Supporter nor the Opponent role can override the policy to
 satisfy its assigned position: both roles serve **only permitted Topics**
 and pass through the same output check.
 
+The completion **synthesis** passes through the same server-owned output
+policy. Its structured fields are joined and checked exactly like a Turn's
+content; a blocked synthesis is persisted as a non-retryable
+`output_blocked` failure and the completed debate remains fully visible.
+The Synthesizer agent is neutral by instruction and by construction — it
+never takes a side, never enters the Transcript, and cannot override the
+policy.
+
 ## Participant recovery
 
 - **Blocked Topic** — edit the Topic to remove the disallowed advocacy (the

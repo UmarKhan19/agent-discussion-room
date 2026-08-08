@@ -87,6 +87,21 @@ describe("TelemetryEventSchema", () => {
     ).toBeDefined();
   });
 
+  it("accepts a synthesis generation event without a Turn index", () => {
+    expect(
+      TelemetryEventSchema.parse({
+        event: "generation",
+        operation: "synthesis",
+        outcome: "success",
+        durationMs: 40,
+        requestId,
+        discussionId,
+        model: "opencode/deepseek-v4-flash-free",
+        usage: { inputTokens: 12, outputTokens: 9, totalTokens: 21 },
+      }),
+    ).toBeDefined();
+  });
+
   it.each([
     ["topic", "Should cities create more public parks?"],
     ["transcript", [{ speaker: "supporter", content: "secret turn" }]],

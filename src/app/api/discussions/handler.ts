@@ -838,6 +838,92 @@ export function createDiscussionHttpHandlers(
       }
     },
 
+    /**
+     * Server-owned synthesis retry/resume. The browser sends no body and no
+     * Turn request identity: ownership comes from the signed session, the
+     * resource from the Discussion id, and the retry decision from the
+     * persisted `synthesis` sub-state, so a retryable or missing synthesis
+     * is recoverable from the canonical Discussion URL in a fresh tab with
+     * only the ownership cookie. `retrySynthesis` returns an authoritative
+     * state for every synthesis outcome (resumed, already committed, still
+     * generating, or non-retryable), so a retry can never create a second
+     * synthesis and duplicate clicks are harmless.
+     */
+    async postSynthesisRetry(
+      request: Request,
+      untrustedId: string,
+    ): Promise<Response> {
+      const meta = requestMeta("synthesis");
+
+      const parsedId = parseDiscussionIdentifier(untrustedId, meta);
+      if (!parsedId.ok) return parsedId.response;
+      meta.discussionId = parsedId.id;
+
+      const storageBlocked = await storageReadyResponse(meta);
+      if (storageBlocked) return storageBlocked;
+
+      const guarded = await authenticateRequest(request, meta);
+      if ("response" in guarded) return guarded.response;
+      const { session } = guarded;
+
+      try {
+        const discussion = await runner.retrySynthesis(
+          session.id,
+          parsedId.id,
+        );
+        if (!discussion) {
+          return errorResponse(
+            telemetry,
+            404,
+            {
+              code: "DISCUSSION_NOT_FOUND",
+              message: "This Discussion is not available in the current session.",
+              action: "Start a new Discussion in this session or return to the session that created it.",
+            },
+            meta,
+            session.setCookie,
+          );
+        }
+
+        return discussionResponse(
+          telemetry,
+          discussion,
+          200,
+          meta,
+          session.setCookie,
+        );
+      } catch (error) {
+        if (error instanceof DiscussionStorageUnavailableError) {
+          return storageUnavailableResponse(meta, session.setCookie);
+        }
+        if (error instanceof DiscussionInvalidStateError) {
+          return errorResponse(
+            telemetry,
+            409,
+            {
+              code: "INVALID_DISCUSSION_STATE",
+              message: "The synthesis can only be retried for a completed Discussion.",
+              action: "Read the current Discussion state before requesting a synthesis.",
+            },
+            meta,
+            session.setCookie,
+          );
+        }
+
+        return errorResponse(
+          telemetry,
+          500,
+          {
+            code: "INVALID_RESPONSE",
+            message: "The synthesis could not be resumed safely.",
+            action: "Read the current Discussion state before trying again.",
+          },
+          meta,
+          session.setCookie,
+        );
+      }
+    },
+
     async get(request: Request, untrustedId: string): Promise<Response> {
       const meta = requestMeta("read");
 

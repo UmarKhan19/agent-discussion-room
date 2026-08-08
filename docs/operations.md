@@ -126,7 +126,7 @@ startup.
 | Request body | 4,096 bytes | `DISCUSSION_MAX_REQUEST_BODY_BYTES` | Bounded read; oversized → `413` |
 | Session rate limit | 60 req / 60 s | `DISCUSSION_SESSION_RATE_LIMIT`, `DISCUSSION_SESSION_RATE_WINDOW_MS` | Fixed window per signed session → `429` + `Retry-After` |
 | Network rate limit | 300 req / 60 s | `DISCUSSION_NETWORK_RATE_LIMIT`, `DISCUSSION_NETWORK_RATE_WINDOW_MS` | Fixed window per client address (`X-Forwarded-For` first hop, then `X-Real-IP`) → `429` + `Retry-After` |
-| Session generation quota | 500 claims | `DISCUSSION_SESSION_GENERATION_QUOTA` | Per (Discussion, request identity), in a time window, process-local → `429 SESSION_QUOTA_EXCEEDED` with `Retry-After` |
+| Session generation quota | 500 claims | `DISCUSSION_SESSION_GENERATION_QUOTA` | Per logical generation (one provider model call — a next-Turn generation charged per `(Discussion, request identity)`, or a completed Discussion's one synthesis charged per `discussionId/synthesis`), in a time window, process-local → `429 SESSION_QUOTA_EXCEEDED` with `Retry-After` |
 | Session generation quota window | 86400000 ms (24 h) | `DISCUSSION_SESSION_GENERATION_QUOTA_WINDOW_MS` | Time window over which the session generation quota is measured; after it elapses, charged keys are discarded and the allowance is restored |
 
 Rate-limit state is **process-local and in-memory** (hard-bounded bucket
@@ -145,6 +145,15 @@ budgets.
 | Output characters (enforced post-generation) | 8,000 | 12,000 | `DISCUSSION_MAX_OUTPUT_CHARACTERS` |
 | Generation timeout | 30,000 ms | 300,000 ms | `DISCUSSION_GENERATION_TIMEOUT_MS` |
 | Simultaneous generations | 4 | 16 | `DISCUSSION_MAX_CONCURRENT_GENERATIONS` |
+| Synthesis Transcript characters in context | 48,000 | 64,000 | `DISCUSSION_SYNTHESIS_TRANSCRIPT_CHARACTER_BUDGET` |
+
+The synthesis Transcript budget bounds the completed debate's Transcript
+passed to the Synthesizer agent (the whole debate when it fits, otherwise
+the newest Messages first until the budget is consumed). A synthesis also
+reuses the generation timeout above and is itself one provider generation:
+it consumes one logical quota unit per Discussion (charge key
+`discussionId/synthesis`), charged exactly once — retries, replays, and
+concurrent attempts reuse the key and never double-charge.
 
 The generation timeout also fixes the recovery lease: a claimed attempt's
 lease is the timeout plus a fixed 60-second margin, so a live instance's own

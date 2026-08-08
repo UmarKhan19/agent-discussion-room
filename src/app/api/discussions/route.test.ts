@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { DiscussionResponseSchema, ErrorResponseSchema } from "@/discussion/contracts";
 import { GET, POST as POST_TURN } from "./[id]/route";
 import { POST as POST_STOP } from "./[id]/stop/route";
+import { POST as POST_SYNTHESIS } from "./[id]/synthesis/route";
 import { POST } from "./route";
 
 function expectPrivateSessionResponse(response: Response): void {
@@ -89,6 +90,49 @@ describe("Discussion routes", () => {
     const idleConflict = await POST_STOP(
       new Request(
         `http://localhost/api/discussions/${discussion.id}/stop`,
+        { method: "POST", headers: { Cookie: ownerCookie } },
+      ),
+      { params: Promise.resolve({ id: discussion.id }) },
+    );
+    expect(idleConflict.status).toBe(409);
+    expectPrivateSessionResponse(idleConflict);
+    expect(
+      ErrorResponseSchema.parse(await idleConflict.json()).error.code,
+    ).toBe("INVALID_DISCUSSION_STATE");
+  });
+
+  it("wires the ownership-protected synthesis retry endpoint", async () => {
+    const created = await POST(
+      new Request("http://localhost/api/discussions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ topic: "How cities can improve public parks", creationRequestId: "aaaaaaaa-aaaa-4aaa-8aaa-000000000001" }),
+      }),
+    );
+    const discussion = DiscussionResponseSchema.parse(await created.json());
+
+    // An unrelated session cannot resume the synthesis.
+    const denied = await POST_SYNTHESIS(
+      new Request(
+        `http://localhost/api/discussions/${discussion.id}/synthesis`,
+        { method: "POST" },
+      ),
+      { params: Promise.resolve({ id: discussion.id }) },
+    );
+    expect(denied.status).toBe(404);
+    expectPrivateSessionResponse(denied);
+    expect(ErrorResponseSchema.parse(await denied.json()).error.code).toBe(
+      "DISCUSSION_NOT_FOUND",
+    );
+
+    // The owner's retry on an idle Discussion is rejected as an invalid
+    // state, not silently accepted.
+    const setCookie = created.headers.get("set-cookie");
+    if (!setCookie) throw new Error("Expected the signed session cookie");
+    const ownerCookie = setCookie.split(";", 1)[0];
+    const idleConflict = await POST_SYNTHESIS(
+      new Request(
+        `http://localhost/api/discussions/${discussion.id}/synthesis`,
         { method: "POST", headers: { Cookie: ownerCookie } },
       ),
       { params: Promise.resolve({ id: discussion.id }) },

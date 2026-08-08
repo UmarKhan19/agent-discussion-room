@@ -65,6 +65,14 @@ serve two different scripts concurrently.
   reload during generation aborts the client fetch, the server
   persists a `stopped`/`disconnect` state, and the reloaded page hydrates
   zero Messages.
+- **Synthesis** (`e2e/discussion-synthesis.spec.ts`): the committed
+  synthesis renders outside the Transcript on completion with deterministic
+  fields and never an extra Turn; a transiently failed synthesis is
+  recovered by the Retry Synthesis control through the server-owned retry
+  seam (no request identity — the Turn count stays fixed), including from
+  a fresh tab that shares only the ownership cookie; a policy-blocked
+  synthesis keeps the completed debate fully
+  visible with no retry offered.
 - **Accessibility** (`e2e/accessibility.spec.ts`): full keyboard operation
   with a visible focus indicator in both themes, targeted status and
   announcement regions, semantic ordered Transcript structure, Jump to

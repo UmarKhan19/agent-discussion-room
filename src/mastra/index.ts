@@ -10,6 +10,10 @@ import { MastraDiscussion } from "@/discussion/mastra-discussion";
 import { createMastraObservability } from "@/observability/mastra-observability";
 import { OPPONENT_MODEL_ID, opponentAgent } from "./agents/opponent";
 import { SUPPORTER_MODEL_ID, supporterAgent } from "./agents/supporter";
+import {
+  SYNTHESIZER_MODEL_ID,
+  synthesizerAgent,
+} from "./agents/synthesizer";
 
 const environment = resolveDiscussionEnvironment(process.env);
 
@@ -33,7 +37,7 @@ const mastraStorage = new LibSQLStore({
 });
 
 export const mastra = new Mastra({
-  agents: { supporterAgent, opponentAgent },
+  agents: { supporterAgent, opponentAgent, synthesizerAgent },
   storage: mastraStorage,
   logger: new PinoLogger({
     name: "Mastra",
@@ -52,5 +56,9 @@ export const discussion = new MastraDiscussion({
   opponent: {
     modelId: OPPONENT_MODEL_ID,
     generate: (prompt, options) => opponentAgent.generate(prompt, options),
+  },
+  synthesizer: {
+    modelId: SYNTHESIZER_MODEL_ID,
+    generate: (prompt, options) => synthesizerAgent.generate(prompt, options),
   },
 });

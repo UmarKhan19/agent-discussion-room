@@ -7,7 +7,11 @@ describe("production Mastra registry", () => {
       .map((agent) => agent.id)
       .sort();
 
-    expect(agentIds).toEqual(["opponent-agent", "supporter-agent"]);
+    expect(agentIds).toEqual([
+      "opponent-agent",
+      "supporter-agent",
+      "synthesizer-agent",
+    ]);
     expect(mastra.listWorkflows()).toEqual({});
     expect(mastra.listTools()).toEqual({});
     expect(mastra.listScorers()).toEqual({});

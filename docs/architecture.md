@@ -19,7 +19,10 @@ below.
 | **Supporter** | The Speaker who argues in support of the Topic (Turn 1, then every odd Turn). Implemented by the Supporter agent with a stable model identifier reported in telemetry. |
 | **Opponent** | The Speaker who argues against the Topic (Turn 2, then every even Turn). Implemented by the Opponent agent. |
 | **Transcript** | The ordered list of Messages of one Discussion, newest last. Transcript length always equals the Turn count; Turn positions are ordered without gaps (enforced by `DiscussionStateSchema`). The model never sees the whole Transcript — only the bounded recent window (see [Bounded context](#bounded-context)). |
-| **Discussion Runner** | The sole authority for the next-Turn lifecycle: it owns Speaker selection, generation claims, policy checks, budget checks, cancellation, retry/idempotency, and the commit of completed Messages (`src/discussion/discussion-runner.ts`). One Discussion may have at most one active generation. |
+| **Discussion Runner** | The sole authority for the next-Turn lifecycle: it owns Speaker selection, generation claims, policy checks, budget checks, cancellation, retry/idempotency, and the commit of completed Messages (`src/discussion/discussion-runner.ts`). One Discussion may have at most one active generation. It also owns the completion synthesis lifecycle. |
+| **Synthesis** | The optional, server-owned completion sub-state on a Discussion (`synthesis` on `DiscussionState`). Every naturally completed Discussion is given exactly one neutral, bounded synthesis: strongest case for/against, agreements, unresolved tradeoffs, claims to verify, and a takeaway. It is **not a Turn** — it never enters the Transcript, never changes the Turn count or Speaker parity, and is rendered outside the Transcript list. |
+| **Synthesis attempt** | A single generation of the synthesis, identified by an attempt UUID and guarded by an exact-attempt lease (`leaseOwnerId`/`leaseExpiresAt`), exactly like a Turn generation. At most one synthesis attempt ever commits per Discussion. |
+| **Synthesizer agent** | The neutral Mastra agent (`synthesizerAgent`) that produces the synthesis from the completed debate's Transcript. It is not a third debater or judge: it never speaks in the debate and never enters the Transcript. |
 | **Discussion Policy** | The server-owned input and output safety rules, independent of the debate agents' instructions. Input policy checks the Topic at start; output policy checks every generated Turn before commit. See [docs/safety.md](docs/safety.md). |
 
 Supporting terms used throughout:
@@ -29,7 +32,7 @@ Supporting terms used throughout:
 | **Session** | An anonymous signed session identified by a UUID. The browser holds an `HttpOnly` cookie containing the UUID and an HMAC-SHA256 signature; every Discussion endpoint requires a valid session and enforces ownership (see [Signed-session ownership](#signed-session-ownership)). |
 | **Request identity (`requestId`)** | A client-supplied UUID that makes next-Turn requests idempotent. Replaying a completed request returns the recorded outcome; retrying a transient failure with the same identity resumes the same Turn. |
 | **Creation request identity (`creationRequestId`)** | A client-supplied UUID that makes the Start operation idempotent. The server persists the `(session, creationRequestId)` mapping with the Discussion it created, so an ambiguous or lost Start response can be retried with the same identity and replays the same Discussion instead of creating an orphan. A reused identity with a different Topic is a conflict (`409 START_REQUEST_CONFLICT`). |
-| **Discussion state** | The validated public shape of a Discussion: `id`, `topic`, `status`, `terminalReason`, `turnLimit`, `turnCount`, `createdAt`, `updatedAt`, `policyOutcome`, `transcript`. Every response is parsed against `DiscussionResponseSchema` before it leaves the server. |
+| **Discussion state** | The validated public shape of a Discussion: `id`, `topic`, `status`, `terminalReason`, `turnLimit`, `turnCount`, `createdAt`, `updatedAt`, `policyOutcome`, `transcript`, and the optional `synthesis` sub-state (present only on a completed Discussion). Every response is parsed against `DiscussionResponseSchema` before it leaves the server. |
 | **Turn failure** | A stable, closed classification of why a Turn did not complete (`generation_failed` [retryable or not], `invalid_response`, `output_blocked`, `output_limit_exceeded`, `timeout`, `stopped`). Failures are persisted per request identity and surfaced as stable product errors. |
 
 ## System overview
@@ -260,13 +263,16 @@ making the operation idempotent per (Discussion, request identity):
 - **Quota accounting** — a session generation quota is charged once per
   (Discussion, request identity); replays, conflicts, and rejected
   duplicates never charge twice. The quota is time-windowed: a session may
-  charge at most `DISCUSSION_SESSION_GENERATION_QUOTA` unique generations
-  per `DISCUSSION_SESSION_GENERATION_QUOTA_WINDOW_MS` (default 24 h). When
-  the window elapses the charge keys are discarded and the allowance is
-  restored, so "try again later" is truthful — an exhausted session recovers
-  automatically after the configured window. The quota is never charged
-  for a request rejected solely because the server lacks generation
-  capacity.
+  charge at most `DISCUSSION_SESSION_GENERATION_QUOTA` unique logical
+  generations per `DISCUSSION_SESSION_GENERATION_QUOTA_WINDOW_MS`
+  (default 24 h). A logical generation is one provider model call — an
+  ordinary next-Turn generation (charge key `discussionId/requestId`) or
+  the one completion synthesis of a naturally completed Discussion (charge
+  key `discussionId/synthesis`, see [Completion synthesis](#completion-synthesis)). When the window elapses the charge keys are discarded
+  and the allowance is restored, so "try again later" is truthful — an
+  exhausted session recovers automatically after the configured window.
+  The quota is never charged for a request rejected solely because the
+  server lacks generation capacity.
 
   Precise "charged once" semantics across windows and retries:
 
@@ -296,6 +302,75 @@ making the operation idempotent per (Discussion, request identity):
   independently rejects requests against a completed/stopped Discussion.
 - Reusing a request identity across Discussions is legal but charges each
   Discussion separately against the session quota.
+
+## Completion synthesis
+
+Every **naturally completed** Discussion (final Turn committed; never a
+stopped one) produces exactly one neutral, bounded synthesis. The synthesis
+starts **in-band** after the final Turn commits and its capacity slot is
+released, a **fresh capacity slot** is acquired for it, and it consumes
+**one logical generation quota unit per Discussion** (charge key
+`discussionId/synthesis`), charged exactly once after capacity is acquired
+and before any provider work — mirroring the Turn path. Synthesis retries
+and replays reuse the same charge key and never double-charge.
+
+- **Not a Turn.** The synthesis is a sub-state (`synthesis.status`:
+  `generating | completed | failed`), not a third Speaker, not a Message,
+  and not an extra Turn. `turnCount`, the Transcript, and Speaker parity are
+  untouched; legacy completed Discussions without a `synthesis` field stay
+  valid (the field is optional in `DiscussionStateSchema`).
+- **Trigger.** The Runner calls `completeWithSynthesis` synchronously within
+  the final Turn POST, after the Turn commits. There is no new Turn request
+  and the synthesis is never a fake Turn.
+- **Retry.** `POST /api/discussions/:id/synthesis` resumes the synthesis
+  with no body and no Turn request identity: ownership comes from the
+  signed session, the resource from the Discussion id, and the retry
+  decision from the persisted `synthesis` sub-state. A retryable failure
+  or a missing synthesis (crash between the final Turn commit and the
+  synthesis claim) is therefore recoverable from the canonical Discussion
+  URL in a fresh tab with only the ownership cookie. Duplicate clicks,
+  concurrent tabs, and retries after an ambiguous response are idempotent:
+  `claimSynthesis` claims a fresh attempt only when none exists or the
+  existing one is retryably failed, at most one synthesis ever commits, and
+  the debate Turn is never regenerated.
+- **Stop.** Stop is rejected once the Discussion is completed, so a Stop
+  cannot race the synthesis. The synthesis generation ignores client
+  disconnects and still commits.
+- **Timeout.** The synthesis reuses the configured `generationTimeoutMs`; a
+  timeout persists a non-retryable `timeout` failure, and a late provider
+  result is discarded by the exact-attempt guard.
+- **Crash recovery.** The synthesis attempt carries the same lease
+  machinery as a Turn. `recoverInterrupted()` (and lazy recovery inside
+  `claimSynthesis`) flips an expired `generating` synthesis to a retryable
+  failed state **without touching the completed debate**.
+- **Idempotency.** `claimSynthesis` claims a synthesis attempt only when
+  none exists or the existing one is retryably failed; `completeSynthesis`
+  and `failSynthesis` accept only the exact current attempt, so at most one
+  synthesis ever commits.
+- **Capacity.** `maxConcurrentGenerations` covers both Turn and synthesis
+  generations; a synthesis that finds no capacity is persisted as a
+  retryable `generation_failed` failure.
+- **Quota.** The synthesis is one provider generation, so it consumes one
+  logical quota unit per Discussion under the dedicated charge key
+  `discussionId/synthesis` (never a Turn request key, so a client-supplied
+  request identity can never collide with it). The charge happens only
+  after capacity is acquired and before provider work; a quota-denied
+  claim is reconciled into the same retryable `generation_failed` failure
+  recovery produces, leaving the completed debate intact and the synthesis
+  resumable once the window resets. Retries, replays, concurrent retries,
+  and crash recovery reuse the same key and never double-charge.
+- **Policy.** The synthesis output runs through the same server-owned output
+  policy (evaluated on the joined structured fields). A blocked synthesis is
+  `output_blocked` (non-retryable); the completed debate stays fully
+  visible.
+- **Bounds.** The prompt transcript is bounded by
+  `DISCUSSION_SYNTHESIS_TRANSCRIPT_CHARACTER_BUDGET` (default 48 000
+  characters, hard ceiling 64 000; see [docs/operations.md](docs/operations.md)),
+  and the committed content is bounded per field (1 200 characters),
+  per array (4 items), and in total (6 000 characters).
+- **Privacy.** Telemetry records a `synthesis` generation event with the
+  attempt identity and usage only — never content or prompt (see
+  [docs/observability-privacy.md](docs/observability-privacy.md)).
 
 ## Persistence and data model
 
@@ -362,7 +437,11 @@ Recovery reconciles only attempts that are actually eligible:
 - **Lazy recovery** — a next-Turn claim for a request identity whose
   generating attempt has an expired lease recovers it inside the same
   transaction before reclaiming the Turn, so participants are not stranded
-  waiting for a restart. A recovered Discussion may also be reclaimed by a
+  waiting for a restart. Completed Discussions with an expired `generating`
+  synthesis are reconciled the same way: the synthesis attempt is flipped
+  to a retryable failed state and the **completed debate is untouched**,
+  and `claimSynthesis` performs the same recovery lazily inside its own
+  transaction so a retry is not stranded until the next restart. A recovered Discussion may also be reclaimed by a
   fresh request identity (the participant may have lost the original
   identity); either way the abandoned Turn is reclaimed at the same
   position — nothing is skipped or duplicated.
@@ -395,9 +474,10 @@ Mastra resources are registered in the central composition root
 `src/mastra/index.ts`, which exposes the Mastra instance and the
 `MastraDiscussion` generation adapter:
 
-- **Agents:** `supporterAgent` and `opponentAgent` only — the production
-  registry contains exactly these two agents and **no** tools, workflows, or
-  scorers. `src/mastra/index.test.ts` asserts this focus so unrelated sample
+- **Agents:** `supporterAgent`, `opponentAgent`, and `synthesizerAgent` —
+  the production registry contains exactly these three agents and **no**
+  tools, workflows, or scorers. `src/mastra/index.test.ts` asserts this
+  focus so unrelated sample
   resources cannot return.
 - The composition resolves its own environment (storage, logger,
   observability) from the same environment contract, with explicit storage —

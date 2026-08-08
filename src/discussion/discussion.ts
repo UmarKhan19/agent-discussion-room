@@ -48,11 +48,52 @@ export type GeneratedDiscussionTurn = z.infer<
   typeof GeneratedDiscussionTurnSchema
 >;
 
+export interface GenerateSynthesisInput {
+  topic: string;
+  /**
+   * The bounded Transcript selected as the synthesis context (see
+   * `synthesisTranscriptCharacterBudget`); unlike a next-Turn window it
+   * normally contains the whole debate.
+   */
+  transcript: readonly DiscussionMessage[];
+  signal?: AbortSignal;
+  /** Server-owned output-token ceiling; never supplied by the client. */
+  maxOutputTokens?: number;
+  /** Server-owned output-character ceiling; never supplied by the client. */
+  maxOutputCharacters?: number;
+}
+
+/**
+ * The raw provider result of a synthesis generation. The structured content
+ * is deliberately NOT parsed here: the Discussion Runner owns output
+ * validation, so the adapter stays a raw generation seam and a malformed or
+ * adversarial provider payload can never bypass the runtime schema.
+ */
+export const GeneratedSynthesisSchema = z
+  .object({
+    /** Raw provider text; the Runner parses and validates it as JSON. */
+    content: z.string().trim().min(1),
+    usage: GenerationUsageSchema.optional(),
+    model: z.string().trim().min(1).optional(),
+  })
+  .strict();
+
+export type GeneratedSynthesis = z.infer<typeof GeneratedSynthesisSchema>;
+
 /** Product-owned boundary for generating one Discussion Turn. */
 export interface Discussion {
   generateTurn(
     input: GenerateDiscussionTurnInput,
   ): Promise<GeneratedDiscussionTurn>;
+  /**
+   * Product-owned boundary for generating the neutral synthesis of a
+   * completed debate. Conceptually distinct from a Turn: it is not a
+   * Supporter or Opponent message, never enters the Transcript, and never
+   * advances the Turn count.
+   */
+  generateSynthesis(
+    input: GenerateSynthesisInput,
+  ): Promise<GeneratedSynthesis>;
 }
 
 export class DiscussionGenerationError extends Error {

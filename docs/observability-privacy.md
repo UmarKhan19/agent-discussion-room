@@ -17,7 +17,13 @@ Two event families exist:
 | Event | Emitted at | Fields |
 | --- | --- | --- |
 | `request` | The HTTP seam (every handled request) | operation (`start`, `next-turn`, `stop`, `read`), outcome (`success`, `failure`), statusCode, errorClass, retryable, category, requestId, discussionId, durationMs |
-| `generation` | The Discussion runner seam (each model generation) | turn, requestId, discussionId, outcome (`success`, `failure`, `cancelled`), errorClass, retryable, category, cancellationReason (`stop`, `disconnect`, `timeout`), completed, model, usage, durationMs |
+| `generation` | The Discussion runner seam (each model generation) | operation (`next-turn`, `synthesis`), turn (present only for `next-turn`), requestId, discussionId, outcome (`success`, `failure`, `cancelled`), errorClass, retryable, category, cancellationReason (`stop`, `disconnect`, `timeout`), completed, model, usage, durationMs |
+
+A synthesis generation is a `generation` event with `operation:
+"synthesis"` and **no `turn` field** — it is not a Turn, and it carries
+exactly the same privacy guarantees as a Turn event: model id, usage
+counters, attempt identities, and outcome classification only, never any
+content or prompt.
 
 Error classes are a **stable, closed vocabulary** of 25 values: the 24
 public `ProductErrorCodes` (`TOPIC_REQUIRED`, `TOPIC_BLOCKED`,

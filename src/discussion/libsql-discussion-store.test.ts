@@ -839,6 +839,93 @@ describe("LibSQLDiscussionStore", () => {
       secondStore.close();
     });
 
+    it("reconciles an abandoned synthesis into a retryable failure and keeps the debate intact", async () => {
+      const url = storeUrl();
+      const clock = mutableClock(now);
+      const firstStore = createLeasedStore(url, {
+        clock,
+        generationTimeoutMs: DEFAULT_GENERATION_TIMEOUT_MS,
+        leaseOwnerId: "instance-a",
+      });
+      // A completed debate whose synthesis attempt is mid-flight.
+      const completed = DiscussionStateSchema.parse({
+        ...idleState(),
+        status: "completed",
+        turnLimit: 2,
+        turnCount: 2,
+        transcript: [message(1), message(2, secondRequestId)],
+        synthesis: {
+          status: "generating",
+          requestId: "00000000-0000-4000-8000-000000000001",
+          attemptId,
+          startedAt: now.toISOString(),
+          updatedAt: now.toISOString(),
+          leaseOwnerId: "instance-a",
+          leaseExpiresAt: new Date(
+            now.getTime() + leaseMs,
+          ).toISOString(),
+        },
+      });
+      await firstStore.create(ownerSessionId, completed);
+      // Simulated crash while the synthesis is generating.
+      firstStore.close();
+      clock.advance(leaseMs + 1);
+
+      const secondStore = createLeasedStore(url, {
+        clock,
+        generationTimeoutMs: DEFAULT_GENERATION_TIMEOUT_MS,
+        leaseOwnerId: "instance-b",
+      });
+      expect(await secondStore.recoverInterrupted()).toBe(1);
+
+      const recovered = await secondStore.readOwned(ownerSessionId, discussionId);
+      // The debate Transcript and terminal state are untouched; only the
+      // synthesis attempt is reconciled.
+      expect(recovered).toMatchObject({
+        status: "completed",
+        turnCount: 2,
+      });
+      expect(recovered?.transcript).toHaveLength(2);
+      expect(recovered?.synthesis).toMatchObject({
+        status: "failed",
+        failure: { kind: "generation_failed", retryable: true },
+      });
+
+      // The participant is not stranded: a fresh attempt can be claimed
+      // and can commit a real synthesis.
+      const claimed = await secondStore.claimSynthesis({
+        ownerSessionId,
+        discussionId,
+        attemptId: secondAttemptId,
+        updatedAt: clock.now().toISOString(),
+      });
+      expect(claimed.kind).toBe("claimed");
+      if (claimed.kind !== "claimed") return;
+      await secondStore.completeSynthesis({
+        ownerSessionId,
+        discussionId,
+        attemptId: secondAttemptId,
+        content: {
+          strongestSupport: "Support",
+          strongestOpposition: "Opposition",
+          agreements: [],
+          unresolved: "Unresolved",
+          claimsToVerify: [],
+          takeaway: "Takeaway",
+        },
+        outputPolicyOutcome: {
+          decision: "allowed",
+          category: null,
+          checkedAt: clock.now().toISOString(),
+        },
+        updatedAt: clock.now().toISOString(),
+      });
+      expect(
+        (await secondStore.readOwned(ownerSessionId, discussionId))?.synthesis,
+      ).toMatchObject({ status: "completed" });
+      secondStore.close();
+    });
+
     it("is a no-op when no Discussion was interrupted", async () => {
       const store = createStore(storeUrl());
       await store.create(ownerSessionId, idleState());

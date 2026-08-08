@@ -172,3 +172,124 @@ describe("scripted scenario registry", () => {
     expect(currentScriptedScenario()).toEqual(DEFAULT_SCRIPTED_SCENARIO);
   });
 });
+
+describe("ScriptedDiscussion synthesis", () => {
+  it("produces deterministic default synthesis content", async () => {
+    const fake = new ScriptedDiscussion();
+    const result = await fake.generateSynthesis({
+      topic: "Should cities create more public parks?",
+      transcript: [
+        {
+          id: "33333333-3333-4333-8333-000000000001",
+          content: "yes",
+          speaker: "supporter",
+          createdAt: "2026-08-02T12:00:00.000Z",
+          turn: 1,
+          generation: {
+            requestId: "44444444-4444-4444-8444-444444444444",
+            outputPolicyOutcome: {
+              decision: "allowed",
+              category: null,
+              checkedAt: "2026-08-02T12:00:00.000Z",
+            },
+          },
+        },
+        {
+          id: "33333333-3333-4333-8333-000000000002",
+          content: "no",
+          speaker: "opponent",
+          createdAt: "2026-08-02T12:00:00.000Z",
+          turn: 2,
+          generation: {
+            requestId: "55555555-5555-4555-8555-555555555555",
+            outputPolicyOutcome: {
+              decision: "allowed",
+              category: null,
+              checkedAt: "2026-08-02T12:00:00.000Z",
+            },
+          },
+        },
+      ],
+    });
+    expect(result.model).toBe("deterministic/scripted");
+    const parsed = JSON.parse(result.content) as {
+      strongestSupport: string;
+      strongestOpposition: string;
+      agreements: string[];
+      unresolved: string;
+      claimsToVerify: string[];
+      takeaway: string;
+    };
+    expect(parsed.strongestSupport).toContain("cities create more public parks");
+    expect(parsed.strongestOpposition).toContain("against");
+    expect(parsed.takeaway).toContain("2 turns");
+  });
+
+  it("uses scripted synthesis content and records the call", async () => {
+    setScriptedScenario({
+      turns: [],
+      synthesis: {
+        syntheses: [
+          { outcome: "success", content: '{"takeaway":"scripted"}' },
+        ],
+      },
+    });
+    const fake = new ScriptedDiscussion();
+    const result = await fake.generateSynthesis({
+      topic: "t",
+      transcript: [],
+    });
+    expect(result.content).toBe('{"takeaway":"scripted"}');
+    expect(fake.synthesisCalls).toHaveLength(1);
+    expect(fake.synthesisCalls[0].topic).toBe("t");
+  });
+
+  it("throws a retryable failure for a transient synthesis failure", async () => {
+    setScriptedScenario({
+      turns: [],
+      synthesis: { syntheses: [{ outcome: "transient-failure" }] },
+    });
+    const fake = new ScriptedDiscussion();
+    await expect(
+      fake.generateSynthesis({ topic: "t", transcript: [] }),
+    ).rejects.toMatchObject({ retryable: true });
+    // Generations beyond the scripted list fall back to success.
+    await expect(
+      fake.generateSynthesis({ topic: "t", transcript: [] }),
+    ).resolves.toBeDefined();
+  });
+
+  it("emits policy-violating and invalid synthesis responses", async () => {
+    setScriptedScenario({
+      turns: [],
+      synthesis: {
+        syntheses: [
+          { outcome: "policy-violation" },
+          { outcome: "invalid-response" },
+        ],
+      },
+    });
+    const fake = new ScriptedDiscussion();
+    const blocked = await fake.generateSynthesis({ topic: "t", transcript: [] });
+    const blockedParsed = JSON.parse(blocked.content) as {
+      strongestSupport: string;
+    };
+    expect(blockedParsed.strongestSupport).toBe(
+      SCRIPTED_POLICY_VIOLATION_CONTENT,
+    );
+    const invalid = await fake.generateSynthesis({ topic: "t", transcript: [] });
+    expect(invalid.content).toBe("this is not valid synthesis JSON at all");
+  });
+
+  it("resets the synthesis script with the scenario", () => {
+    setScriptedScenario({
+      turns: [],
+      synthesis: { syntheses: [{ outcome: "transient-failure" }] },
+    });
+    resetScriptedScenario();
+    expect(currentScriptedScenario().synthesis).toEqual({
+      syntheses: [],
+      synthesisFallback: { outcome: "success" },
+    });
+  });
+});

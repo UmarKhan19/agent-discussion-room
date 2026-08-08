@@ -75,6 +75,10 @@ async function createProcessHandlers(): Promise<DiscussionHttpHandlers> {
       "DISCUSSION_TRANSCRIPT_CHARACTER_BUDGET",
       DEFAULT_DISCUSSION_BUDGETS.transcriptCharacterBudget,
     ),
+    synthesisTranscriptCharacterBudget: envBudgetInt(
+      "DISCUSSION_SYNTHESIS_TRANSCRIPT_CHARACTER_BUDGET",
+      DEFAULT_DISCUSSION_BUDGETS.synthesisTranscriptCharacterBudget,
+    ),
     maxOutputTokens: envBudgetInt(
       "DISCUSSION_MAX_OUTPUT_TOKENS",
       DEFAULT_DISCUSSION_BUDGETS.maxOutputTokens,

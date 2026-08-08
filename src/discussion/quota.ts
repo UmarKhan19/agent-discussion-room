@@ -3,9 +3,12 @@
  *
  * The quota guards aggregate provider cost for anonymous sessions: each
  * signed session may charge at most `sessionQuota` unique logical
- * generations (identified by `discussionId/requestId`) during one time
- * window. When the window elapses the charge keys are discarded and the
- * session receives a fresh allowance, so "try again later" is truthful.
+ * generations during one time window. A logical generation is one model
+ * invocation — an ordinary next-Turn generation (charge key
+ * `discussionId/requestId`) or the one completion synthesis of a naturally
+ * completed Discussion (charge key `discussionId/synthesis`). When the
+ * window elapses the charge keys are discarded and the session receives a
+ * fresh allowance, so "try again later" is truthful.
  *
  * Memory lifecycle:
  *
@@ -29,6 +32,11 @@
  * protections share one tested cleanup pattern without coupling their
  * semantics: rate limiting guards HTTP burst frequency, while this quota
  * guards per-session generation cost.
+ *
+ * The synthesis charge key is deliberately not a Turn request key: the
+ * same logical synthesis retried, replayed, or resumed after a restart
+ * always reuses `discussionId/synthesis`, so it is charged at most once
+ * per Discussion while retries never double-charge.
  */
 
 /** Bound on retained session quota entries (matches the rate limiter cap). */

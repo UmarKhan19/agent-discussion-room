@@ -23,6 +23,7 @@ export const TelemetryOperationSchema = z.enum([
   "read",
   "next-turn",
   "stop",
+  "synthesis",
 ]);
 
 export const TelemetryCancellationReasonSchema = z.enum([
@@ -85,10 +86,11 @@ const RequestTelemetryEventSchema = z
 const GenerationTelemetryEventSchema = z
   .object({
     event: z.literal("generation"),
-    operation: z.literal("next-turn"),
+    operation: z.enum(["next-turn", "synthesis"]),
     outcome: z.enum(["success", "failure", "cancelled"]),
     durationMs: z.number().nonnegative(),
-    turn: z.number().int().positive(),
+    /** The Turn index; present only for `next-turn` generations. */
+    turn: z.number().int().positive().optional(),
     requestId: RequestIdentifierSchema,
     discussionId: DiscussionIdentifierSchema,
     errorClass: TelemetryErrorClassSchema.optional(),

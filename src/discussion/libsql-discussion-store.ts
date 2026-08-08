@@ -9,11 +9,19 @@ import {
   DiscussionStateSchema,
   RequestIdentifierSchema,
   SessionIdentifierSchema,
+  SYNTHESIS_REQUEST_ID,
+  SynthesisContentSchema,
+  SynthesisFailureSchema,
+  type AllowedPolicyOutcome,
   type DiscussionMessage,
   type DiscussionState,
   type DiscussionTerminalReason,
+  type GenerationUsage,
+  type SynthesisContent,
+  type SynthesisFailure,
 } from "./contracts";
 import type {
+  ClaimSynthesisResult,
   ClaimTurnResult,
   CreateDiscussionResult,
   DiscussionStore,
@@ -57,6 +65,12 @@ export interface LibSQLDiscussionStoreOptions {
 }
 
 const INTERRUPTED_RECOVERY_FAILURE: TurnFailure = {
+  kind: "generation_failed",
+  retryable: true,
+};
+
+/** Recovery outcome for a synthesis attempt abandoned by its owning process. */
+const INTERRUPTED_SYNTHESIS_RECOVERY_FAILURE: SynthesisFailure = {
   kind: "generation_failed",
   retryable: true,
 };
@@ -386,23 +400,41 @@ export class LibSQLDiscussionStore
           );
           continue;
         }
-        if (parsed.data.status !== "generating") continue;
+        if (parsed.data.status === "generating") {
+          // A generating Discussion whose lease is still valid is owned by a
+          // live instance and must never be recovered. Rows without a lease
+          // are legacy rows from before leasing; they are treated as expired
+          // so an upgrade never strands them permanently.
+          const request = await this.readGeneratingRequest(tx, String(row.id));
+          if (request && !this.isLeaseExpired(request)) continue;
 
-        // A generating Discussion whose lease is still valid is owned by a
-        // live instance and must never be recovered. Rows without a lease
-        // are legacy rows from before leasing; they are treated as expired
-        // so an upgrade never strands them permanently.
-        const request = await this.readGeneratingRequest(tx, String(row.id));
-        if (request && !this.isLeaseExpired(request)) continue;
-
-        await this.recoverAttempt(
-          tx,
-          String(row.id),
-          parsed.data,
-          request ?? null,
-          updatedAt,
-        );
-        recovered += 1;
+          await this.recoverAttempt(
+            tx,
+            String(row.id),
+            parsed.data,
+            request ?? null,
+            updatedAt,
+          );
+          recovered += 1;
+          continue;
+        }
+        // A completed Discussion whose synthesis attempt is generating: the
+        // debate Transcript is durable and must stay untouched; only the
+        // synthesis attempt is reconciled. Same lease rule as Turns — an
+        // attempt owned by a live instance is never recovered.
+        if (
+          parsed.data.status === "completed" &&
+          parsed.data.synthesis?.status === "generating" &&
+          this.isSynthesisLeaseExpired(parsed.data.synthesis)
+        ) {
+          await this.recoverSynthesisAttempt(
+            tx,
+            String(row.id),
+            parsed.data,
+            updatedAt,
+          );
+          recovered += 1;
+        }
       }
 
       return recovered;
@@ -774,6 +806,157 @@ export class LibSQLDiscussionStore
     });
   }
 
+  async claimSynthesis(input: {
+    ownerSessionId: string;
+    discussionId: string;
+    attemptId: string;
+    updatedAt: string;
+  }): Promise<ClaimSynthesisResult> {
+    await this.init();
+    const ownerSessionId = SessionIdentifierSchema.parse(input.ownerSessionId);
+    const discussionId = DiscussionIdentifierSchema.parse(input.discussionId);
+    const attemptId = RequestIdentifierSchema.parse(input.attemptId);
+
+    return this.withWriteTransaction(async (tx) => {
+      const discussion = await this.readOwnedState(
+        tx,
+        ownerSessionId,
+        discussionId,
+      );
+      if (!discussion) return { kind: "not_found" };
+
+      const existing = discussion.synthesis;
+      if (existing?.status === "completed") {
+        return { kind: "already_present", discussion };
+      }
+      if (existing?.status === "generating") {
+        // A generating attempt whose lease is still valid is owned by a live
+        // instance: observe it, never claim a second attempt. An expired (or
+        // absent) lease means the owning process disappeared: recover it
+        // transactionally into the same retryable failed state recovery
+        // produces, then fall through and claim a fresh attempt so the
+        // participant is not stranded until the next restart.
+        if (!this.isSynthesisLeaseExpired(existing)) {
+          return { kind: "in_progress", discussion };
+        }
+        await this.recoverSynthesisAttempt(
+          tx,
+          discussionId,
+          discussion,
+          input.updatedAt,
+        );
+      }
+      if (existing?.status === "failed" && !existing.failure.retryable) {
+        return { kind: "invalid_state", discussion };
+      }
+      if (discussion.status !== "completed") {
+        return { kind: "invalid_state", discussion };
+      }
+
+      const claimed: DiscussionState = {
+        ...discussion,
+        synthesis: {
+          status: "generating",
+          requestId: SYNTHESIS_REQUEST_ID,
+          attemptId,
+          startedAt: input.updatedAt,
+          updatedAt: input.updatedAt,
+          leaseOwnerId: this.leaseOwnerId,
+          leaseExpiresAt: new Date(
+            this.now().getTime() + this.leaseDurationMs,
+          ).toISOString(),
+        },
+      };
+      await this.writeState(tx, discussionId, claimed);
+      return {
+        kind: "claimed",
+        discussion: DiscussionStateSchema.parse(claimed),
+      };
+    });
+  }
+
+  async completeSynthesis(input: {
+    ownerSessionId: string;
+    discussionId: string;
+    attemptId: string;
+    content: SynthesisContent;
+    usage?: GenerationUsage;
+    outputPolicyOutcome: AllowedPolicyOutcome;
+    updatedAt: string;
+  }): Promise<TurnMutationResult> {
+    await this.init();
+    const content = SynthesisContentSchema.parse(input.content);
+    return this.withWriteTransaction(async (tx) => {
+      const stored = await this.requireCurrentSynthesisAttempt(tx, input);
+      if ("result" in stored) return stored.result;
+      const existing = stored.discussion.synthesis;
+      if (existing?.status !== "generating") {
+        // Defensive: the guard above requires a generating attempt.
+        return { kind: "stale", discussion: stored.discussion };
+      }
+
+      const updated: DiscussionState = {
+        ...stored.discussion,
+        synthesis: {
+          status: "completed",
+          requestId: SYNTHESIS_REQUEST_ID,
+          attemptId: input.attemptId,
+          content,
+          ...(input.usage === undefined ? {} : { usage: input.usage }),
+          outputPolicyOutcome: input.outputPolicyOutcome,
+          startedAt: existing.startedAt,
+          updatedAt: input.updatedAt,
+          leaseOwnerId: null,
+          leaseExpiresAt: null,
+        },
+      };
+      await this.writeState(tx, input.discussionId, updated);
+      return {
+        kind: "updated",
+        discussion: DiscussionStateSchema.parse(updated),
+      };
+    });
+  }
+
+  async failSynthesis(input: {
+    ownerSessionId: string;
+    discussionId: string;
+    attemptId: string;
+    failure: SynthesisFailure;
+    updatedAt: string;
+  }): Promise<TurnMutationResult> {
+    await this.init();
+    const failure = SynthesisFailureSchema.parse(input.failure);
+    return this.withWriteTransaction(async (tx) => {
+      const stored = await this.requireCurrentSynthesisAttempt(tx, input);
+      if ("result" in stored) return stored.result;
+      const existing = stored.discussion.synthesis;
+      if (existing?.status !== "generating") {
+        // Defensive: the guard above requires a generating attempt.
+        return { kind: "stale", discussion: stored.discussion };
+      }
+
+      const updated: DiscussionState = {
+        ...stored.discussion,
+        synthesis: {
+          status: "failed",
+          requestId: SYNTHESIS_REQUEST_ID,
+          attemptId: input.attemptId,
+          failure,
+          startedAt: existing.startedAt,
+          updatedAt: input.updatedAt,
+          leaseOwnerId: null,
+          leaseExpiresAt: null,
+        },
+      };
+      await this.writeState(tx, input.discussionId, updated);
+      return {
+        kind: "updated",
+        discussion: DiscussionStateSchema.parse(updated),
+      };
+    });
+  }
+
   private async createSchema(): Promise<void> {
     await this.client.executeMultiple(SCHEMA_SQL);
     await this.migrateRequestLeaseColumns();
@@ -926,6 +1109,56 @@ export class LibSQLDiscussionStore
   }
 
   /**
+   * Lease rule for a generating synthesis attempt, mirroring Turns: absent
+   * (in-memory/legacy) is treated as expired; a valid lease means a live
+   * instance still owns the attempt and it must not be recovered.
+   */
+  private isSynthesisLeaseExpired(synthesis: Extract<
+    DiscussionState["synthesis"],
+    { status: "generating" }
+  >): boolean {
+    return (
+      synthesis.leaseExpiresAt === null ||
+      synthesis.leaseExpiresAt < this.now().toISOString()
+    );
+  }
+
+  /**
+   * Converts an abandoned generating synthesis attempt into a retryable
+   * failed synthesis, leaving the completed debate Transcript untouched.
+   * Must be called inside the write transaction that owns the row.
+   */
+  private async recoverSynthesisAttempt(
+    tx: Transaction,
+    discussionId: string,
+    discussion: DiscussionState,
+    updatedAt: string,
+  ): Promise<void> {
+    if (discussion.synthesis?.status !== "generating") return;
+    const recoveredState: DiscussionState = {
+      ...discussion,
+      synthesis: {
+        status: "failed",
+        requestId: discussion.synthesis.requestId,
+        attemptId: discussion.synthesis.attemptId,
+        failure: INTERRUPTED_SYNTHESIS_RECOVERY_FAILURE,
+        startedAt: discussion.synthesis.startedAt,
+        updatedAt,
+        leaseOwnerId: null,
+        leaseExpiresAt: null,
+      },
+    };
+    await tx.execute({
+      sql: "UPDATE discussion SET state = ?, updated_at = ? WHERE id = ?",
+      args: [
+        JSON.stringify(recoveredState),
+        recoveredState.updatedAt,
+        discussionId,
+      ],
+    });
+  }
+
+  /**
    * Converts one abandoned generating attempt into a retryable failed
    * state, both in the Discussion document and in its request record.
    * Must be called inside the write transaction that owns the row.
@@ -953,6 +1186,38 @@ export class LibSQLDiscussionStore
         args: [serializeFailure(INTERRUPTED_RECOVERY_FAILURE), discussionId, request.requestId],
       });
     }
+  }
+
+  /**
+   * Reads the owned Discussion and verifies the caller's synthesis attempt is
+   * still the currently persisted one. Returns the not-found result, a stale
+   * result, or the verified discussion.
+   */
+  private async requireCurrentSynthesisAttempt(
+    tx: Transaction,
+    input: {
+      ownerSessionId: string;
+      discussionId: string;
+      attemptId: string;
+    },
+  ): Promise<
+    | { result: TurnMutationResult }
+    | { discussion: DiscussionState }
+  > {
+    const discussion = await this.readOwnedState(
+      tx,
+      input.ownerSessionId,
+      input.discussionId,
+    );
+    if (!discussion) return { result: { kind: "not_found" } };
+    if (
+      discussion.synthesis?.status !== "generating" ||
+      discussion.synthesis.attemptId !== input.attemptId ||
+      discussion.status !== "completed"
+    ) {
+      return { result: { kind: "stale", discussion } };
+    }
+    return { discussion };
   }
 
   private async readOwnedState(
