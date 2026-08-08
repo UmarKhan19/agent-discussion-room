@@ -67,9 +67,18 @@ export function deriveLeaseDurationMs(generationTimeoutMs: number): number {
 export const DEFAULT_MAX_CONCURRENT_GENERATIONS = 4;
 export const HARD_MAX_CONCURRENT_GENERATIONS = 16;
 
-/** Model-generating next-Turn requests one signed session may claim. */
+/** Model-generating next-Turn requests one signed session may claim per time window. */
 export const DEFAULT_SESSION_GENERATION_QUOTA = 500;
 export const HARD_SESSION_GENERATION_QUOTA = 10_000;
+
+/**
+ * Time window (ms) over which a session's generation quota is measured.
+ * After the window elapses, charged request keys are discarded and the
+ * session receives a fresh allowance, making "try again later" truthful.
+ * The hard maximum matches the anonymous session cookie Max-Age (30 days).
+ */
+export const DEFAULT_SESSION_GENERATION_QUOTA_WINDOW_MS = 24 * 60 * 60 * 1000;
+export const HARD_SESSION_GENERATION_QUOTA_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
 export const DiscussionBudgetSchema = z
   .object({
@@ -104,6 +113,11 @@ export const DiscussionBudgetSchema = z
       .int()
       .positive()
       .max(HARD_SESSION_GENERATION_QUOTA),
+    sessionGenerationQuotaWindowMs: z
+      .number()
+      .int()
+      .positive()
+      .max(HARD_SESSION_GENERATION_QUOTA_WINDOW_MS),
   })
   .strict();
 
@@ -117,4 +131,6 @@ export const DEFAULT_DISCUSSION_BUDGETS: DiscussionBudgets = {
   generationTimeoutMs: DEFAULT_GENERATION_TIMEOUT_MS,
   maxConcurrentGenerations: DEFAULT_MAX_CONCURRENT_GENERATIONS,
   sessionGenerationQuota: DEFAULT_SESSION_GENERATION_QUOTA,
+  sessionGenerationQuotaWindowMs:
+    DEFAULT_SESSION_GENERATION_QUOTA_WINDOW_MS,
 };

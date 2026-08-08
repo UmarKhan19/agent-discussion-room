@@ -2132,6 +2132,7 @@ describe("Discussion HTTP interface", () => {
       ]);
       const [first, second, third] = await createDiscussions(3, {
         sessionGenerationQuota: 2,
+        sessionGenerationQuotaWindowMs: 60_000,
       });
 
       expect((await nextTurn(first, requestId)).status).toBe(200);
@@ -2140,9 +2141,11 @@ describe("Discussion HTTP interface", () => {
       const blocked = await nextTurn(third, turnRequestId(3));
       const blockedError = ErrorResponseSchema.parse(await blocked.json());
       expect(blocked.status).toBe(429);
+      expect(blocked.headers.get("retry-after")).toBe("60");
       expect(blockedError.error).toMatchObject({
         code: "SESSION_QUOTA_EXCEEDED",
         retryable: false,
+        retryAfterSeconds: 60,
       });
       expect(fakeDiscussion.calls).toHaveLength(2);
     });
@@ -2275,6 +2278,70 @@ describe("Discussion HTTP interface", () => {
         DiscussionStateSchema.parse(await replay.json()).transcript,
       ).toHaveLength(1);
       expect(fakeDiscussion.calls).toHaveLength(2);
+    });
+
+    it("restores per-session quota after the time window elapses", async () => {
+      let currentTime = now;
+      configureService(undefined, () => {
+        idCalls += 1;
+        return discussionIdFor(idCalls);
+      });
+      fakeDiscussion = new FakeDiscussion([
+        { type: "success", result: generatedTurn },
+        { type: "success", result: generatedTurn },
+      ]);
+      runner = new DiscussionRunner({
+        store,
+        discussion: fakeDiscussion,
+        outputPolicy: new DiscussionOutputPolicy(() => currentTime),
+        now: () => currentTime,
+        createMessageId: () => {
+          messageIdCalls += 1;
+          return turnMessageId(messageIdCalls);
+        },
+        budgets: {
+          sessionGenerationQuota: 1,
+          sessionGenerationQuotaWindowMs: 60_000,
+        },
+      });
+      handlers = createDiscussionHttpHandlers(service, sessions, runner);
+
+      // Start two discussions under one session.
+      const first = await handlers.post(
+        jsonRequest({ topic: "Permitted Topic 1" }),
+      );
+      const cookie = cookiePair(first);
+      await handlers.post(jsonRequest({ topic: "Permitted Topic 2" }, cookie));
+
+      // Charge the single quota slot.
+      expect(
+        (
+          await handlers.postTurn(
+            jsonRequest({ requestId }, cookie),
+            discussionIdFor(1),
+          )
+        ).status,
+      ).toBe(200);
+
+      // Quota exhausted — a new request is blocked.
+      const blocked = await handlers.postTurn(
+        jsonRequest({ requestId: secondRequestId }, cookie),
+        discussionIdFor(2),
+      );
+      expect(blocked.status).toBe(429);
+
+      // Advance past the 60-second window.
+      currentTime = new Date(now.getTime() + 60_001);
+
+      // Quota restored — a new request identity succeeds.
+      expect(
+        (
+          await handlers.postTurn(
+            jsonRequest({ requestId: turnRequestId(3) }, cookie),
+            discussionIdFor(2),
+          )
+        ).status,
+      ).toBe(200);
     });
   });
 });

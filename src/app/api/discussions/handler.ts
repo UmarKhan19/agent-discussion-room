@@ -585,9 +585,11 @@ export function createDiscussionHttpHandlers(
               code: "SESSION_QUOTA_EXCEEDED",
               message: "This session has reached its generation quota.",
               action: "Start a fresh session, or try again later.",
+              retryAfterSeconds: error.retryAfterSeconds,
             },
             meta,
             session.setCookie,
+            error.retryAfterSeconds,
           );
         }
 

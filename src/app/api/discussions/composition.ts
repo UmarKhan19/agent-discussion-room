@@ -95,6 +95,10 @@ async function createProcessHandlers(): Promise<DiscussionHttpHandlers> {
       "DISCUSSION_SESSION_GENERATION_QUOTA",
       DEFAULT_DISCUSSION_BUDGETS.sessionGenerationQuota,
     ),
+    sessionGenerationQuotaWindowMs: envBudgetInt(
+      "DISCUSSION_SESSION_GENERATION_QUOTA_WINDOW_MS",
+      DEFAULT_DISCUSSION_BUDGETS.sessionGenerationQuotaWindowMs,
+    ),
   });
   if (environment.storage.kind === "durable") {
     ensureStorageDirectory(environment.storage.url);

@@ -106,7 +106,8 @@ startup.
 | Request body | 4,096 bytes | `DISCUSSION_MAX_REQUEST_BODY_BYTES` | Bounded read; oversized → `413` |
 | Session rate limit | 60 req / 60 s | `DISCUSSION_SESSION_RATE_LIMIT`, `DISCUSSION_SESSION_RATE_WINDOW_MS` | Fixed window per signed session → `429` + `Retry-After` |
 | Network rate limit | 300 req / 60 s | `DISCUSSION_NETWORK_RATE_LIMIT`, `DISCUSSION_NETWORK_RATE_WINDOW_MS` | Fixed window per client address (`X-Forwarded-For` first hop, then `X-Real-IP`) → `429` + `Retry-After` |
-| Session generation quota | 500 claims | `DISCUSSION_SESSION_GENERATION_QUOTA` | Per (Discussion, request identity), process-local → `429 SESSION_QUOTA_EXCEEDED` |
+| Session generation quota | 500 claims | `DISCUSSION_SESSION_GENERATION_QUOTA` | Per (Discussion, request identity), in a time window, process-local → `429 SESSION_QUOTA_EXCEEDED` with `Retry-After` |
+| Session generation quota window | 86400000 ms (24 h) | `DISCUSSION_SESSION_GENERATION_QUOTA_WINDOW_MS` | Time window over which the session generation quota is measured; after it elapses, charged keys are discarded and the allowance is restored |
 
 Rate-limit state is **process-local and in-memory** (hard-bounded bucket
 table): counters reset on restart, and multi-instance deployments should put

@@ -38,6 +38,7 @@ import {
   DiscussionOutputPolicy,
   type DiscussionOutputPolicyEvaluator,
 } from "./policy";
+import { SessionGenerationQuota } from "./quota";
 
 export class DiscussionInvalidStateError extends Error {
   constructor() {
@@ -91,7 +92,7 @@ export class DiscussionGenerationCapacityError extends Error {
 
 /** The owning session has claimed its configured generation quota. */
 export class DiscussionSessionQuotaExceededError extends Error {
-  constructor() {
+  constructor(readonly retryAfterSeconds: number) {
     super("Discussion session generation quota exceeded");
     this.name = "DiscussionSessionQuotaExceededError";
   }
@@ -239,13 +240,14 @@ export class DiscussionRunner {
   private readonly capacity: GenerationCapacity;
   private readonly activeGenerations = new Map<string, ActiveGeneration>();
   /**
-   * Session -> generation charge keys. A key is `discussionId/requestId`, so
-   * reusing one request identity across Discussions charges each Discussion
-   * separately while a retry of the same identity in the same Discussion is
-   * charged at most once. Replays, conflicts, and rejected duplicates never
-   * charge.
+   * Time-windowed per-session quota tracker. A charge key is
+   * `discussionId/requestId`, so reusing one request identity across
+   * Discussions charges each Discussion separately while a retry of the
+   * same identity in the same Discussion is charged at most once. Replays,
+   * conflicts, and rejected duplicates never charge. Expired windows and
+   * abandoned sessions are reclaimed automatically; see `SessionGenerationQuota`.
    */
-  private readonly chargedGenerationKeys = new Map<string, Set<string>>();
+  private readonly quota: SessionGenerationQuota;
 
   constructor(options: DiscussionRunnerOptions) {
     this.store = options.store;
@@ -265,6 +267,16 @@ export class DiscussionRunner {
     this.capacity = new GenerationCapacity(
       this.budgets.maxConcurrentGenerations,
     );
+    this.quota = new SessionGenerationQuota(
+      this.budgets.sessionGenerationQuota,
+      this.budgets.sessionGenerationQuotaWindowMs,
+      () => this.now().getTime(),
+    );
+  }
+
+  /** Number of sessions tracked by the generation quota; a diagnostics aid. */
+  get quotaSize(): number {
+    return this.quota.size;
   }
 
   async stop(ownerSessionId: string, discussionId: string): Promise<DiscussionState | null> {
@@ -298,19 +310,24 @@ export class DiscussionRunner {
     const stableRequestId = RequestIdentifierSchema.parse(requestId);
     const attemptId = RequestIdentifierSchema.parse(this.createAttemptId());
 
-    // Quota guard: charged before any generation starts, and only once per
-    // (Discussion, request identity) pair. Replayed, in-flight, and rejected
-    // duplicate requests are already charged or never claim, so they are not
-    // blocked and never double charge; reusing an identity in a fresh
-    // Discussion still counts against the session quota.
+    // Quota guard: checked before any generation starts as an advisory
+    // fast-path, and charged only once per (Discussion, request identity)
+    // pair — and only after generation capacity has been acquired. The
+    // charge itself (`attemptCharge`) is the authoritative mutation: it
+    // atomically re-validates the session's window state, so two concurrent
+    // requests that both passed the early check can never over-commit the
+    // final quota slot. Replayed, in-flight, and rejected duplicate
+    // requests are already charged or never claim, so they are not blocked
+    // and never double charge; reusing an identity in a fresh Discussion
+    // still counts against the session quota. The quota is time-windowed:
+    // an exhausted session recovers after its window elapses, making "try
+    // again later" truthful.
     const chargeKey = `${id}/${stableRequestId}`;
-    const sessionCharges =
-      this.chargedGenerationKeys.get(sessionId) ?? new Set<string>();
-    if (
-      !sessionCharges.has(chargeKey) &&
-      sessionCharges.size >= this.budgets.sessionGenerationQuota
-    ) {
-      throw new DiscussionSessionQuotaExceededError();
+    const quotaCheck = this.quota.check(sessionId, chargeKey);
+    if (quotaCheck.kind === "exhausted") {
+      throw new DiscussionSessionQuotaExceededError(
+        quotaCheck.retryAfterSeconds,
+      );
     }
 
     // Capacity guard: the claim result is the only authoritative signal
@@ -359,8 +376,8 @@ export class DiscussionRunner {
         // Quota is never charged for an attempt that did not generate.
         // A storage-unavailability failure here is propagated (not
         // swallowed) so it surfaces as STORAGE_UNAVAILABLE instead of a
-        // capacity rejection; see `resolveCapacityRejectedClaim`.
-        await this.resolveCapacityRejectedClaim(
+        // capacity rejection; see `resolveUnstartedClaim`.
+        await this.resolveUnstartedClaim(
           sessionId,
           id,
           stableRequestId,
@@ -369,8 +386,26 @@ export class DiscussionRunner {
         throw new DiscussionGenerationCapacityError();
       }
       capacityHeld = true;
-      sessionCharges.add(chargeKey);
-      this.chargedGenerationKeys.set(sessionId, sessionCharges);
+
+      // Authoritative quota decision, made only once capacity is held so
+      // a request rejected for lack of capacity never consumes quota. If
+      // the final slot was taken by a concurrent request after the early
+      // check passed, the durable claim is reconciled (never abandoned)
+      // and the caller receives the quota error: the Turn is not stranded
+      // in `generating` until lease expiry, a later retry can claim it
+      // once the window resets, and no quota or capacity is left held.
+      const chargeOutcome = this.quota.attemptCharge(sessionId, chargeKey);
+      if (chargeOutcome.kind === "quotaExceeded") {
+        await this.resolveUnstartedClaim(
+          sessionId,
+          id,
+          stableRequestId,
+          claim,
+        );
+        throw new DiscussionSessionQuotaExceededError(
+          chargeOutcome.retryAfterSeconds,
+        );
+      }
 
       const generating = claim.discussion;
       const turn = claim.turn;
@@ -532,26 +567,29 @@ export class DiscussionRunner {
   }
 
   /**
-   * Resolves a freshly claimed attempt that cannot start because the
-   * process-wide capacity slot was unavailable: the claim is converted to
-   * a retryable failed state (the same outcome recovery produces for an
-   * abandoned attempt), so the Turn is not stranded for the lease duration
-   * and a later retry can claim it.
+   * Resolves a freshly claimed attempt that cannot start provider work —
+   * because the process-wide capacity slot was unavailable, or because the
+   * authoritative quota charge was rejected by a concurrent request — into
+   * the same retryable failed state recovery produces for an abandoned
+   * attempt. The Turn is not stranded for the lease duration, and a later
+   * retry can claim it (once capacity frees up, or once the quota window
+   * resets). Quota is never charged on this path: the attempt never
+   * generated.
    *
    * Reconciliation is best-effort for non-storage failures: if the store
    * cannot record the resolution for a transient reason other than an
    * outage, the attempt's lease will expire and recovery will reconcile it,
-   * and the caller still receives the capacity error.
+   * and the caller still receives the capacity/quota error.
    *
    * A storage-unavailability failure is authoritative, not best-effort: the
    * persisted lifecycle state could not be updated, so swallowing it would
-   * misreport the outcome as a capacity rejection. It is propagated so the
-   * request surfaces as `500 STORAGE_UNAVAILABLE`; the attempt keeps its
-   * recovery lease and is reconciled through the normal lease/recovery
-   * path, so a retry of the same request identity can never duplicate a
-   * committed Turn.
+   * misreport the outcome as a capacity/quota rejection. It is propagated
+   * so the request surfaces as `500 STORAGE_UNAVAILABLE`; the attempt
+   * keeps its recovery lease and is reconciled through the normal
+   * lease/recovery path, so a retry of the same request identity can never
+   * duplicate a committed Turn.
    */
-  private async resolveCapacityRejectedClaim(
+  private async resolveUnstartedClaim(
     ownerSessionId: string,
     discussionId: string,
     requestId: string,
@@ -570,8 +608,9 @@ export class DiscussionRunner {
     } catch (error) {
       // Storage unavailable is authoritative: the persisted lifecycle state
       // could not be updated, so it must surface as STORAGE_UNAVAILABLE
-      // rather than be disguised as a capacity rejection. Propagate it; the
-      // attempt keeps its recovery lease and is reconciled via recovery.
+      // rather than be disguised as a capacity/quota rejection. Propagate
+      // it; the attempt keeps its recovery lease and is reconciled via
+      // recovery.
       if (error instanceof DiscussionStorageUnavailableError) {
         throw error;
       }

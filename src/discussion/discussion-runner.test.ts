@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DiscussionGenerationCapacityError,
+  DiscussionGenerationFailedError,
   DiscussionRunner,
   DiscussionSessionQuotaExceededError,
 } from "./discussion-runner";
@@ -9,15 +10,18 @@ import {
   DiscussionStateSchema,
   type DiscussionState,
 } from "./contracts";
-import type {
-  ClaimTurnResult,
-  DiscussionStore,
-  RequestStatusResult,
-  StopTurnResult,
-  TurnFailure,
-  TurnMutationResult,
+import {
+  InMemoryDiscussionStore,
+  type ClaimTurnResult,
+  type DiscussionStore,
+  type RequestStatusResult,
+  type StopTurnResult,
+  type TurnFailure,
+  type TurnMutationResult,
 } from "./discussion-service";
-import { FakeDiscussion } from "./testing/fake-discussion";
+import { DiscussionGenerationError } from "./discussion";
+import { FakeDiscussion, type FakeDiscussionOutcome } from "./testing/fake-discussion";
+import type { DiscussionBudgets } from "./budgets";
 
 const now = new Date("2026-08-02T12:00:00.000Z");
 const ownerSessionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -307,6 +311,349 @@ describe("DiscussionRunner generation capacity", () => {
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(100);
     await expect(fourth).resolves.toBeTruthy();
+    expect(fake.calls).toHaveLength(2);
+  });
+});
+
+function uuidFor(index: number): string {
+  return `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
+}
+
+describe("DiscussionRunner time-windowed generation quota", () => {
+  const windowMs = 60_000;
+
+  function freshRunner(
+    clock: () => Date,
+    quotas: Partial<DiscussionBudgets>,
+    outcomes: FakeDiscussionOutcome[],
+  ): DiscussionRunner {
+    return new DiscussionRunner({
+      store: new StaleHintStore(),
+      discussion: new FakeDiscussion(outcomes),
+      budgets: {
+        sessionGenerationQuota: 1,
+        sessionGenerationQuotaWindowMs: windowMs,
+        ...quotas,
+      },
+      now: clock,
+    });
+  }
+
+  it("restores the per-session quota after the time window elapses", async () => {
+    let currentTime = now;
+    const clock = () => currentTime;
+    const runner = freshRunner(clock, {}, [
+      { type: "success", result: generatedTurn },
+      { type: "success", result: generatedTurn },
+      { type: "success", result: generatedTurn },
+    ]);
+
+    // Charge the single quota slot.
+    await runner.nextTurn(
+      ownerSessionId,
+      uuidFor(1),
+      uuidFor(101),
+    );
+
+    // Quota exhausted — second request is blocked.
+    await expect(
+      runner.nextTurn(ownerSessionId, uuidFor(2), uuidFor(102)),
+    ).rejects.toThrow(DiscussionSessionQuotaExceededError);
+
+    // Advance past the window.
+    currentTime = new Date(now.getTime() + windowMs + 1);
+
+    // Quota restored — third request succeeds.
+    const result = await runner.nextTurn(
+      ownerSessionId,
+      uuidFor(3),
+      uuidFor(103),
+    );
+    expect(result).not.toBeNull();
+  });
+
+  it("carries retryAfterSeconds on the quota-exceeded error", async () => {
+    const runner = freshRunner(() => now, {}, [
+      { type: "success", result: generatedTurn },
+    ]);
+
+    await runner.nextTurn(ownerSessionId, uuidFor(1), uuidFor(101));
+
+    let retryAfter: number | undefined;
+    try {
+      await runner.nextTurn(ownerSessionId, uuidFor(2), uuidFor(102));
+    } catch (error) {
+      if (error instanceof DiscussionSessionQuotaExceededError) {
+        retryAfter = error.retryAfterSeconds;
+      }
+    }
+    expect(retryAfter).toBeGreaterThan(0);
+    expect(retryAfter).toBeLessThanOrEqual(60);
+  });
+
+  it("consumes quota on provider failure (charge precedes generation)", async () => {
+    const runner = freshRunner(() => now, {}, [
+      { type: "failure", error: new Error("provider failure") },
+      { type: "success", result: generatedTurn },
+    ]);
+
+    // The generation fails, but the quota charge has already happened.
+    await expect(
+      runner.nextTurn(ownerSessionId, uuidFor(1), uuidFor(101)),
+    ).rejects.toThrow();
+
+    // Quota is consumed — the next request is blocked.
+    await expect(
+      runner.nextTurn(ownerSessionId, uuidFor(2), uuidFor(102)),
+    ).rejects.toThrow(DiscussionSessionQuotaExceededError);
+  });
+
+  it("removes expired sessions from the outer Map via periodic sweep", async () => {
+    let currentTime = now;
+    const clock = () => currentTime;
+    const sessionCount = 200;
+    const fake = new FakeDiscussion(
+      Array.from({ length: sessionCount + 128 }, () => ({
+        type: "success" as const,
+        result: generatedTurn,
+      })),
+    );
+    const runner = new DiscussionRunner({
+      store: new StaleHintStore(),
+      discussion: fake,
+      budgets: {
+        sessionGenerationQuota: 500,
+        sessionGenerationQuotaWindowMs: windowMs,
+      },
+      now: clock,
+    });
+
+    // Create 200 sessions, each charging one generation.
+    for (let i = 0; i < sessionCount; i += 1) {
+      await runner.nextTurn(
+        uuidFor(i),
+        uuidFor(i + 10_000),
+        uuidFor(i + 20_000),
+      );
+    }
+    expect(runner.quotaSize).toBe(sessionCount);
+
+    // All windows expire.
+    currentTime = new Date(now.getTime() + windowMs + 1);
+
+    // Trigger the amortized periodic sweep (every QUOTA_SWEEP_INTERVAL
+    // check calls) via enough nextTurn calls with fresh sessions.
+    for (let i = 0; i < 128; i += 1) {
+      await runner.nextTurn(
+        uuidFor(i + 30_000),
+        uuidFor(i + 40_000),
+        uuidFor(i + 50_000),
+      );
+    }
+
+    // Old sessions swept; only the new ones remain.
+    expect(runner.quotaSize).toBeLessThan(sessionCount);
+  });
+
+  it("contains the final-slot race: two concurrent unique requests from one session never both generate", async () => {
+    vi.useFakeTimers();
+    const store = new InMemoryDiscussionStore();
+    await store.create(ownerSessionId, stateFor(discussionId, {}));
+    await store.create(ownerSessionId, stateFor(secondDiscussionId, {}));
+    await store.create(ownerSessionId, stateFor(thirdDiscussionId, {}));
+
+    // Outcomes: the prior charge, the race winner, and the later fresh
+    // session. The winner is kept in flight so the losing path can be
+    // observed while it still holds its capacity slot.
+    const fake = new FakeDiscussion([
+      { type: "success", result: generatedTurn },
+      { type: "success", result: generatedTurn, delayMs: 100 },
+      { type: "success", result: generatedTurn, delayMs: 100 },
+    ]);
+    const runner = new DiscussionRunner({
+      store,
+      discussion: fake,
+      budgets: {
+        sessionGenerationQuota: 2,
+        sessionGenerationQuotaWindowMs: windowMs,
+        maxConcurrentGenerations: 2,
+      },
+      now: () => now,
+    });
+
+    // Consume the first of two slots.
+    await runner.nextTurn(ownerSessionId, discussionId, requestId);
+    expect(fake.calls).toHaveLength(1);
+
+    // Two unique requests from the SAME session race for the final slot.
+    // Both pass the advisory check (one slot remains), both claim, both
+    // acquire capacity; only the authoritative charge may proceed.
+    const winner = runner.nextTurn(
+      ownerSessionId,
+      secondDiscussionId,
+      secondRequestId,
+    );
+    const loser = runner.nextTurn(
+      ownerSessionId,
+      thirdDiscussionId,
+      thirdRequestId,
+    );
+    // Attach the rejection assertion immediately so the loser's rejection
+    // is handled the moment it settles (no unhandled-rejection window).
+    const loserRejection = expect(loser).rejects.toThrow(
+      DiscussionSessionQuotaExceededError,
+    );
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Exactly one provider generation started from the race.
+    expect(fake.calls).toHaveLength(2);
+
+    // The loser receives the quota error, not a generation outcome.
+    await loserRejection;
+
+    // The winner is mid-generation.
+    expect(
+      (await store.readOwned(ownerSessionId, secondDiscussionId))?.status,
+    ).toBe("generating");
+
+    // The loser's persisted claim was reconciled into a retryable failed
+    // state: the Discussion is not stuck in `generating`, committed no
+    // Turn, and the same request identity can be retried once the window
+    // resets.
+    const loserState = await store.readOwned(ownerSessionId, thirdDiscussionId);
+    expect(loserState?.status).toBe("failed");
+    expect(loserState?.terminalReason).toBeNull();
+    expect(loserState?.transcript).toHaveLength(0);
+    expect(
+      await store.requestStatus(
+        ownerSessionId,
+        thirdDiscussionId,
+        thirdRequestId,
+      ),
+    ).toEqual({ kind: "failed", retryable: true });
+
+    // Capacity was fully released by the losing path: a fresh session can
+    // start a generation while the winner still holds its slot.
+    await store.create(secondSessionId, stateFor(fourthDiscussionId, {}));
+    const fourth = runner.nextTurn(
+      secondSessionId,
+      fourthDiscussionId,
+      "88888888-2222-4222-8222-222222222222",
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.calls).toHaveLength(3);
+
+    // Complete the winner and the fresh session: exactly one Turn is
+    // committed for the winner, none for the loser.
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(winner).resolves.not.toBeNull();
+    await expect(fourth).resolves.not.toBeNull();
+    expect(
+      (await store.readOwned(ownerSessionId, secondDiscussionId))?.transcript,
+    ).toHaveLength(1);
+    expect(
+      (await store.readOwned(ownerSessionId, thirdDiscussionId))?.transcript,
+    ).toHaveLength(0);
+  });
+
+  it("never recharges or regenerates a successful replay, even after the window elapses", async () => {
+    let currentTime = now.getTime();
+    const clock = () => new Date(currentTime);
+    const store = new InMemoryDiscussionStore();
+    await store.create(ownerSessionId, stateFor(discussionId, {}));
+    const fake = new FakeDiscussion([
+      { type: "success", result: generatedTurn },
+      { type: "success", result: generatedTurn },
+    ]);
+    const runner = new DiscussionRunner({
+      store,
+      discussion: fake,
+      budgets: {
+        sessionGenerationQuota: 1,
+        sessionGenerationQuotaWindowMs: windowMs,
+      },
+      now: clock,
+    });
+
+    // Charge the single slot and commit a Turn.
+    await runner.nextTurn(ownerSessionId, discussionId, requestId);
+    expect(fake.calls).toHaveLength(1);
+
+    // Advance past the window: the in-memory charge key is gone, so a
+    // non-authoritative implementation could wrongly re-admit the replay.
+    currentTime = now.getTime() + windowMs + 1;
+
+    // The persisted outcome is authoritative: the replay returns the
+    // committed state without invoking the provider or consuming quota.
+    const replay = await runner.nextTurn(
+      ownerSessionId,
+      discussionId,
+      requestId,
+    );
+    expect(replay).not.toBeNull();
+    expect(replay?.transcript).toHaveLength(1);
+    expect(fake.calls).toHaveLength(1);
+
+    // A NEW identity still has the fresh window's full allowance: had the
+    // replay consumed the window's single slot, this would be blocked.
+    await store.create(ownerSessionId, stateFor(secondDiscussionId, {}));
+    const next = await runner.nextTurn(
+      ownerSessionId,
+      secondDiscussionId,
+      secondRequestId,
+    );
+    expect(next).not.toBeNull();
+    expect(fake.calls).toHaveLength(2);
+  });
+
+  it("charges a retry from a later quota window against that window's allowance", async () => {
+    let currentTime = now.getTime();
+    const clock = () => new Date(currentTime);
+    const store = new InMemoryDiscussionStore();
+    await store.create(ownerSessionId, stateFor(discussionId, {}));
+    const fake = new FakeDiscussion([
+      {
+        type: "failure",
+        error: new DiscussionGenerationError(new Error("transient"), true),
+      },
+      { type: "success", result: generatedTurn },
+      { type: "success", result: generatedTurn },
+    ]);
+    const runner = new DiscussionRunner({
+      store,
+      discussion: fake,
+      budgets: {
+        sessionGenerationQuota: 1,
+        sessionGenerationQuotaWindowMs: windowMs,
+      },
+      now: clock,
+    });
+
+    // Window 1: the generation is admitted (charged) but fails retryably.
+    await expect(
+      runner.nextTurn(ownerSessionId, discussionId, requestId),
+    ).rejects.toThrow(DiscussionGenerationFailedError);
+
+    // Advance past the window.
+    currentTime = now.getTime() + windowMs + 1;
+
+    // Window 2: retrying the SAME logical request is a fresh provider
+    // execution in a fresh cost window, so it consumes window 2's slot.
+    const retried = await runner.nextTurn(
+      ownerSessionId,
+      discussionId,
+      requestId,
+    );
+    expect(retried).not.toBeNull();
+    expect(retried?.transcript).toHaveLength(1);
+    expect(fake.calls).toHaveLength(2);
+
+    // Window 2's allowance is now spent: a new identity is blocked, which
+    // proves the retry was charged to the later window.
+    await store.create(ownerSessionId, stateFor(secondDiscussionId, {}));
+    await expect(
+      runner.nextTurn(ownerSessionId, secondDiscussionId, secondRequestId),
+    ).rejects.toThrow(DiscussionSessionQuotaExceededError);
     expect(fake.calls).toHaveLength(2);
   });
 });

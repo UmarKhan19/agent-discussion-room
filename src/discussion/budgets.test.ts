@@ -9,6 +9,7 @@ import {
   HARD_MAX_OUTPUT_TOKENS,
   HARD_RECENT_TRANSCRIPT_TURNS,
   HARD_SESSION_GENERATION_QUOTA,
+  HARD_SESSION_GENERATION_QUOTA_WINDOW_MS,
   HARD_TRANSCRIPT_CHARACTER_BUDGET,
   RECOVERY_LEASE_GRACE_MS,
   deriveLeaseDurationMs,
@@ -30,6 +31,7 @@ describe("Discussion generation budgets", () => {
     ["generationTimeoutMs", HARD_GENERATION_TIMEOUT_MS],
     ["maxConcurrentGenerations", HARD_MAX_CONCURRENT_GENERATIONS],
     ["sessionGenerationQuota", HARD_SESSION_GENERATION_QUOTA],
+    ["sessionGenerationQuotaWindowMs", HARD_SESSION_GENERATION_QUOTA_WINDOW_MS],
   ])(
     "accepts exactly the hard maximum for %s and rejects anything above it",
     (field, hardMaximum) => {

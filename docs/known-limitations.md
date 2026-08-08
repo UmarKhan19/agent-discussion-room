@@ -44,8 +44,21 @@ explicitly changed.
   tuned for out-of-vocabulary harm.
 - **Per-process budgets and rate limits.** The rate limiter, session
   generation quota, and concurrency ceiling are process-local and in-memory
-  (hard-bounded). Counters reset on restart; multi-instance deployments get
-  per-instance budgets unless they add a shared limiting layer.
+  (hard-bounded). Counters and charge keys reset on restart; multi-instance
+  deployments get per-instance budgets unless they add a shared limiting
+  layer.
+- **Cookie-based quota can be reset by clearing cookies.** The session
+  generation quota is enforced per signed session cookie, so deleting the
+  cookie (or using a fresh browser profile) yields a fresh allowance. The
+  quota is an abuse-abatement measure, not a billing or identity system.
+- **Quota state can be evicted under extreme session churn.** The generation
+  quota is a best-effort process-local cost guard. Its in-memory session
+  table is hard-bounded (10,000 sessions, the same bound as the rate
+  limiter); under extreme unique-session churn it may evict an active
+  session's quota state to keep the table bounded, which can restore
+  allowance for that session. Expired windows are always swept before any
+  live entry is evicted, and the session currently being processed is never
+  evicted.
 - **Single-instance local storage.** A `file:` libSQL URL supports one
   instance; horizontal scaling requires a remote libSQL endpoint. Remote
   libSQL deployments may run multiple instances against the shared store:

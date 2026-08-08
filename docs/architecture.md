@@ -202,7 +202,32 @@ making the operation idempotent per (Discussion, request identity):
   Message. Non-retryable failures are terminal for that identity.
 - **Quota accounting** — a session generation quota is charged once per
   (Discussion, request identity); replays, conflicts, and rejected
-  duplicates never charge twice.
+  duplicates never charge twice. The quota is time-windowed: a session may
+  charge at most `DISCUSSION_SESSION_GENERATION_QUOTA` unique generations
+  per `DISCUSSION_SESSION_GENERATION_QUOTA_WINDOW_MS` (default 24 h). When
+  the window elapses the charge keys are discarded and the allowance is
+  restored, so "try again later" is truthful — an exhausted session recovers
+  automatically after the configured window. The quota is never charged
+  for a request rejected solely because the server lacks generation
+  capacity.
+
+  Precise "charged once" semantics across windows and retries:
+
+  - Within one active window, repeated execution of the same logical
+    request (a retry of a retryable failure, or an already-charged key) is
+    never double-charged.
+  - A successful persisted replay never triggers another provider
+    generation or quota charge, even after the window elapses — the
+    persisted outcome is authoritative regardless of in-memory charge keys.
+  - A retryable failure retried in a later quota window is a fresh provider
+    execution in a fresh cost window and consumes quota from that later
+    window.
+  - The final charge is an atomic, authoritative mutation executed only
+    after generation capacity is acquired: two concurrent unique requests
+    that both passed an earlier advisory check can never over-commit the
+    last remaining quota slot, and the request that loses the race is
+    answered with `SESSION_QUOTA_EXCEEDED` while its persisted Turn claim
+    is reconciled into a retryable failure.
 
 ## Fresh-Discussion rules
 
