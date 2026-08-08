@@ -16,7 +16,7 @@ import {
 } from "./contracts";
 import {
   DiscussionStorageUnavailableError,
-} from "./discussion-service";
+} from "./discussion-store";
 import {
   LibSQLDiscussionStore,
   isStorageUnavailableError,

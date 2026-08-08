@@ -11,7 +11,6 @@ import {
   type DiscussionState,
 } from "./contracts";
 import {
-  InMemoryDiscussionStore,
   type ClaimSynthesisResult,
   type ClaimTurnResult,
   type CreateDiscussionResult,
@@ -20,7 +19,8 @@ import {
   type StopTurnResult,
   type TurnFailure,
   type TurnMutationResult,
-} from "./discussion-service";
+} from "./discussion-store";
+import { InMemoryDiscussionStore } from "./in-memory-discussion-store";
 import { DiscussionGenerationError } from "./discussion";
 import { FakeDiscussion, type FakeDiscussionOutcome } from "./testing/fake-discussion";
 import type { DiscussionBudgets } from "./budgets";

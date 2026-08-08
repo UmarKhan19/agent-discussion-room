@@ -30,12 +30,12 @@ import type {
   StopTurnResult,
   TurnFailure,
   TurnMutationResult,
-} from "./discussion-service";
+} from "./discussion-store";
 import {
   DiscussionStorageUnavailableError,
   TurnFailureSchema,
   copyFailure,
-} from "./discussion-service";
+} from "./discussion-store";
 
 export interface LibSQLDiscussionStoreOptions {
   /** libSQL URL: file:, libsql:, http(s):, or ws(s):. */

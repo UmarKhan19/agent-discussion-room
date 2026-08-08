@@ -14,10 +14,12 @@ import {
 } from "@/discussion/contracts";
 import {
   DiscussionService,
+} from "@/discussion/discussion-service";
+import {
   DiscussionStorageUnavailableError,
   type CreateDiscussionResult,
   type DiscussionStore,
-} from "@/discussion/discussion-service";
+} from "@/discussion/discussion-store";
 import { DiscussionRunner } from "@/discussion/discussion-runner";
 import { LibSQLDiscussionStore } from "@/discussion/libsql-discussion-store";
 import { DiscussionOutputPolicy, DiscussionPolicy } from "@/discussion/policy";

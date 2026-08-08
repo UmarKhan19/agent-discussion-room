@@ -10,9 +10,9 @@ import {
 import { DiscussionRunner } from "@/discussion/discussion-runner";
 import {
   DiscussionService,
-  InMemoryDiscussionStore,
-  isDurableDiscussionStore,
 } from "@/discussion/discussion-service";
+import { isDurableDiscussionStore } from "@/discussion/discussion-store";
+import { InMemoryDiscussionStore } from "@/discussion/in-memory-discussion-store";
 import { LibSQLDiscussionStore } from "@/discussion/libsql-discussion-store";
 import { scriptedDiscussion } from "@/discussion/scripted-discussion";
 import {

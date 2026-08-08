@@ -37,8 +37,8 @@ import type {
   DiscussionStore,
   TurnFailure,
   TurnMutationResult,
-} from "./discussion-service";
-import { DiscussionStorageUnavailableError } from "./discussion-service";
+} from "./discussion-store";
+import { DiscussionStorageUnavailableError } from "./discussion-store";
 import {
   DiscussionOutputPolicy,
   type DiscussionOutputPolicyEvaluator,

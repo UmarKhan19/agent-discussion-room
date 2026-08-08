@@ -12,8 +12,8 @@ import {
 } from "@/discussion/discussion";
 import {
   DiscussionService,
-  InMemoryDiscussionStore,
 } from "@/discussion/discussion-service";
+import { InMemoryDiscussionStore } from "@/discussion/in-memory-discussion-store";
 import {
   DiscussionOutputPolicy,
   DiscussionPolicy,

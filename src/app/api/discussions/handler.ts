@@ -56,9 +56,9 @@ import {
 import {
   DiscussionPolicyBlockedError,
   DiscussionStartConflictError,
-  DiscussionStorageUnavailableError,
   type DiscussionService,
 } from "@/discussion/discussion-service";
+import { DiscussionStorageUnavailableError } from "@/discussion/discussion-store";
 import {
   SAFE_OUTPUT_ALTERNATIVE,
   SAFE_TOPIC_ALTERNATIVE,
@@ -129,6 +129,312 @@ function errorResponse(
     discussionId: meta.discussionId,
   });
   return new Response(JSON.stringify(body), { status, headers });
+}
+
+/**
+ * Stable `500 STORAGE_UNAVAILABLE` envelope, used both while the durable
+ * store is still initializing and, after startup, when a runtime storage
+ * outage makes the required storage operation impossible. Retryable: the
+ * failure is request-scoped and later requests succeed automatically once
+ * storage is reachable again (see `docs/operations.md`).
+ */
+function storageUnavailableResponse(
+  telemetry: DiscussionTelemetry,
+  meta: RequestMeta,
+  setCookie?: string,
+): Response {
+  return errorResponse(
+    telemetry,
+    500,
+    {
+      code: "STORAGE_UNAVAILABLE",
+      message: "Discussion storage is not available right now.",
+      action:
+        "Wait briefly and retry; check the server logs for storage errors.",
+      retryable: true,
+    },
+    meta,
+    setCookie,
+  );
+}
+
+/**
+ * Stable `404 DISCUSSION_NOT_FOUND` envelope for an unowned or unknown
+ * Discussion. Deliberately non-disclosing: it does not reveal whether the
+ * Discussion exists under another session — the URL is an address, not a
+ * credential.
+ */
+function notFoundResponse(
+  telemetry: DiscussionTelemetry,
+  meta: RequestMeta,
+  setCookie?: string,
+): Response {
+  return errorResponse(
+    telemetry,
+    404,
+    {
+      code: "DISCUSSION_NOT_FOUND",
+      message: "This Discussion is not available in the current session.",
+      action: "Start a new Discussion in this session or return to the session that created it.",
+    },
+    meta,
+    setCookie,
+  );
+}
+
+/**
+ * `409 INVALID_DISCUSSION_STATE` envelope. The status, code, and
+ * retryability are identical across operations; only the participant copy
+ * differs, because the offending state differs (an idle Discussion cannot
+ * be stopped, a non-completed one cannot resume a synthesis).
+ */
+function invalidStateResponse(
+  telemetry: DiscussionTelemetry,
+  operation: TelemetryOperation,
+  meta: RequestMeta,
+  setCookie?: string,
+): Response {
+  switch (operation) {
+    case "stop":
+      return errorResponse(
+        telemetry,
+        409,
+        {
+          code: "INVALID_DISCUSSION_STATE",
+          message: "This Discussion has no active generation to stop.",
+          action: "Read the current Discussion state before trying to stop it.",
+        },
+        meta,
+        setCookie,
+      );
+    case "synthesis":
+      return errorResponse(
+        telemetry,
+        409,
+        {
+          code: "INVALID_DISCUSSION_STATE",
+          message: "The synthesis can only be retried for a completed Discussion.",
+          action: "Read the current Discussion state before requesting a synthesis.",
+        },
+        meta,
+        setCookie,
+      );
+    default:
+      return errorResponse(
+        telemetry,
+        409,
+        {
+          code: "INVALID_DISCUSSION_STATE",
+          message: "This Discussion is not eligible for another Turn.",
+          action: "Read the current Discussion state before requesting another Turn.",
+        },
+        meta,
+        setCookie,
+      );
+  }
+}
+
+/**
+ * The single mapping from known application/domain/infrastructure errors to
+ * the stable HTTP product contract. Every endpoint routes its caught errors
+ * through here, so a new error class or a contract change has exactly one
+ * home and endpoints cannot drift. Returns null for unknown errors: they are
+ * deliberately NOT mapped, so each endpoint's non-disclosing fallback answers
+ * them and a programmer bug can never be laundered into a friendly product
+ * error.
+ */
+export function mapDiscussionError(
+  telemetry: DiscussionTelemetry,
+  error: unknown,
+  meta: RequestMeta,
+  setCookie?: string,
+): Response | null {
+  if (error instanceof DiscussionStorageUnavailableError) {
+    return storageUnavailableResponse(telemetry, meta, setCookie);
+  }
+  if (error instanceof DiscussionPolicyBlockedError) {
+    return errorResponse(
+      telemetry,
+      422,
+      {
+        code: "TOPIC_BLOCKED",
+        message: "This Topic requests advocacy or praise that the Discussion Policy does not permit.",
+        action: SAFE_TOPIC_ALTERNATIVE,
+        category: error.outcome.category,
+      },
+      meta,
+      setCookie,
+    );
+  }
+  if (error instanceof DiscussionStartConflictError) {
+    return errorResponse(
+      telemetry,
+      409,
+      {
+        code: "START_REQUEST_CONFLICT",
+        message: "This Start request was already used to create a different Discussion in this session.",
+        action: "Start a new Discussion with a fresh request identity.",
+      },
+      meta,
+      setCookie,
+    );
+  }
+  if (error instanceof DiscussionRequestInProgressError) {
+    return errorResponse(
+      telemetry,
+      409,
+      {
+        code: "REQUEST_IN_PROGRESS",
+        message: "This next-Turn request is already being generated.",
+        action: "Wait for the active request to finish, then retry with the same requestId.",
+        retryable: true,
+      },
+      meta,
+      setCookie,
+    );
+  }
+  if (error instanceof DiscussionTurnInProgressError) {
+    return errorResponse(
+      telemetry,
+      409,
+      {
+        code: "TURN_IN_PROGRESS",
+        message: "Another next-Turn request is already being generated for this Discussion.",
+        action: "Wait for the active Turn to finish before requesting another Turn.",
+        retryable: true,
+      },
+      meta,
+      setCookie,
+    );
+  }
+  if (error instanceof DiscussionSessionQuotaExceededError) {
+    return errorResponse(
+      telemetry,
+      429,
+      {
+        code: "SESSION_QUOTA_EXCEEDED",
+        message: "This session has reached its generation quota.",
+        action: "Start a fresh session, or try again later.",
+        retryAfterSeconds: error.retryAfterSeconds,
+      },
+      meta,
+      setCookie,
+      error.retryAfterSeconds,
+    );
+  }
+  if (error instanceof DiscussionGenerationCapacityError) {
+    return errorResponse(
+      telemetry,
+      503,
+      {
+        code: "GENERATION_CAPACITY_EXCEEDED",
+        message: "The server has reached its simultaneous generation limit.",
+        action: "Wait for an active generation to finish, then retry with the same request identity.",
+        retryable: true,
+      },
+      meta,
+      setCookie,
+    );
+  }
+  if (error instanceof DiscussionCompletedError) {
+    return errorResponse(
+      telemetry,
+      409,
+      {
+        code: "DISCUSSION_COMPLETED",
+        message: "This Discussion has completed its configured Turn limit.",
+        action: "Start a new Discussion to continue with a fresh Topic and Transcript.",
+      },
+      meta,
+      setCookie,
+    );
+  }
+  if (error instanceof DiscussionInvalidStateError) {
+    return invalidStateResponse(telemetry, meta.operation, meta, setCookie);
+  }
+  if (error instanceof DiscussionOutputPolicyBlockedError) {
+    return errorResponse(
+      telemetry,
+      422,
+      {
+        code: "OUTPUT_BLOCKED",
+        message: "The generated Turn did not pass the Discussion output policy.",
+        action: SAFE_OUTPUT_ALTERNATIVE,
+        category: error.category,
+      },
+      meta,
+      setCookie,
+    );
+  }
+  if (error instanceof DiscussionInvalidGeneratedTurnError) {
+    return errorResponse(
+      telemetry,
+      502,
+      {
+        code: "INVALID_RESPONSE",
+        message: "The generated Turn did not match the safe response contract.",
+        action: "Start a new Discussion or try again later.",
+      },
+      meta,
+      setCookie,
+    );
+  }
+  if (error instanceof DiscussionGenerationOutputLimitError) {
+    return errorResponse(
+      telemetry,
+      502,
+      {
+        code: "OUTPUT_LIMIT_EXCEEDED",
+        message: "The generated Turn exceeded the configured output limit.",
+        action: "Start a new Discussion or try again later.",
+      },
+      meta,
+      setCookie,
+    );
+  }
+  if (error instanceof DiscussionGenerationTimeoutError) {
+    return errorResponse(
+      telemetry,
+      504,
+      {
+        code: "GENERATION_TIMEOUT",
+        message: "The next Turn reached the server generation timeout.",
+        action: "Start a new Discussion and try again later.",
+      },
+      meta,
+      setCookie,
+    );
+  }
+  if (error instanceof DiscussionStoppedError) {
+    return errorResponse(
+      telemetry,
+      409,
+      {
+        code: "DISCUSSION_STOPPED",
+        message: "The Discussion was stopped before the next Turn completed.",
+        action: "Start a new Discussion to continue with a fresh Topic and Transcript.",
+      },
+      meta,
+      setCookie,
+    );
+  }
+  if (error instanceof DiscussionGenerationFailedError) {
+    return errorResponse(
+      telemetry,
+      502,
+      {
+        code: "GENERATION_FAILED",
+        message: "The next Turn could not be generated safely.",
+        action: error.retryable
+          ? "Retry this Turn with the same request identity."
+          : "Start a new Discussion or try again later.",
+        retryable: error.retryable,
+      },
+      meta,
+      setCookie,
+    );
+  }
+  return null;
 }
 
 function rateLimitedResponse(
@@ -392,32 +698,6 @@ export function createDiscussionHttpHandlers(
   }
 
   /**
-   * Stable `500 STORAGE_UNAVAILABLE` envelope, used both while the durable
-   * store is still initializing and, after startup, when a runtime storage
-   * outage makes the required storage operation impossible. Retryable: the
-   * failure is request-scoped and later requests succeed automatically once
-   * storage is reachable again (see `docs/operations.md`).
-   */
-  function storageUnavailableResponse(
-    meta: RequestMeta,
-    setCookie?: string,
-  ): Response {
-    return errorResponse(
-      telemetry,
-      500,
-      {
-        code: "STORAGE_UNAVAILABLE",
-        message: "Discussion storage is not available right now.",
-        action:
-          "Wait briefly and retry; check the server logs for storage errors.",
-        retryable: true,
-      },
-      meta,
-      setCookie,
-    );
-  }
-
-  /**
    * Returns a `STORAGE_UNAVAILABLE` envelope while the durable store is still
    * initializing, or `null` to proceed. Production startup validates
    * configuration before any request is served; this gate covers store
@@ -430,7 +710,7 @@ export function createDiscussionHttpHandlers(
       await ready;
       return null;
     } catch {
-      return storageUnavailableResponse(meta);
+      return storageUnavailableResponse(telemetry, meta);
     }
   }
 
@@ -472,48 +752,20 @@ export function createDiscussionHttpHandlers(
         meta.discussionId = discussion.id;
         return discussionResponse(telemetry, discussion, 201, meta, session.setCookie);
       } catch (error) {
-        if (error instanceof DiscussionStorageUnavailableError) {
-          return storageUnavailableResponse(meta, session.setCookie);
-        }
-        if (error instanceof DiscussionPolicyBlockedError) {
-          return errorResponse(
+        return (
+          mapDiscussionError(telemetry, error, meta, session.setCookie) ??
+          errorResponse(
             telemetry,
-            422,
+            500,
             {
-              code: "TOPIC_BLOCKED",
-              message: "This Topic requests advocacy or praise that the Discussion Policy does not permit.",
-              action: SAFE_TOPIC_ALTERNATIVE,
-              category: error.outcome.category,
+              code: "INVALID_RESPONSE",
+              message: "The Discussion could not be created safely.",
+              action: "Try again with the same Topic.",
+              retryable: true,
             },
             meta,
             session.setCookie,
-          );
-        }
-        if (error instanceof DiscussionStartConflictError) {
-          return errorResponse(
-            telemetry,
-            409,
-            {
-              code: "START_REQUEST_CONFLICT",
-              message: "This Start request was already used to create a different Discussion in this session.",
-              action: "Start a new Discussion with a fresh request identity.",
-            },
-            meta,
-            session.setCookie,
-          );
-        }
-
-        return errorResponse(
-          telemetry,
-          500,
-          {
-            code: "INVALID_RESPONSE",
-            message: "The Discussion could not be created safely.",
-            action: "Try again with the same Topic.",
-            retryable: true,
-          },
-          meta,
-          session.setCookie,
+          )
         );
       }
     },
@@ -562,211 +814,24 @@ export function createDiscussionHttpHandlers(
           request.signal,
         );
         if (!discussion) {
-          return errorResponse(
-            telemetry,
-            404,
-            {
-              code: "DISCUSSION_NOT_FOUND",
-              message: "This Discussion is not available in the current session.",
-              action: "Start a new Discussion in this session or return to the session that created it.",
-            },
-            meta,
-            session.setCookie,
-          );
+          return notFoundResponse(telemetry, meta, session.setCookie);
         }
 
         return discussionResponse(telemetry, discussion, 200, meta, session.setCookie);
       } catch (error) {
-        if (error instanceof DiscussionStorageUnavailableError) {
-          return storageUnavailableResponse(meta, session.setCookie);
-        }
-        if (error instanceof DiscussionRequestInProgressError) {
-          return errorResponse(
+        return (
+          mapDiscussionError(telemetry, error, meta, session.setCookie) ??
+          errorResponse(
             telemetry,
-            409,
-            {
-              code: "REQUEST_IN_PROGRESS",
-              message: "This next-Turn request is already being generated.",
-              action: "Wait for the active request to finish, then retry with the same requestId.",
-              retryable: true,
-            },
-            meta,
-            session.setCookie,
-          );
-        }
-
-        if (error instanceof DiscussionTurnInProgressError) {
-          return errorResponse(
-            telemetry,
-            409,
-            {
-              code: "TURN_IN_PROGRESS",
-              message: "Another next-Turn request is already being generated for this Discussion.",
-              action: "Wait for the active Turn to finish before requesting another Turn.",
-              retryable: true,
-            },
-            meta,
-            session.setCookie,
-          );
-        }
-
-        if (error instanceof DiscussionSessionQuotaExceededError) {
-          return errorResponse(
-            telemetry,
-            429,
-            {
-              code: "SESSION_QUOTA_EXCEEDED",
-              message: "This session has reached its generation quota.",
-              action: "Start a fresh session, or try again later.",
-              retryAfterSeconds: error.retryAfterSeconds,
-            },
-            meta,
-            session.setCookie,
-            error.retryAfterSeconds,
-          );
-        }
-
-        if (error instanceof DiscussionGenerationCapacityError) {
-          return errorResponse(
-            telemetry,
-            503,
-            {
-              code: "GENERATION_CAPACITY_EXCEEDED",
-              message: "The server has reached its simultaneous generation limit.",
-              action: "Wait for an active generation to finish, then retry with the same request identity.",
-              retryable: true,
-            },
-            meta,
-            session.setCookie,
-          );
-        }
-
-        if (error instanceof DiscussionCompletedError) {
-          return errorResponse(
-            telemetry,
-            409,
-            {
-              code: "DISCUSSION_COMPLETED",
-              message: "This Discussion has completed its configured Turn limit.",
-              action: "Start a new Discussion to continue with a fresh Topic and Transcript.",
-            },
-            meta,
-            session.setCookie,
-          );
-        }
-
-        if (error instanceof DiscussionInvalidStateError) {
-          return errorResponse(
-            telemetry,
-            409,
-            {
-              code: "INVALID_DISCUSSION_STATE",
-              message: "This Discussion is not eligible for another Turn.",
-              action: "Read the current Discussion state before requesting another Turn.",
-            },
-            meta,
-            session.setCookie,
-          );
-        }
-
-        if (error instanceof DiscussionOutputPolicyBlockedError) {
-          return errorResponse(
-            telemetry,
-            422,
-            {
-              code: "OUTPUT_BLOCKED",
-              message: "The generated Turn did not pass the Discussion output policy.",
-              action: SAFE_OUTPUT_ALTERNATIVE,
-              category: error.category,
-            },
-            meta,
-            session.setCookie,
-          );
-        }
-
-        if (error instanceof DiscussionInvalidGeneratedTurnError) {
-          return errorResponse(
-            telemetry,
-            502,
+            500,
             {
               code: "INVALID_RESPONSE",
-              message: "The generated Turn did not match the safe response contract.",
-              action: "Start a new Discussion or try again later.",
+              message: "The Discussion could not be advanced safely.",
+              action: "Read the current Discussion state before trying again.",
             },
             meta,
             session.setCookie,
-          );
-        }
-
-        if (error instanceof DiscussionGenerationOutputLimitError) {
-          return errorResponse(
-            telemetry,
-            502,
-            {
-              code: "OUTPUT_LIMIT_EXCEEDED",
-              message: "The generated Turn exceeded the configured output limit.",
-              action: "Start a new Discussion or try again later.",
-            },
-            meta,
-            session.setCookie,
-          );
-        }
-
-        if (error instanceof DiscussionGenerationTimeoutError) {
-          return errorResponse(
-            telemetry,
-            504,
-            {
-              code: "GENERATION_TIMEOUT",
-              message: "The next Turn reached the server generation timeout.",
-              action: "Start a new Discussion and try again later.",
-            },
-            meta,
-            session.setCookie,
-          );
-        }
-
-        if (error instanceof DiscussionStoppedError) {
-          return errorResponse(
-            telemetry,
-            409,
-            {
-              code: "DISCUSSION_STOPPED",
-              message: "The Discussion was stopped before the next Turn completed.",
-              action: "Start a new Discussion to continue with a fresh Topic and Transcript.",
-            },
-            meta,
-            session.setCookie,
-          );
-        }
-
-        if (error instanceof DiscussionGenerationFailedError) {
-          return errorResponse(
-            telemetry,
-            502,
-            {
-              code: "GENERATION_FAILED",
-              message: "The next Turn could not be generated safely.",
-              action: error.retryable
-                ? "Retry this Turn with the same request identity."
-                : "Start a new Discussion or try again later.",
-              retryable: error.retryable,
-            },
-            meta,
-            session.setCookie,
-          );
-        }
-
-        return errorResponse(
-          telemetry,
-          500,
-          {
-            code: "INVALID_RESPONSE",
-            message: "The Discussion could not be advanced safely.",
-            action: "Read the current Discussion state before trying again.",
-          },
-          meta,
-          session.setCookie,
+          )
         );
       }
     },
@@ -791,49 +856,25 @@ export function createDiscussionHttpHandlers(
       try {
         const discussion = await runner.stop(session.id, parsedId.id);
         if (!discussion) {
-          return errorResponse(
-            telemetry,
-            404,
-            {
-              code: "DISCUSSION_NOT_FOUND",
-              message: "This Discussion is not available in the current session.",
-              action: "Start a new Discussion in this session or return to the session that created it.",
-            },
-            meta,
-            session.setCookie,
-          );
+          return notFoundResponse(telemetry, meta, session.setCookie);
         }
 
         return discussionResponse(telemetry, discussion, 200, meta, session.setCookie);
       } catch (error) {
-        if (error instanceof DiscussionStorageUnavailableError) {
-          return storageUnavailableResponse(meta, session.setCookie);
-        }
-        if (error instanceof DiscussionInvalidStateError) {
-          return errorResponse(
+        return (
+          mapDiscussionError(telemetry, error, meta, session.setCookie) ??
+          errorResponse(
             telemetry,
-            409,
+            500,
             {
-              code: "INVALID_DISCUSSION_STATE",
-              message: "This Discussion has no active generation to stop.",
-              action: "Read the current Discussion state before trying to stop it.",
+              code: "INVALID_RESPONSE",
+              message: "The Discussion could not be stopped safely.",
+              action: "Read the current Discussion state before trying again.",
+              retryable: true,
             },
             meta,
             session.setCookie,
-          );
-        }
-
-        return errorResponse(
-          telemetry,
-          500,
-          {
-            code: "INVALID_RESPONSE",
-            message: "The Discussion could not be stopped safely.",
-            action: "Read the current Discussion state before trying again.",
-            retryable: true,
-          },
-          meta,
-          session.setCookie,
+          )
         );
       }
     },
@@ -872,17 +913,7 @@ export function createDiscussionHttpHandlers(
           parsedId.id,
         );
         if (!discussion) {
-          return errorResponse(
-            telemetry,
-            404,
-            {
-              code: "DISCUSSION_NOT_FOUND",
-              message: "This Discussion is not available in the current session.",
-              action: "Start a new Discussion in this session or return to the session that created it.",
-            },
-            meta,
-            session.setCookie,
-          );
+          return notFoundResponse(telemetry, meta, session.setCookie);
         }
 
         return discussionResponse(
@@ -893,33 +924,19 @@ export function createDiscussionHttpHandlers(
           session.setCookie,
         );
       } catch (error) {
-        if (error instanceof DiscussionStorageUnavailableError) {
-          return storageUnavailableResponse(meta, session.setCookie);
-        }
-        if (error instanceof DiscussionInvalidStateError) {
-          return errorResponse(
+        return (
+          mapDiscussionError(telemetry, error, meta, session.setCookie) ??
+          errorResponse(
             telemetry,
-            409,
+            500,
             {
-              code: "INVALID_DISCUSSION_STATE",
-              message: "The synthesis can only be retried for a completed Discussion.",
-              action: "Read the current Discussion state before requesting a synthesis.",
+              code: "INVALID_RESPONSE",
+              message: "The synthesis could not be resumed safely.",
+              action: "Read the current Discussion state before trying again.",
             },
             meta,
             session.setCookie,
-          );
-        }
-
-        return errorResponse(
-          telemetry,
-          500,
-          {
-            code: "INVALID_RESPONSE",
-            message: "The synthesis could not be resumed safely.",
-            action: "Read the current Discussion state before trying again.",
-          },
-          meta,
-          session.setCookie,
+          )
         );
       }
     },
@@ -942,33 +959,23 @@ export function createDiscussionHttpHandlers(
       try {
         discussion = await service.read(session.id, parsedId.id);
       } catch (error) {
-        if (error instanceof DiscussionStorageUnavailableError) {
-          return storageUnavailableResponse(meta, session.setCookie);
-        }
-        return errorResponse(
-          telemetry,
-          500,
-          {
-            code: "INVALID_RESPONSE",
-            message: "The Discussion could not be read safely.",
-            action: "Start a new Discussion or try again later.",
-          },
-          meta,
-          session.setCookie,
+        return (
+          mapDiscussionError(telemetry, error, meta, session.setCookie) ??
+          errorResponse(
+            telemetry,
+            500,
+            {
+              code: "INVALID_RESPONSE",
+              message: "The Discussion could not be read safely.",
+              action: "Start a new Discussion or try again later.",
+            },
+            meta,
+            session.setCookie,
+          )
         );
       }
       if (!discussion) {
-        return errorResponse(
-          telemetry,
-          404,
-          {
-            code: "DISCUSSION_NOT_FOUND",
-            message: "This Discussion is not available in the current session.",
-            action: "Start a new Discussion in this session or return to the session that created it.",
-          },
-          meta,
-          session.setCookie,
-        );
+        return notFoundResponse(telemetry, meta, session.setCookie);
       }
 
       return discussionResponse(telemetry, discussion, 200, meta, session.setCookie);

@@ -13,7 +13,7 @@ import {
   type DiscussionState,
   type SynthesisContent,
 } from "./contracts";
-import { InMemoryDiscussionStore } from "./discussion-service";
+import { InMemoryDiscussionStore } from "./in-memory-discussion-store";
 import { FakeDiscussion } from "./testing/fake-discussion";
 import { CapturingTelemetry } from "../observability/telemetry";
 import { TelemetryEventSchema } from "../observability/telemetry";
