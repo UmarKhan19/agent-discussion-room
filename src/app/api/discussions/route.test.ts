@@ -27,7 +27,7 @@ describe("Discussion routes", () => {
       new Request("http://localhost/api/discussions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ topic: "How cities can improve public parks" }),
+        body: JSON.stringify({ topic: "How cities can improve public parks", creationRequestId: "aaaaaaaa-aaaa-4aaa-8aaa-000000000001" }),
       }),
     );
     const discussion = DiscussionResponseSchema.parse(await created.json());
@@ -40,7 +40,7 @@ describe("Discussion routes", () => {
       new Request("http://localhost/api/discussions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ topic: "How cities can improve public parks" }),
+        body: JSON.stringify({ topic: "How cities can improve public parks", creationRequestId: "aaaaaaaa-aaaa-4aaa-8aaa-000000000001" }),
       }),
     );
     const discussion = DiscussionResponseSchema.parse(await created.json());
@@ -68,7 +68,7 @@ describe("Discussion routes", () => {
       new Request("http://localhost/api/discussions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ topic: "How cities can improve public parks" }),
+        body: JSON.stringify({ topic: "How cities can improve public parks", creationRequestId: "aaaaaaaa-aaaa-4aaa-8aaa-000000000001" }),
       }),
     );
     const discussion = DiscussionResponseSchema.parse(await created.json());
@@ -105,7 +105,7 @@ describe("Discussion routes", () => {
       new Request("http://localhost/api/discussions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ topic: "How cities can improve public parks" }),
+        body: JSON.stringify({ topic: "How cities can improve public parks", creationRequestId: "aaaaaaaa-aaaa-4aaa-8aaa-000000000001" }),
       }),
     );
     const discussion = DiscussionResponseSchema.parse(await created.json());

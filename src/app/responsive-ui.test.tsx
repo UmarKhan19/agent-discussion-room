@@ -7,11 +7,25 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DiscussionState } from "@/discussion/contracts";
+import DiscussionRoom from "./discussion-room";
 import { Transcript } from "./components/transcript";
 import Home from "./page";
+
+const { pushMock, stableRouter, pathnameRef } = vi.hoisted(() => {
+  const pushMock = vi.fn();
+  return {
+    pushMock,
+    stableRouter: { push: pushMock },
+    pathnameRef: { current: "/" },
+  };
+});
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => stableRouter,
+  usePathname: () => pathnameRef.current,
+}));
 
 /**
  * Structural UI-contract tests: every primary control rides the touch-target
@@ -24,9 +38,10 @@ import Home from "./page";
 
 const topic = "Should cities create more public parks?";
 const requestId = "22222222-2222-4222-8222-222222222222";
+const discussionId = "11111111-1111-4111-8111-111111111111";
 
 const initialDiscussion: DiscussionState = {
-  id: "11111111-1111-4111-8111-111111111111",
+  id: discussionId,
   topic,
   status: "idle",
   terminalReason: null,
@@ -42,21 +57,45 @@ const initialDiscussion: DiscussionState = {
   transcript: [],
 };
 
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function errorResponse(status: number, code: string, message: string): Response {
+  return jsonResponse(
+    {
+      error: {
+        code,
+        message,
+        action: `Action for ${code}.`,
+        retryable: true,
+      },
+    },
+    status,
+  );
+}
+
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  window.sessionStorage.clear();
+  pushMock.mockReset();
+  pathnameRef.current = "/";
 });
 
-async function startDiscussionFlow(fetchMock: ReturnType<typeof vi.fn>) {
+/** Hydrate-mode flow: the persisted state is fetched, then an idle
+ *  Discussion advances Turns. The first call is always the hydration GET. */
+function renderHydratedFlow(
+  fetchMock: ReturnType<typeof vi.fn>,
+  id: string = discussionId,
+) {
   vi.stubGlobal("fetch", fetchMock);
   vi.stubGlobal("crypto", { randomUUID: () => requestId });
-  const user = userEvent.setup();
-  render(<Home />);
-  await user.type(
-    screen.getByRole("textbox", { name: "Discussion Topic" }),
-    topic,
-  );
-  await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+  pathnameRef.current = `/discussions/${id}`;
+  return render(<DiscussionRoom discussionId={id} />);
 }
 
 function expectControlSurface(button: HTMLElement) {
@@ -74,49 +113,41 @@ describe("touch targets and narrow-screen layout", () => {
   });
 
   it("keeps Start, Stop, and Retry on the touch-target and full-width control surfaces", async () => {
-    // Start surface.
+    // Start surface (create page).
     render(<Home />);
     const start = screen.getByRole("button", { name: "Start Discussion" });
     expectControlSurface(start);
     cleanup();
 
-    // Stop surface: generation is in flight.
+    // Stop surface: generation is in flight on the hydrated page.
     const stopFetchMock = vi
       .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(initialDiscussion), { status: 201 }),
-      )
+      .mockResolvedValueOnce(jsonResponse(initialDiscussion))
       .mockReturnValueOnce(new Promise<Response>(() => undefined));
-    await startDiscussionFlow(stopFetchMock);
+    renderHydratedFlow(stopFetchMock);
     await waitFor(() => expect(stopFetchMock).toHaveBeenCalledTimes(2));
     const stop = screen.getByRole("button", { name: "Stop Discussion" });
     expectControlSurface(stop);
     cleanup();
 
-    // Retry surface: a retryable Turn failure.
-    const failed = { ...initialDiscussion, status: "failed" };
+    // Retry surface: a retryable Turn failure on the hydrated page.
+    const failed = {
+      ...initialDiscussion,
+      status: "failed",
+      terminalReason: null,
+    };
     const retryFetchMock = vi
       .fn()
+      .mockResolvedValueOnce(jsonResponse(initialDiscussion))
       .mockResolvedValueOnce(
-        new Response(JSON.stringify(initialDiscussion), { status: 201 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            error: {
-              code: "GENERATION_FAILED",
-              message: "The next Turn could not be generated safely.",
-              action: "Retry this Turn with the same request identity.",
-              retryable: true,
-            },
-          }),
-          { status: 502 },
+        errorResponse(
+          502,
+          "GENERATION_FAILED",
+          "The next Turn could not be generated safely.",
         ),
       )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(failed), { status: 200 }),
-      );
-    await startDiscussionFlow(retryFetchMock);
+      .mockResolvedValueOnce(jsonResponse(failed));
+    renderHydratedFlow(retryFetchMock);
     const retry = await screen.findByRole("button", { name: "Retry Turn" });
     expectControlSurface(retry);
   });
@@ -161,13 +192,13 @@ describe("text zoom and reflow", () => {
   it("keeps long Topics on the reflow surface so they wrap instead of overflowing", async () => {
     const longWord = "Supercalifragilisticexpialidocious".repeat(5);
     const longTopic = `${longWord} Should cities create more public parks?`;
-    const fetchMock = vi.fn().mockResolvedValueOnce(
-      new Response(
-        JSON.stringify({ ...initialDiscussion, topic: longTopic }),
-        { status: 201 },
-      ),
-    );
-    await startDiscussionFlow(fetchMock);
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({ ...initialDiscussion, topic: longTopic }),
+      )
+      .mockReturnValueOnce(new Promise<Response>(() => undefined));
+    renderHydratedFlow(fetchMock);
 
     const heading = await screen.findByRole("heading", {
       name: longTopic,

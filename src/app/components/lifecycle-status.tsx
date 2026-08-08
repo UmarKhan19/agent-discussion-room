@@ -9,6 +9,7 @@ import type { DiscussionErrorFamily } from "@/app/discussion-error";
 export type LifecyclePhase =
   | { kind: "empty" }
   | { kind: "starting" }
+  | { kind: "hydrating" }
   | { kind: "ready" }
   | { kind: "generating"; speaker: Speaker | null }
   | { kind: "stopping" }
@@ -18,6 +19,12 @@ export type LifecyclePhase =
 
 export interface LifecycleOverlay {
   isStarting: boolean;
+  /**
+   * True while an existing Discussion is being hydrated from the
+   * authoritative persisted state; the UI must not show a blank or new
+   * Discussion, and must not start a Turn, before hydration resolves.
+   */
+  isHydrating: boolean;
   isStopping: boolean;
   isGenerating: boolean;
   generatingSpeaker: Speaker | null;
@@ -34,6 +41,7 @@ export function derivePhase(
   discussion: DiscussionState | null,
   overlay: LifecycleOverlay,
 ): LifecyclePhase {
+  if (overlay.isHydrating && !discussion) return { kind: "hydrating" };
   if (overlay.isStarting && !discussion) return { kind: "starting" };
   if (!discussion) return { kind: "empty" };
 
@@ -72,6 +80,8 @@ export function lifecycleStatusCopy(phase: LifecyclePhase): string {
       return "No active Discussion. Enter a Topic and choose Start Discussion.";
     case "starting":
       return "Starting Discussion…";
+    case "hydrating":
+      return "Loading Discussion…";
     case "ready":
       return "Ready for the next Turn.";
     case "generating":

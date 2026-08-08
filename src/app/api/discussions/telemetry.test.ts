@@ -42,6 +42,30 @@ function messageIdFor(turn: number): string {
   return `33333333-3333-4333-8333-${String(turn).padStart(12, "0")}`;
 }
 
+/**
+ * Test Starts predate the required `creationRequestId`; inject a unique one
+ * whenever a body carries a Topic but no identity, leaving malformed bodies
+ * untouched so validation tests keep their intent.
+ */
+let startRequestSequence = 0;
+function testCreationRequestId(): string {
+  startRequestSequence += 1;
+  return `aaaaaaaa-aaaa-4aaa-8aaa-${String(startRequestSequence).padStart(12, "0")}`;
+}
+
+function withDefaultCreationRequestId(body: unknown): unknown {
+  if (
+    typeof body === "object" &&
+    body !== null &&
+    !Array.isArray(body) &&
+    "topic" in body &&
+    !("creationRequestId" in body)
+  ) {
+    return { ...(body as Record<string, unknown>), creationRequestId: testCreationRequestId() };
+  }
+  return body;
+}
+
 function jsonRequest(
   body: unknown,
   cookie?: string,
@@ -54,7 +78,7 @@ function jsonRequest(
       "Content-Type": "application/json",
       ...(cookie ? { Cookie: cookie } : {}),
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(withDefaultCreationRequestId(body)),
     signal,
   });
 }

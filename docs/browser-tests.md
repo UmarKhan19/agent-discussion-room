@@ -53,6 +53,18 @@ serve two different scripts concurrently.
   Transcript, state, or request-identity leakage; session isolation (a
   second browser context cannot read, advance, or stop another session's
   Discussion).
+- **Addressability** (`e2e/addressability.spec.ts`): reload of a completed
+  Discussion restores the exact persisted state with no duplicated Turns
+  and no re-claiming; reload of a stopped Discussion renders as-is with
+  zero Messages; direct navigation to the canonical URL (`/discussions/:id`)
+  hydrates from the server; a second anonymous session opening the same URL
+  sees the “Discussion unavailable” card (the URL is an address, never a
+  credential); a Start whose commit succeeded but whose response was lost
+  (server committed, response dropped) is recovered on reload with the same
+  creation identity and navigates to the original Discussion identifier;
+  reload during generation aborts the client fetch, the server
+  persists a `stopped`/`disconnect` state, and the reloaded page hydrates
+  zero Messages.
 - **Accessibility** (`e2e/accessibility.spec.ts`): full keyboard operation
   with a visible focus indicator in both themes, targeted status and
   announcement regions, semantic ordered Transcript structure, Jump to

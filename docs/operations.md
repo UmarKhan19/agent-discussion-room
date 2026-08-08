@@ -54,6 +54,26 @@ from the runtime variables.
   databases follow the provider's backup contract). There is no historical
   production data import.
 
+### Schema migrations on startup
+
+On startup the durable store brings existing databases up to date
+(`migrateCreationRequestColumn`):
+
+1. A `PRAGMA` check adds the nullable `creation_request_id TEXT` column to
+   `discussion` when it is missing (the duplicate-column race is re-checked
+   and ignored).
+2. A partial unique index `discussion_creation_request` over
+   `(owner_session_id, creation_request_id) WHERE creation_request_id IS
+   NOT NULL` is created **after** the column addition, so legacy databases
+   never hit an index that references a missing column. The index is the
+   database backstop for idempotent Start: one (session, identity) mapping
+   can name only one Discussion row.
+
+Existing rows keep `creation_request_id = NULL` and are never matched by
+replay; only new Starts carry an identity. The migration is additive — no
+existing data is rewritten, and no application changes are required to
+serve an upgraded database.
+
 ## Startup failure conditions
 
 Production startup **fails loudly** with a non-secret problem list (only
@@ -146,7 +166,7 @@ order, cancellation, and retry rules are in
   event per handled HTTP request and a `generation` event per model
   generation. Fields are identifiers, outcome, stable error class,
   retryable flag, latency, model, and usage metadata. The error-class
-  vocabulary is closed (24 product codes + `INTERNAL`); provider failures
+  vocabulary is closed (25 product codes + `INTERNAL`); provider failures
   are observable only through these classifications.
 - **Never recorded, by construction**: Topic, Transcript, Message content,
   prompts, model output, secrets, and session identifiers. The telemetry

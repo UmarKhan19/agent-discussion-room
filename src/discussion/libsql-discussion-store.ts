@@ -15,6 +15,7 @@ import {
 } from "./contracts";
 import type {
   ClaimTurnResult,
+  CreateDiscussionResult,
   DiscussionStore,
   DurableDiscussionStore,
   RequestStatusResult,
@@ -201,7 +202,8 @@ CREATE TABLE IF NOT EXISTS discussion (
   id TEXT PRIMARY KEY,
   owner_session_id TEXT NOT NULL,
   state TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  creation_request_id TEXT
 );
 CREATE INDEX IF NOT EXISTS discussion_owner_session
   ON discussion (owner_session_id);
@@ -410,16 +412,51 @@ export class LibSQLDiscussionStore
   async create(
     ownerSessionId: string,
     discussion: DiscussionState,
-  ): Promise<void> {
+    creationRequestId?: string | null,
+  ): Promise<CreateDiscussionResult> {
     await this.init();
     const owner = SessionIdentifierSchema.parse(ownerSessionId);
     const state = DiscussionStateSchema.parse(discussion);
-    await this.guardStorage(() =>
-      this.client.execute({
+
+    // The write transaction makes the idempotency check-and-insert atomic
+    // against concurrent identical Starts from other instances sharing the
+    // same database: `BEGIN IMMEDIATE` serializes writers, so exactly one
+    // transaction inserts and every later one replays. The partial unique
+    // index (`discussion_creation_request`) is the database-level backstop
+    // that makes the guarantee authoritative rather than process-local.
+    return this.withWriteTransaction(async (tx) => {
+      if (creationRequestId !== undefined && creationRequestId !== null) {
+        const requestId = RequestIdentifierSchema.parse(creationRequestId);
+        const existing = await tx.execute({
+          sql: "SELECT state FROM discussion WHERE owner_session_id = ? AND creation_request_id = ? LIMIT 1",
+          args: [owner, requestId],
+        });
+        const row = existing.rows[0];
+        if (row) {
+          return {
+            kind: "replayed",
+            discussion: parseStateColumn(row.state),
+          };
+        }
+        await tx.execute({
+          sql: "INSERT INTO discussion (id, owner_session_id, creation_request_id, state, updated_at) VALUES (?, ?, ?, ?, ?)",
+          args: [
+            state.id,
+            owner,
+            requestId,
+            JSON.stringify(state),
+            state.updatedAt,
+          ],
+        });
+        return { kind: "created" };
+      }
+
+      await tx.execute({
         sql: "INSERT INTO discussion (id, owner_session_id, state, updated_at) VALUES (?, ?, ?, ?)",
         args: [state.id, owner, JSON.stringify(state), state.updatedAt],
-      }),
-    );
+      });
+      return { kind: "created" };
+    });
   }
 
   async readOwned(
@@ -740,6 +777,7 @@ export class LibSQLDiscussionStore
   private async createSchema(): Promise<void> {
     await this.client.executeMultiple(SCHEMA_SQL);
     await this.migrateRequestLeaseColumns();
+    await this.migrateCreationRequestColumn();
     if (this.client.protocol === "file") {
       try {
         await this.client.execute("PRAGMA journal_mode = WAL");
@@ -748,6 +786,49 @@ export class LibSQLDiscussionStore
         // still correct under the in-process writer queue.
       }
     }
+  }
+
+  /**
+   * Adds the Start-idempotency column to databases created before the
+   * feature existed and creates the partial unique index that makes the
+   * (owner session, creation request identity) mapping authoritative.
+   * `CREATE TABLE IF NOT EXISTS` cannot alter an existing table, so this
+   * checks `PRAGMA table_info` and adds only the missing column; existing
+   * rows keep `NULL` (historical Discussions predate the feature and stay
+   * valid — the partial index excludes them). Both operations are
+   * idempotent and safe to run concurrently from multiple instances: a
+   * lost `ALTER TABLE` race surfaces as a duplicate-column error, which is
+   * re-checked and ignored.
+   */
+  private async migrateCreationRequestColumn(): Promise<void> {
+    const columns = await this.client.execute(
+      "PRAGMA table_info(discussion)",
+    );
+    const names = new Set(columns.rows.map((row) => String(row.name)));
+    if (!names.has("creation_request_id")) {
+      try {
+        await this.client.execute(
+          "ALTER TABLE discussion ADD COLUMN creation_request_id TEXT",
+        );
+      } catch (error) {
+        const recheck = await this.client.execute(
+          "PRAGMA table_info(discussion)",
+        );
+        if (
+          !recheck.rows.some((row) => String(row.name) === "creation_request_id")
+        ) {
+          throw error;
+        }
+      }
+    }
+    // The partial index lives here (after the ALTER) because legacy
+    // databases that predate the column must have it added first; for fresh
+    // databases the column already exists and `IF NOT EXISTS` makes the
+    // create a no-op re-run. Keeping a single creation site also avoids
+    // referencing the column before it exists on legacy databases.
+    await this.client.execute(
+      "CREATE UNIQUE INDEX IF NOT EXISTS discussion_creation_request ON discussion (owner_session_id, creation_request_id) WHERE creation_request_id IS NOT NULL",
+    );
   }
 
   /**

@@ -28,15 +28,16 @@ Supporting terms used throughout:
 | --- | --- |
 | **Session** | An anonymous signed session identified by a UUID. The browser holds an `HttpOnly` cookie containing the UUID and an HMAC-SHA256 signature; every Discussion endpoint requires a valid session and enforces ownership (see [Signed-session ownership](#signed-session-ownership)). |
 | **Request identity (`requestId`)** | A client-supplied UUID that makes next-Turn requests idempotent. Replaying a completed request returns the recorded outcome; retrying a transient failure with the same identity resumes the same Turn. |
+| **Creation request identity (`creationRequestId`)** | A client-supplied UUID that makes the Start operation idempotent. The server persists the `(session, creationRequestId)` mapping with the Discussion it created, so an ambiguous or lost Start response can be retried with the same identity and replays the same Discussion instead of creating an orphan. A reused identity with a different Topic is a conflict (`409 START_REQUEST_CONFLICT`). |
 | **Discussion state** | The validated public shape of a Discussion: `id`, `topic`, `status`, `terminalReason`, `turnLimit`, `turnCount`, `createdAt`, `updatedAt`, `policyOutcome`, `transcript`. Every response is parsed against `DiscussionResponseSchema` before it leaves the server. |
 | **Turn failure** | A stable, closed classification of why a Turn did not complete (`generation_failed` [retryable or not], `invalid_response`, `output_blocked`, `output_limit_exceeded`, `timeout`, `stopped`). Failures are persisted per request identity and surfaced as stable product errors. |
 
 ## System overview
 
 ```
-Participant (browser UI)
-        │  JSON fetch (same origin)
-        ▼
+Participant (browser UI)           canonical URL: /discussions/:id  (create entry: /)
+        │  JSON fetch (same origin)          │
+        ▼                                   ▼
 HTTP interface ──► DiscussionService ──► DiscussionStore (libSQL / in-memory dev)
   POST /api/discussions            │
   POST /api/discussions/:id        ▼
@@ -69,14 +70,14 @@ envelope on failure.
 
 | Operation | Endpoint | Request body | Success | Notable failures |
 | --- | --- | --- | --- | --- |
-| Start a Discussion | `POST /api/discussions` | `{"topic": "<text>"}` | `201` + state (`idle`, empty Transcript) | `400` topic validation family, `422 TOPIC_BLOCKED` (input policy), `413`/`415` transport guards, `429` rate limited |
+| Start a Discussion | `POST /api/discussions` | `{"topic": "<text>", "creationRequestId": "<uuid>"}` | `201` + state (`idle`, empty Transcript); an exact retry with the same identity replays the stored Discussion (`201`, unchanged state) | `400` topic/identity validation family, `409 START_REQUEST_CONFLICT` (same identity, different Topic), `422 TOPIC_BLOCKED` (input policy), `413`/`415` transport guards, `429` rate limited |
 | Request the next Turn | `POST /api/discussions/:id` | `{"requestId": "<uuid>"}` | `200` + state (completed at the Turn limit) | `404` not owned/unknown, `409` `REQUEST_IN_PROGRESS`/`TURN_IN_PROGRESS`/`DISCUSSION_COMPLETED`/`DISCUSSION_STOPPED`/`INVALID_DISCUSSION_STATE`, `422 OUTPUT_BLOCKED`, `429 SESSION_QUOTA_EXCEEDED`, `502` `GENERATION_FAILED`/`OUTPUT_LIMIT_EXCEEDED`/`INVALID_RESPONSE`, `503 GENERATION_CAPACITY_EXCEEDED`, `504 GENERATION_TIMEOUT` |
 | Stop an in-progress generation | `POST /api/discussions/:id/stop` | none (empty body) | `200` + state (`stopped`, `terminalReason: "stop"`) | `404`, `409 INVALID_DISCUSSION_STATE` when nothing is generating |
 | Read a Discussion | `GET /api/discussions/:id` | none | `200` + state | `404` not owned/unknown |
 
 Error envelope: `{"error": {"code", "message", "action", "retryable",
 "category"? (policy blocks), "retryAfterSeconds"? (rate limits)}}`. `code`
-is a stable, closed vocabulary (`ProductErrorCodeSchema`, 24 values);
+is a stable, closed vocabulary (`ProductErrorCodeSchema`, 25 values);
 `action` tells the participant what to change. Provider details, stack
 traces, and internal model information never appear in responses.
 
@@ -118,6 +119,62 @@ constraint violations) continue to surface as their own product codes
 - A stable production secret lets ownership survive restarts; without it,
   every restart invalidates existing sessions (see
   [docs/operations.md](docs/operations.md)).
+
+## Addressable Discussions and hydration
+
+Every Discussion lives at a **canonical browser URL** (`/discussions/:id`)
+that is an *address*, never a credential: the URL names the Discussion, while
+ownership is still the anonymous signed session that started it.
+
+- **Canonical route.** `POST /api/discussions` returns the Discussion id and
+the create page navigates to `/discussions/:id`; `/` is the New Discussion
+entry point. `src/app/discussions/[id]/page.tsx` awaits the route param
+(Next.js 16) and renders the shared `DiscussionRoom` controller in hydrate
+mode (`src/app/discussion-room.tsx`).
+- **Hydration is server-authoritative.** On mount (reload, direct
+navigation, or A→B id change) the controller fetches
+`GET /api/discussions/:id` and renders exactly the persisted state. The
+hydration matrix:
+
+| Persisted status | Hydrated behavior |
+| --- | --- |
+| `idle` | Auto-advance the next Turn from the persisted state (only the client ever sees the auto-advance; the server owns the claim). |
+| `generating` | Observe only: poll `GET` every 2 s until the state resolves. The page never re-claims an in-flight generation with a Turn POST; a Stop or fresh run aborts the poll. The poll cap is derived from the authoritative server bound (`HARD_GENERATION_TIMEOUT_MS` + `RECOVERY_LEASE_GRACE_MS`, 180 polls / 360 s) so the browser never stops observing an attempt the server can still legitimately consider active; hitting the cap renders a stable “still generating, reload” state. |
+| `completed` / `stopped` | Render as-is with the terminal controls; no Turn continuation, no Retry. |
+| `failed`, `terminalReason: null` | Offer Retry **only** when a sessionStorage pending-Turn identity for this Discussion matches (see below); otherwise render failed with a fresh-Discussion action. |
+| `failed`, `terminalReason: "timeout"` | Render the timeout guidance as-is. |
+| `404` / `403` / malformed id | “Discussion unavailable” card with a Start-a-New-Discussion action; the URL alone grants nothing. |
+| transient fetch error | “Could not load” card with Retry Loading (re-runs hydration) and Start a New Discussion. |
+
+- **Never duplicate, never double-claim.** Hydration never appends Turns:
+a terminal Discussion is never advanced again on reload (proven by the
+browser suite), and a reload during generation aborts the client fetch —
+the server’s disconnect guard persists a `stopped`/`disconnect` state with
+zero Messages, which the reloaded page then hydrates.
+
+### The idempotent Start protocol
+
+1. The client mints a UUID (`creationRequestId`) and persists it in
+   `sessionStorage` with the Topic **before** the Start POST.
+2. The server persists the `(owner session, creationRequestId)` mapping in
+   the `discussion` table (partial unique index
+   `discussion_creation_request`) inside the same transaction that inserts
+   the Discussion. `create()` runs SELECT-then-INSERT inside a write
+   transaction (`BEGIN IMMEDIATE`), so concurrent identical Starts serialize
+   and resolve to one Discussion.
+3. An exact retry (same identity, same Topic) **replays the stored
+   Discussion** — `201` with the original state, no second row, no quota
+   double-charge. A reused identity with a different Topic is `409
+   START_REQUEST_CONFLICT` (family `topic`, surfaced to the Topic control).
+4. The identity is durable: the mapping survives process restarts, so a
+   lost Start response retried after a restart still replays instead of
+   orphaning.
+5. The client clears the pending identity when the hydrated Discussion
+   confirms it (topic matches), when a fresh Discussion starts, and on
+   topic-family errors; a different Topic always mints a fresh identity.
+
+Next-Turn idempotency (`requestId`) is unchanged: it remains per-Discussion,
+per-Turn, and independent of the Start identity.
 
 ## Allowed state transitions
 
@@ -246,7 +303,12 @@ The production system of record is a **libSQL** database
 (`DISCUSSION_STORE_URL`), with two tables created at startup:
 
 - `discussion` — `id` (PK), `owner_session_id`, `state` (validated
-  `DiscussionState` JSON), `updated_at`.
+  `DiscussionState` JSON), `updated_at`, `creation_request_id` (nullable
+  Start identity). A partial unique index
+  `discussion_creation_request` over `(owner_session_id,
+  creation_request_id) WHERE creation_request_id IS NOT NULL` is the
+  database backstop for idempotent Start: a second insert with the same
+  (session, identity) cannot occur, so replays return the stored row.
 - `discussion_request` — `discussion_id` + `request_id` (PK), `turn`,
   `attempt_id`, `status` (`generating`/`succeeded`/`failed`), `failure`,
   `lease_owner_id`, `lease_expires_at`. This table is what makes retry,

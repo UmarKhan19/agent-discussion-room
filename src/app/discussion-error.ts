@@ -50,6 +50,10 @@ export function errorFamilyForCode(
     case "GENERATION_FAILED":
     case "INVALID_RESPONSE":
       return retryable ? "retry" : "terminal";
+    case "START_REQUEST_CONFLICT":
+      // The Start identity was already used with a different Topic; the
+      // pending identity is burned and the participant starts fresh.
+      return "topic";
     case "GENERATION_TIMEOUT":
     case "OUTPUT_BLOCKED":
     case "OUTPUT_LIMIT_EXCEEDED":

@@ -52,9 +52,9 @@ function mutableClock(start: Date): {
   };
 }
 
-function idleState(turnLimit = 12): DiscussionState {
+function idleState(turnLimit = 12, id = discussionId): DiscussionState {
   return DiscussionStateSchema.parse({
-    id: discussionId,
+    id,
     topic: "Should cities create more public parks?",
     status: "idle",
     terminalReason: null,
@@ -657,6 +657,120 @@ describe("LibSQLDiscussionStore", () => {
         }),
       ).toEqual({ kind: "not_found" });
       secondStore.close();
+    });
+  });
+
+  describe("Start request idempotency", () => {
+    const creationRequestId = "77777777-7777-4777-8777-777777777777";
+
+    it("replays the original Discussion for an exact (owner, creation request) retry and persists only one row", async () => {
+      const url = storeUrl();
+      const store = createStore(url);
+      await store.init();
+
+      const first = await store.create(
+        ownerSessionId,
+        idleState(),
+        creationRequestId,
+      );
+      expect(first).toEqual({ kind: "created" });
+
+      // The exact retry replays the persisted Discussion — the stored
+      // state is authoritative, not the caller's copy.
+      const replayed = await store.create(
+        ownerSessionId,
+        { ...idleState(), topic: "A different topic" },
+        creationRequestId,
+      );
+      expect(replayed).toEqual({
+        kind: "replayed",
+        discussion: idleState(),
+      });
+
+      // Only one row exists for the identity: a retry never duplicates.
+      const rows = await store["client"].execute({
+        sql: "SELECT COUNT(*) AS count FROM discussion WHERE owner_session_id = ?",
+        args: [ownerSessionId],
+      });
+      expect(Number(rows.rows[0]?.count)).toBe(1);
+      store.close();
+    });
+
+    it("creates a separate Discussion for a different creation request identity in the same session", async () => {
+      const url = storeUrl();
+      const store = createStore(url);
+      await store.init();
+
+      await store.create(ownerSessionId, idleState(), creationRequestId);
+      const second = await store.create(
+        ownerSessionId,
+        { ...idleState(), id: secondRequestId, topic: "A second Topic" },
+        "88888888-8888-4888-8888-888888888888",
+      );
+      expect(second).toEqual({ kind: "created" });
+
+      expect(
+        await store.readOwned(ownerSessionId, secondRequestId),
+      ).toMatchObject({ topic: "A second Topic" });
+      store.close();
+    });
+
+    it("scopes the creation request identity per session", async () => {
+      const url = storeUrl();
+      const store = createStore(url);
+      await store.init();
+
+      await store.create(ownerSessionId, idleState(), creationRequestId);
+      // The same identity in a different session is a different logical
+      // Start and must create a new Discussion, never replay another
+      // session's Discussion.
+      const other = await store.create(
+        otherSessionId,
+        { ...idleState(), id: secondRequestId },
+        creationRequestId,
+      );
+      expect(other).toEqual({ kind: "created" });
+      store.close();
+    });
+
+    it("keeps the replay mapping durable across a restart", async () => {
+      const url = storeUrl();
+      const firstStore = createStore(url);
+      await firstStore.init();
+      await firstStore.create(ownerSessionId, idleState(), creationRequestId);
+      firstStore.close();
+
+      const secondStore = createStore(url);
+      const replayed = await secondStore.create(
+        ownerSessionId,
+        { ...idleState(), topic: "An unrelated Topic" },
+        creationRequestId,
+      );
+      expect(replayed).toEqual({
+        kind: "replayed",
+        discussion: idleState(),
+      });
+      secondStore.close();
+    });
+
+    it("never matches a creation request against legacy rows with a null identity", async () => {
+      const url = storeUrl();
+      const store = createStore(url);
+      await store.init();
+
+      // A legacy-era create (no identity) stays untouched by the unique
+      // index: a later Start with an identity is a fresh logical action.
+      await store.create(ownerSessionId, idleState());
+      const second = await store.create(
+        ownerSessionId,
+        { ...idleState(), id: secondRequestId },
+        creationRequestId,
+      );
+      expect(second).toEqual({ kind: "created" });
+      expect(await store.readOwned(ownerSessionId, discussionId)).toEqual(
+        idleState(),
+      );
+      store.close();
     });
   });
 
@@ -1973,26 +2087,31 @@ CREATE INDEX discussion_request_status ON discussion_request (discussion_id, sta
       const storeB = createStore(url);
       const storeC = createStore(url);
       const results = await Promise.allSettled([storeB.init(), storeC.init()]);
-      // Remote libSQL serializes schema writers server-side; on a local
-      // file one writer can surface the driver's SQLITE_BUSY. Whatever the
-      // outcome, every instance whose initialization completed can operate
-      // on the shared schema.
-      expect(
-        results.some((result) => result.status === "fulfilled"),
-      ).toBe(true);
-      const working = [storeB, storeC].filter(
-        (_store, index) => results[index]?.status === "fulfilled",
-      );
-      const store = working[0]!;
-      await store.create(ownerSessionId, idleState());
-      const claim = await store.claimTurn({
-        ownerSessionId,
-        discussionId,
-        requestId,
-        attemptId,
-        updatedAt: now.toISOString(),
-      });
-      expect(claim.kind).toBe("claimed");
+      // Both instances must complete the migration and operate on the shared
+      // schema. The ALTER race (both instances inspected the old schema and
+      // both attempted the column addition) is resolved by the losing
+      // instance's duplicate-column error, which the migration re-checks and
+      // ignores; the partial unique index creation is a no-op for the loser
+      // under `IF NOT EXISTS`. This assertion is the regression guard: a
+      // migration that could permanently brick one instance of a
+      // multi-instance deployment must fail this test.
+      expect(results).toEqual([
+        { status: "fulfilled", value: undefined },
+        { status: "fulfilled", value: undefined },
+      ]);
+      for (const store of [storeB, storeC]) {
+        const storeId =
+          store === storeB ? discussionId : "99999999-9999-4999-8999-999999999999";
+        await store.create(ownerSessionId, idleState(12, storeId));
+        const claim = await store.claimTurn({
+          ownerSessionId,
+          discussionId: storeId,
+          requestId,
+          attemptId,
+          updatedAt: now.toISOString(),
+        });
+        expect(claim.kind).toBe("claimed");
+      }
       storeB.close();
       storeC.close();
     }, 15_000);

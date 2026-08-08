@@ -174,6 +174,35 @@ describe("Transcript announcements", () => {
     expect(log.textContent).not.toContain("New Turn 2");
   });
 
+  it("hydrates ten historical Turns silently and announces only the single appended Turn", () => {
+    // The exact hydration contract: an existing Discussion with a full
+    // historical Transcript must not announce its past Turns as if they
+    // were newly generated live content, and a single authoritative
+    // append must announce only that one Turn.
+    const historical = Array.from({ length: 10 }, (_, index) =>
+      message(
+        index + 1,
+        (index + 1) % 2 === 1 ? "supporter" : "opponent",
+        `Historical Turn ${index + 1}`,
+      ),
+    );
+    const { rerender } = render(<Transcript messages={historical} />);
+    const log = screen.getByRole("log", {
+      name: "Transcript announcements",
+    });
+    expect(log.textContent).toBe("");
+
+    rerender(
+      <Transcript messages={[...historical, message(11, "supporter", "Newest Turn.")]} />,
+    );
+    expect(log.textContent).toContain("New Turn 11 from the Supporter.");
+    for (let turn = 1; turn <= 10; turn += 1) {
+      // Full announcement format, so "New Turn 1" never matches inside the
+      // "New Turn 11" announcement.
+      expect(log.textContent).not.toContain(`New Turn ${turn} from the`);
+    }
+  });
+
   it("keeps only a bounded tail of announcements so old content is never re-read", () => {
     const { rerender } = render(<Transcript messages={[supporterOne]} />);
     const many = [

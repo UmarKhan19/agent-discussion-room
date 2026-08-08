@@ -63,6 +63,30 @@ function successfulOutcomes(contents: readonly string[]): FakeDiscussionOutcome[
   }));
 }
 
+/**
+ * Test Starts predate the required `creationRequestId`; inject a unique one
+ * whenever a body carries a Topic but no identity, leaving malformed bodies
+ * untouched so validation tests keep their intent.
+ */
+let startRequestSequence = 0;
+function testCreationRequestId(): string {
+  startRequestSequence += 1;
+  return `aaaaaaaa-aaaa-4aaa-8aaa-${String(startRequestSequence).padStart(12, "0")}`;
+}
+
+function withDefaultCreationRequestId(body: unknown): unknown {
+  if (
+    typeof body === "object" &&
+    body !== null &&
+    !Array.isArray(body) &&
+    "topic" in body &&
+    !("creationRequestId" in body)
+  ) {
+    return { ...(body as Record<string, unknown>), creationRequestId: testCreationRequestId() };
+  }
+  return body;
+}
+
 function jsonRequest(
   body: unknown,
   cookie?: string,
@@ -74,7 +98,7 @@ function jsonRequest(
       "Content-Type": "application/json",
       ...(cookie ? { Cookie: cookie } : {}),
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(withDefaultCreationRequestId(body)),
   });
 }
 
@@ -476,6 +500,47 @@ describe("Discussion persistence across restarts", () => {
       discussionId,
     );
     expect(ownerTurn.status).toBe(200);
+    second.store.close();
+  });
+
+  it("keeps the Start idempotency mapping durable across a restart", async () => {
+    const url = databaseUrl();
+    const creationRequestId = "77777777-7777-4777-8777-777777777777";
+    const first = restartHarness(url, []);
+    const created = await first.handlers.post(
+      jsonRequest({ topic: "Should cities create more public parks?", creationRequestId }),
+    );
+    const ownerCookie = cookiePair(created);
+    const firstDiscussion = DiscussionStateSchema.parse(await created.json());
+    first.store.close();
+
+    // After the restart, the exact retry — same identity, same Topic, same
+    // session — replays the persisted Discussion instead of creating an
+    // orphan: the (owner session, creation request) mapping is durable.
+    const second = restartHarness(url, []);
+    const retried = await second.handlers.post(
+      jsonRequest(
+        { topic: "Should cities create more public parks?", creationRequestId },
+        ownerCookie,
+      ),
+    );
+    expect(retried.status).toBe(201);
+    expect(DiscussionStateSchema.parse(await retried.json())).toEqual(
+      firstDiscussion,
+    );
+
+    // A reused identity with a different Topic stays a conflict after the
+    // restart.
+    const conflict = await second.handlers.post(
+      jsonRequest(
+        { topic: "A different permitted Topic", creationRequestId },
+        ownerCookie,
+      ),
+    );
+    expect(conflict.status).toBe(409);
+    expect(
+      ErrorResponseSchema.parse(await conflict.json()).error.code,
+    ).toBe("START_REQUEST_CONFLICT");
     second.store.close();
   });
 

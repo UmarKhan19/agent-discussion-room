@@ -30,6 +30,7 @@ const idleDiscussion: DiscussionState = {
 
 const overlay: LifecycleOverlay = {
   isStarting: false,
+  isHydrating: false,
   isStopping: false,
   isGenerating: false,
   generatingSpeaker: null,

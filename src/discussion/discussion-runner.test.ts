@@ -13,6 +13,7 @@ import {
 import {
   InMemoryDiscussionStore,
   type ClaimTurnResult,
+  type CreateDiscussionResult,
   type DiscussionStore,
   type RequestStatusResult,
   type StopTurnResult,
@@ -110,7 +111,9 @@ class StaleHintStore implements DiscussionStore {
     failure: TurnFailure;
   }> = [];
 
-  async create(): Promise<void> {}
+  async create(): Promise<CreateDiscussionResult> {
+    return { kind: "created" };
+  }
 
   async readOwned(): Promise<DiscussionState | null> {
     return null;

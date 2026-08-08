@@ -1,17 +1,46 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { StrictMode } from "react";
 import { NextTurnRequestSchema } from "@/discussion/contracts";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import DiscussionRoom from "./discussion-room";
 import Home from "./page";
 
+const { pushMock, stableRouter, pathnameRef } = vi.hoisted(() => {
+  const pushMock = vi.fn();
+  return {
+    pushMock,
+    // useRouter must return a stable object identity: the create-mode mount
+    // effect depends on `router`, and a fresh object per render would re-run
+    // it (and auto-retry the persisted pending Start identity) after every
+    // render.
+    stableRouter: { push: pushMock },
+    pathnameRef: { current: "/" },
+  };
+});
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => stableRouter,
+  usePathname: () => pathnameRef.current,
+}));
+
 const topic = "Should cities create more public parks?";
+const discussionId = "11111111-1111-4111-8111-111111111111";
 const requestId = "22222222-2222-4222-8222-222222222222";
+const secondRequestId = "44444444-4444-4444-8444-444444444444";
 const messageContent =
   "Public parks give more residents access to shared green space.";
 const initialDiscussion = {
-  id: "11111111-1111-4111-8111-111111111111",
+  id: discussionId,
   topic,
   status: "idle",
   terminalReason: null,
@@ -53,57 +82,322 @@ const discussionWithFirstTurn = {
   ],
 };
 
+const PENDING_START_KEY = "agent-discussion-room:pending-start";
+const PENDING_TURN_KEY = "agent-discussion-room:pending-turn";
+const FOCUS_TOPIC_ON_CREATE_KEY = "agent-discussion-room:focus-topic-on-create";
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function errorResponse(
+  status: number,
+  code: string,
+  message: string,
+  extra: Record<string, unknown> = {},
+  action = `Action for ${code}.`,
+): Response {
+  return jsonResponse(
+    {
+      error: {
+        code,
+        message,
+        action,
+        retryable: true,
+        ...extra,
+      },
+    },
+    status,
+  );
+}
+
+function seedPendingStart(override: Record<string, string> = {}): void {
+  window.sessionStorage.setItem(
+    PENDING_START_KEY,
+    JSON.stringify({ requestId, topic, ...override }),
+  );
+}
+
+function seedPendingTurn(override: Record<string, string> = {}): void {
+  window.sessionStorage.setItem(
+    PENDING_TURN_KEY,
+    JSON.stringify({ discussionId, requestId, ...override }),
+  );
+}
+
+function storedPendingStart(): { requestId: string; topic: string } | null {
+  const raw = window.sessionStorage.getItem(PENDING_START_KEY);
+  return raw ? (JSON.parse(raw) as { requestId: string; topic: string }) : null;
+}
+
+function renderHome(): ReturnType<typeof render> {
+  return render(<Home />);
+}
+
+function renderHydrated(
+  id: string = discussionId,
+): ReturnType<typeof render> {
+  pathnameRef.current = `/discussions/${id}`;
+  return render(<DiscussionRoom discussionId={id} />);
+}
+
+function postedBody(call: unknown[]): unknown {
+  return JSON.parse(String((call[1] as { body: string } | undefined)?.body));
+}
+
+function turnPosts(fetchMock: ReturnType<typeof vi.fn>): unknown[][] {
+  return fetchMock.mock.calls.filter(
+    (call) =>
+      call[0] === `/api/discussions/${discussionId}` &&
+      (call[1] as RequestInit | undefined)?.method === "POST",
+  );
+}
+
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
+  window.sessionStorage.clear();
+  pushMock.mockReset();
+  pathnameRef.current = "/";
 });
 
-describe("participant-visible Discussion start", () => {
+describe("create page", () => {
   it("waits for an explicit action, then shows Topic, empty state, and progress", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(initialDiscussion), {
-          status: 201,
-          headers: { "Content-Type": "application/json" },
-        }),
-      )
-      .mockReturnValueOnce(new Promise<Response>(() => undefined));
+    const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
-    vi.stubGlobal("crypto", { randomUUID: () => requestId });
+    renderHome();
     const user = userEvent.setup();
-
-    render(<Home />);
-
+    expect(
+      screen.getByRole("heading", { name: "Agent Discussion Room" }),
+    ).toBeTruthy();
+    expect(screen.getByRole("status").textContent).toContain(
+      "No active Discussion",
+    );
+    expect(screen.getByRole("button", { name: "Start Discussion" })).toBeTruthy();
     const topicControl = screen.getByRole("textbox", {
       name: "Discussion Topic",
     });
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(screen.getByText(/No active Discussion/)).toBeTruthy();
-
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(screen.getByRole("alert").textContent).toContain(
-      "Enter a Discussion Topic",
-    );
-
     await user.type(topicControl, topic);
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
-      topic,
-    });
-    expect(
-      await screen.findByRole("heading", { name: topic, level: 2 }),
-    ).toBeTruthy();
-    expect(screen.getByLabelText("Turn progress").textContent).toContain(
-      "0 / 12",
-    );
-    expect(screen.getByText("No Turns yet. The Transcript is empty.")).toBeTruthy();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("advances one authorized request at a time with visible progress to completion", async () => {
+  it("Starts a Discussion, posts the creation request identity, and navigates to its canonical URL without advancing the create page", async () => {
+    vi.stubGlobal("crypto", { randomUUID: vi.fn().mockReturnValue(requestId) });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(initialDiscussion, 201))
+      .mockReturnValueOnce(new Promise<Response>(() => undefined));
+    vi.stubGlobal("fetch", fetchMock);
+    renderHome();
+    const user = userEvent.setup();
+    await user.type(
+      screen.getByRole("textbox", { name: "Discussion Topic" }),
+      topic,
+    );
+    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(postedBody(fetchMock.mock.calls[0])).toEqual({
+      topic,
+      creationRequestId: requestId,
+    });
+    await waitFor(() =>
+      expect(pushMock).toHaveBeenCalledWith(`/discussions/${discussionId}`),
+    );
+    // The create page never advances: the Topic stays editable and no
+    // Discussion heading appears here.
+    expect(screen.getByRole("textbox", { name: "Discussion Topic" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: topic, level: 2 })).toBeNull();
+    // The pending identity survives navigation so an ambiguous Start
+    // response stays replay-safe on the hydrated page.
+    expect(storedPendingStart()).toEqual({ requestId, topic });
+  });
+
+  it("reuses a pending Start identity for the same Topic and mints a new one for a different Topic", async () => {
+    vi.stubGlobal("crypto", { randomUUID: vi.fn().mockReturnValue(requestId) });
+    const fetchMock = vi
+      .fn()
+      .mockImplementation(async () => jsonResponse(initialDiscussion, 201));
+    vi.stubGlobal("fetch", fetchMock);
+    renderHome();
+    const user = userEvent.setup();
+    const input = screen.getByRole("textbox", { name: "Discussion Topic" });
+    await user.type(input, topic);
+    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+    await waitFor(() => expect(pushMock).toHaveBeenCalledTimes(1));
+    expect(storedPendingStart()).toEqual({ requestId, topic });
+
+    // Same Topic again → the same identity, so the server replays the
+    // original Discussion instead of creating an orphan.
+    await waitFor(() =>
+      expect(
+        (screen.getByRole("button", { name: "Start Discussion" }) as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+    await waitFor(() => expect(pushMock).toHaveBeenCalledTimes(2));
+    expect(postedBody(fetchMock.mock.calls[1])).toEqual({
+      topic,
+      creationRequestId: requestId,
+    });
+
+    // A different Topic is a genuinely new Start: mint a fresh identity.
+    vi.stubGlobal("crypto", { randomUUID: vi.fn().mockReturnValue(secondRequestId) });
+    await user.clear(input);
+    await user.type(input, "A different permitted Topic");
+    await waitFor(() =>
+      expect(
+        (screen.getByRole("button", { name: "Start Discussion" }) as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+    await waitFor(() => expect(pushMock).toHaveBeenCalledTimes(3));
+    expect(postedBody(fetchMock.mock.calls[2])).toEqual({
+      topic: "A different permitted Topic",
+      creationRequestId: secondRequestId,
+    });
+  });
+
+  it("auto-retries a pending Start on mount after a lost response", async () => {
+    vi.stubGlobal("crypto", { randomUUID: vi.fn().mockReturnValue(requestId) });
+    let resolveStart!: (value: Response) => void;
+    const fetchMock = vi.fn().mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveStart = resolve;
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    seedPendingStart();
+
+    renderHome();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(postedBody(fetchMock.mock.calls[0])).toEqual({
+      topic,
+      creationRequestId: requestId,
+    });
+    expect(screen.getByRole("status").textContent).toContain(
+      "Starting Discussion…",
+    );
+
+    await act(async () => {
+      resolveStart(jsonResponse(initialDiscussion, 201));
+    });
+    await waitFor(() =>
+      expect(pushMock).toHaveBeenCalledWith(`/discussions/${discussionId}`),
+    );
+  });
+
+  it("auto-retries a pending Start on mount under a StrictMode double-invocation", async () => {
+    // Next.js dev wraps the app in StrictMode, which runs mount effects
+    // twice (mount, cleanup, mount). The cleanup of the first invocation
+    // cancels its in-flight retry and must release the start guard so the
+    // second invocation can complete the recovery; without that, the
+    // ambiguous-Start recovery is silently stranded with no navigation and
+    // no error.
+    vi.stubGlobal("crypto", { randomUUID: vi.fn().mockReturnValue(requestId) });
+    const fetchMock = vi
+      .fn()
+      .mockImplementation(async () => jsonResponse(initialDiscussion, 201));
+    vi.stubGlobal("fetch", fetchMock);
+    seedPendingStart();
+
+    render(
+      <StrictMode>
+        <Home />
+      </StrictMode>,
+    );
+    // The double invocation may retry twice; both posts carry the same
+    // creation identity, so both replay the same Discussion.
+    await waitFor(() => expect(pushMock).toHaveBeenCalledTimes(1));
+    const posts = fetchMock.mock.calls.filter(
+      (call) => call[0] === "/api/discussions",
+    );
+    expect(posts.length).toBeGreaterThanOrEqual(1);
+    for (const call of posts) {
+      expect(postedBody(call)).toEqual({ topic, creationRequestId: requestId });
+    }
+    await waitFor(() =>
+      expect(pushMock).toHaveBeenCalledWith(`/discussions/${discussionId}`),
+    );
+  });
+
+  it("burns the pending identity and focuses the Topic control on a topic-family error", async () => {
+    vi.stubGlobal("crypto", { randomUUID: vi.fn().mockReturnValue(requestId) });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        errorResponse(422, "TOPIC_BLOCKED", "This Topic is blocked.", {
+          retryable: false,
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    seedPendingStart();
+
+    renderHome();
+    // The seeded pending Start is auto-retried on mount; the server's
+    // topic-family rejection burns the identity and focuses the control.
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const input = screen.getByRole("textbox", { name: "Discussion Topic" });
+    expect(await screen.findByRole("alert")).toBeTruthy();
+    expect(screen.getByRole("alert").textContent).toContain(
+      "This Topic is blocked.",
+    );
+    expect(document.activeElement).toBe(input);
+    expect(input.getAttribute("aria-invalid")).toBe("true");
+    expect(screen.getByText(/No active Discussion/)).toBeTruthy();
+    expect(pushMock).not.toHaveBeenCalled();
+    expect(storedPendingStart()).toBeNull();
+  });
+
+  it("rejects a Topic longer than the client maximum before making a request", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    renderHome();
+    const user = userEvent.setup();
+    const topicControl = screen.getByRole("textbox", {
+      name: "Discussion Topic",
+    });
+    await user.type(topicControl, "x".repeat(241));
+    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert").textContent).toContain(
+      "240 characters or fewer",
+    );
+  });
+
+  it("prevents duplicate Start submissions from rapid double-clicks", async () => {
+    vi.stubGlobal("crypto", { randomUUID: vi.fn().mockReturnValue(requestId) });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(initialDiscussion, 201))
+      .mockReturnValueOnce(new Promise<Response>(() => undefined));
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderHome();
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "Discussion Topic" }),
+      topic,
+    );
+    const start = screen.getByRole("button", { name: "Start Discussion" });
+    fireEvent.click(start);
+    fireEvent.click(start);
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter((call) => call[0] === "/api/discussions")
+          .length,
+      ).toBe(1),
+    );
+  });
+});
+
+describe("hydrated Discussion page", () => {
+  it("hydrates the persisted state and advances one authorized request at a time with visible progress to completion", async () => {
     const firstRequestId = requestId;
     const secondRequestId = "44444444-4444-4444-8444-444444444444";
     const boundedInitial = { ...initialDiscussion, turnLimit: 2 };
@@ -134,9 +428,7 @@ describe("participant-visible Discussion start", () => {
     let resolveSecondTurn: ((response: Response) => void) | undefined;
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(boundedInitial), { status: 201 }),
-      )
+      .mockResolvedValueOnce(jsonResponse(boundedInitial))
       .mockReturnValueOnce(
         new Promise<Response>((resolve) => {
           resolveFirstTurn = resolve;
@@ -150,23 +442,19 @@ describe("participant-visible Discussion start", () => {
     const generatedIds = [firstRequestId, secondRequestId];
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("crypto", { randomUUID: () => generatedIds.shift() });
-    const user = userEvent.setup();
-
-    render(<Home />);
-    await user.type(
-      screen.getByRole("textbox", { name: "Discussion Topic" }),
-      topic,
-    );
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+    renderHydrated();
+    expect(await screen.findByRole("heading", { name: topic, level: 2 })).toBeTruthy();
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      `/api/discussions/${discussionId}`,
+    );
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ method: "GET" });
     expect(screen.getByRole("status").textContent).toContain(
       "Generating Supporter Turn",
     );
-    expect(fetchMock).toHaveBeenCalledTimes(2);
 
-    resolveFirstTurn?.(new Response(JSON.stringify(firstTurn), { status: 200 }));
-
+    resolveFirstTurn?.(jsonResponse(firstTurn));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
     expect(screen.getByLabelText("Turn progress").textContent).toContain("1 / 2");
     expect(screen.getByRole("status").textContent).toContain(
@@ -174,13 +462,12 @@ describe("participant-visible Discussion start", () => {
     );
     expect(screen.getByText(messageContent)).toBeTruthy();
 
-    resolveSecondTurn?.(new Response(JSON.stringify(completed), { status: 200 }));
-
+    resolveSecondTurn?.(jsonResponse(completed));
     expect(await screen.findByText("Discussion completed.")).toBeTruthy();
     expect(screen.getByLabelText("Turn progress").textContent).toContain("2 / 2");
     expect(screen.queryByText(/Generating .* Turn/)).toBeNull();
-    expect(fetchMock.mock.calls.slice(1).map((call) =>
-      NextTurnRequestSchema.parse(JSON.parse(String(call[1]?.body))).requestId,
+    expect(turnPosts(fetchMock).map((call) =>
+      NextTurnRequestSchema.parse(postedBody(call)).requestId,
     )).toEqual([firstRequestId, secondRequestId]);
   });
 
@@ -192,8 +479,6 @@ describe("participant-visible Discussion start", () => {
       ...discussionWithFirstTurn,
       turnLimit: 2,
     };
-    const opponentContent =
-      "Dense development can leave more land available for parks.";
     const completed = {
       ...firstTurn,
       status: "completed",
@@ -203,7 +488,7 @@ describe("participant-visible Discussion start", () => {
         {
           ...firstTurn.transcript[0],
           id: "55555555-5555-4555-8555-555555555555",
-          content: opponentContent,
+          content: "Dense development can leave more land available for parks.",
           speaker: "opponent",
           turn: 2,
           generation: {
@@ -217,9 +502,7 @@ describe("participant-visible Discussion start", () => {
     let resolveSecondTurn: ((response: Response) => void) | undefined;
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(boundedInitial), { status: 201 }),
-      )
+      .mockResolvedValueOnce(jsonResponse(boundedInitial))
       .mockReturnValueOnce(
         new Promise<Response>((resolve) => {
           resolveFirstTurn = resolve;
@@ -233,41 +516,26 @@ describe("participant-visible Discussion start", () => {
     const generatedIds = [firstRequestId, secondRequestId];
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("crypto", { randomUUID: () => generatedIds.shift() });
-    const user = userEvent.setup();
-
-    render(<Home />);
-    await user.type(
-      screen.getByRole("textbox", { name: "Discussion Topic" }),
-      topic,
-    );
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
+    renderHydrated();
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    expect(screen.getByRole("log").textContent).toBe("");
-
-    resolveFirstTurn?.(new Response(JSON.stringify(firstTurn), { status: 200 }));
-
-    await waitFor(() =>
-      expect(screen.getByRole("log").textContent).toContain(
-        "New Turn 1 from the Supporter.",
-      ),
-    );
-    expect(screen.getByRole("log").textContent).not.toContain(
-      "New Turn 2 from the Opponent.",
-    );
-    expect(screen.getByRole("log").textContent).not.toContain(messageContent);
-
-    resolveSecondTurn?.(new Response(JSON.stringify(completed), { status: 200 }));
-
+    resolveFirstTurn?.(jsonResponse(firstTurn));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    resolveSecondTurn?.(jsonResponse(completed));
     expect(await screen.findByText("Discussion completed.")).toBeTruthy();
+
+    const announce = screen.getByLabelText("Transcript announcements");
+    expect(announce.textContent).toContain("New Turn 1");
     await waitFor(() =>
-      expect(screen.getByRole("log").textContent).toContain(
-        "New Turn 2 from the Opponent.",
-      ),
+      expect(announce.textContent).toContain("New Turn 2"),
     );
-    const log = screen.getByRole("log");
-    expect(log.textContent).toContain("New Turn 1 from the Supporter.");
-    expect(log.textContent).not.toContain(messageContent);
-    expect(log.textContent).not.toContain(opponentContent);
+    expect(announce.textContent).not.toContain("New Turn 3");
+    expect(
+      announce.textContent.match(/New Turn 1/g) ?? [],
+    ).toHaveLength(1);
+    expect(
+      announce.textContent.match(/New Turn 2/g) ?? [],
+    ).toHaveLength(1);
+    expect(screen.getByText(messageContent)).toBeTruthy();
   });
 
   it("retries a retryable server failure with the same logical request identity", async () => {
@@ -284,41 +552,23 @@ describe("participant-visible Discussion start", () => {
     };
     const fetchMock = vi
       .fn()
+      .mockResolvedValueOnce(jsonResponse(boundedInitial))
       .mockResolvedValueOnce(
-        new Response(JSON.stringify(boundedInitial), { status: 201 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            error: {
-              code: "GENERATION_FAILED",
-              message: "The next Turn could not be generated safely.",
-              action: "Retry this Turn with the same request identity.",
-              retryable: true,
-            },
-          }),
-          { status: 502 },
+        errorResponse(
+          502,
+          "GENERATION_FAILED",
+          "The next Turn could not be generated safely.",
+          {},
+          "Retry this Turn with the same request identity.",
         ),
       )
-      .mockResolvedValueOnce(
-        // Authoritative refresh after the persisted failure.
-        new Response(JSON.stringify(failed), { status: 200 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(completed), { status: 200 }),
-      );
+      .mockResolvedValueOnce(jsonResponse(failed))
+      .mockResolvedValueOnce(jsonResponse(completed));
     const randomUUID = vi.fn(() => requestId);
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("crypto", { randomUUID });
+    renderHydrated();
     const user = userEvent.setup();
-
-    render(<Home />);
-    await user.type(
-      screen.getByRole("textbox", { name: "Discussion Topic" }),
-      topic,
-    );
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-
     const retry = await screen.findByRole("button", { name: "Retry Turn" });
     expect(screen.getByRole("alert").textContent).toContain(
       "Retry this Turn with the same request identity.",
@@ -327,24 +577,18 @@ describe("participant-visible Discussion start", () => {
       "Discussion failed.",
     );
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
-      "/api/discussions",
-      `/api/discussions/${initialDiscussion.id}`,
-      `/api/discussions/${initialDiscussion.id}`,
+      `/api/discussions/${discussionId}`,
+      `/api/discussions/${discussionId}`,
+      `/api/discussions/${discussionId}`,
     ]);
     expect(fetchMock.mock.calls[2]?.[1]).toMatchObject({ method: "GET" });
     await user.click(retry);
 
     expect(await screen.findByText("Discussion completed.")).toBeTruthy();
     expect(randomUUID).toHaveBeenCalledTimes(1);
-    expect(
-      fetchMock.mock.calls
-        .slice(1)
-        .filter((call) => call[1]?.method === "POST")
-        .map((call) =>
-          NextTurnRequestSchema.parse(JSON.parse(String(call[1]?.body)))
-            .requestId,
-        ),
-    ).toEqual([requestId, requestId]);
+    expect(turnPosts(fetchMock).map((call) =>
+      NextTurnRequestSchema.parse(postedBody(call)).requestId,
+    )).toEqual([requestId, requestId]);
   });
 
   it("retries an ambiguous network failure with the same logical request identity", async () => {
@@ -356,25 +600,14 @@ describe("participant-visible Discussion start", () => {
     };
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(boundedInitial), { status: 201 }),
-      )
+      .mockResolvedValueOnce(jsonResponse(boundedInitial))
       .mockRejectedValueOnce(new Error("connection reset after commit status unknown"))
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(completed), { status: 200 }),
-      );
+      .mockResolvedValueOnce(jsonResponse(completed));
     const randomUUID = vi.fn(() => requestId);
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("crypto", { randomUUID });
+    renderHydrated();
     const user = userEvent.setup();
-
-    render(<Home />);
-    await user.type(
-      screen.getByRole("textbox", { name: "Discussion Topic" }),
-      topic,
-    );
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-
     const retry = await screen.findByRole("button", { name: "Retry Turn" });
     expect(screen.getByRole("alert").textContent).toContain(
       "Check your connection and try again.",
@@ -383,799 +616,9 @@ describe("participant-visible Discussion start", () => {
 
     expect(await screen.findByText("Discussion completed.")).toBeTruthy();
     expect(randomUUID).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls.slice(1).map((call) =>
-      NextTurnRequestSchema.parse(JSON.parse(String(call[1]?.body))).requestId,
+    expect(turnPosts(fetchMock).map((call) =>
+      NextTurnRequestSchema.parse(postedBody(call)).requestId,
     )).toEqual([requestId, requestId]);
-  });
-
-  it("starts a fresh Discussion without reusing prior lifecycle state", async () => {
-    const secondTopic = "Should libraries stay open later?";
-    const secondDiscussionId = "66666666-6666-4666-8666-666666666666";
-    const requestIds = [
-      requestId,
-      "77777777-7777-4777-8777-777777777777",
-    ];
-    const firstInitial = { ...initialDiscussion, turnLimit: 1 };
-    const firstCompleted = {
-      ...discussionWithFirstTurn,
-      status: "completed",
-      turnLimit: 1,
-    };
-    const secondInitial = {
-      ...initialDiscussion,
-      id: secondDiscussionId,
-      topic: secondTopic,
-      turnLimit: 1,
-    };
-    const secondContent = "Later hours improve access for working residents.";
-    const secondCompleted = {
-      ...secondInitial,
-      status: "completed",
-      turnCount: 1,
-      transcript: [
-        {
-          ...discussionWithFirstTurn.transcript[0],
-          id: "88888888-8888-4888-8888-888888888888",
-          content: secondContent,
-          generation: {
-            ...discussionWithFirstTurn.transcript[0].generation,
-            requestId: requestIds[1],
-          },
-        },
-      ],
-    };
-    let resolveSecondTurn: ((response: Response) => void) | undefined;
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify(firstInitial), { status: 201 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify(firstCompleted), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify(secondInitial), { status: 201 }))
-      .mockReturnValueOnce(new Promise<Response>((resolve) => {
-        resolveSecondTurn = resolve;
-      }));
-    let requestIndex = 0;
-    vi.stubGlobal("fetch", fetchMock);
-    vi.stubGlobal("crypto", {
-      randomUUID: () => requestIds[requestIndex++],
-    });
-    const user = userEvent.setup();
-
-    render(<Home />);
-    const topicControl = screen.getByRole("textbox", { name: "Discussion Topic" });
-    await user.type(topicControl, topic);
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-    expect(await screen.findByText("Discussion completed.")).toBeTruthy();
-    expect(screen.getByText(messageContent)).toBeTruthy();
-
-    await user.clear(topicControl);
-    await user.type(topicControl, secondTopic);
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-
-    expect(await screen.findByRole("heading", { name: secondTopic, level: 2 })).toBeTruthy();
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
-    expect(screen.getByLabelText("Turn progress").textContent).toContain("0 / 1");
-    expect(screen.getByText("No Turns yet. The Transcript is empty.")).toBeTruthy();
-    expect(screen.queryByText(messageContent)).toBeNull();
-    expect(screen.queryByText("Discussion completed.")).toBeNull();
-    expect(screen.getByRole("status").textContent).toContain("Generating Supporter Turn");
-    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
-      "/api/discussions",
-      `/api/discussions/${initialDiscussion.id}`,
-      "/api/discussions",
-      `/api/discussions/${secondDiscussionId}`,
-    ]);
-    expect(fetchMock.mock.calls.filter((call) => call[0] !== "/api/discussions").map((call) =>
-      NextTurnRequestSchema.parse(JSON.parse(String(call[1]?.body))).requestId,
-    )).toEqual(requestIds);
-
-    resolveSecondTurn?.(new Response(JSON.stringify(secondCompleted), { status: 200 }));
-    expect(await screen.findByText(secondContent)).toBeTruthy();
-    expect(screen.getByText("Discussion completed.")).toBeTruthy();
-  });
-
-  it("stops active generation, aborts its request, and ignores a late Turn response", async () => {
-    const stoppedDiscussion = {
-      ...initialDiscussion,
-      status: "stopped",
-      terminalReason: "stop",
-    };
-    let resolveLateTurn: ((response: Response) => void) | undefined;
-    let resolveStop: ((response: Response) => void) | undefined;
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(initialDiscussion), { status: 201 }),
-      )
-      .mockReturnValueOnce(
-        new Promise<Response>((resolve) => {
-          resolveLateTurn = resolve;
-        }),
-      )
-      .mockReturnValueOnce(
-        new Promise<Response>((resolve) => {
-          resolveStop = resolve;
-        }),
-      );
-    vi.stubGlobal("fetch", fetchMock);
-    vi.stubGlobal("crypto", { randomUUID: () => requestId });
-    const user = userEvent.setup();
-
-    render(<Home />);
-    await user.type(
-      screen.getByRole("textbox", { name: "Discussion Topic" }),
-      topic,
-    );
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-
-    const stop = screen.getByRole("button", { name: "Stop Discussion" });
-    expect(stop).toBeTruthy();
-    const turnSignal = fetchMock.mock.calls[1]?.[1]?.signal as
-      | AbortSignal
-      | undefined;
-    expect(turnSignal?.aborted).toBe(false);
-
-    await user.click(stop);
-
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
-    expect(fetchMock.mock.calls[2]?.[0]).toBe(
-      `/api/discussions/${initialDiscussion.id}/stop`,
-    );
-    expect(fetchMock.mock.calls[2]?.[1]).toMatchObject({ method: "POST" });
-    expect(turnSignal?.aborted).toBe(false);
-    expect(
-      screen
-        .getByRole("button", { name: "Stop Discussion" })
-        .hasAttribute("disabled"),
-    ).toBe(true);
-    expect(
-      screen
-        .getByRole("button", { name: "Start Discussion" })
-        .hasAttribute("disabled"),
-    ).toBe(true);
-
-    resolveStop?.(
-      new Response(JSON.stringify(stoppedDiscussion), { status: 200 }),
-    );
-
-    expect(await screen.findByText("Discussion stopped.")).toBeTruthy();
-    expect(turnSignal?.aborted).toBe(true);
-    expect(screen.queryByRole("button", { name: "Stop Discussion" })).toBeNull();
-    expect(
-      screen.getByRole("button", { name: "Start Discussion" }).hasAttribute(
-        "disabled",
-      ),
-    ).toBe(false);
-
-    resolveLateTurn?.(
-      new Response(JSON.stringify(discussionWithFirstTurn), { status: 200 }),
-    );
-    await waitFor(() => expect(screen.queryByText(messageContent)).toBeNull());
-    expect(screen.getByLabelText("Turn progress").textContent).toContain(
-      "0 / 12",
-    );
-    expect(screen.getByText("Discussion stopped.")).toBeTruthy();
-  });
-
-  it("keeps generation attached after failed Stop and permits a successful retry", async () => {
-    const stoppedDiscussion = {
-      ...initialDiscussion,
-      status: "stopped",
-      terminalReason: "stop",
-    };
-    let resolveLateTurn: ((response: Response) => void) | undefined;
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(initialDiscussion), { status: 201 }),
-      )
-      .mockReturnValueOnce(
-        new Promise<Response>((resolve) => {
-          resolveLateTurn = resolve;
-        }),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            error: {
-              code: "INVALID_RESPONSE",
-              message: "The Discussion could not be stopped safely.",
-              action: "Read the current Discussion state before trying again.",
-              retryable: true,
-            },
-          }),
-          { status: 500 },
-        ),
-      )
-      .mockResolvedValueOnce(
-        // Authoritative refresh: the generation is still running.
-        new Response(
-          JSON.stringify({ ...initialDiscussion, status: "generating" }),
-          { status: 200 },
-        ),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(stoppedDiscussion), { status: 200 }),
-      );
-    vi.stubGlobal("fetch", fetchMock);
-    vi.stubGlobal("crypto", { randomUUID: () => requestId });
-    const user = userEvent.setup();
-
-    render(<Home />);
-    await user.type(
-      screen.getByRole("textbox", { name: "Discussion Topic" }),
-      topic,
-    );
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    const turnSignal = fetchMock.mock.calls[1]?.[1]?.signal as
-      | AbortSignal
-      | undefined;
-
-    await user.click(screen.getByRole("button", { name: "Stop Discussion" }));
-
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
-    expect(screen.getByRole("alert").textContent).toContain(
-      "The Discussion could not be stopped safely. Read the current Discussion state before trying again.",
-    );
-    expect(turnSignal?.aborted).toBe(false);
-    expect(fetchMock.mock.calls[3]?.[0]).toBe(
-      `/api/discussions/${initialDiscussion.id}`,
-    );
-    expect(fetchMock.mock.calls[3]?.[1]).toMatchObject({ method: "GET" });
-    const retryStop = screen.getByRole("button", { name: "Stop Discussion" });
-    expect(retryStop.hasAttribute("disabled")).toBe(false);
-
-    await user.click(retryStop);
-
-    expect(await screen.findByText("Discussion stopped.")).toBeTruthy();
-    expect(turnSignal?.aborted).toBe(true);
-    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
-      "/api/discussions",
-      `/api/discussions/${initialDiscussion.id}`,
-      `/api/discussions/${initialDiscussion.id}/stop`,
-      `/api/discussions/${initialDiscussion.id}`,
-      `/api/discussions/${initialDiscussion.id}/stop`,
-    ]);
-    expect(fetchMock.mock.calls[3]?.[1]).toMatchObject({ method: "GET" });
-    expect(screen.getByRole("alert").textContent).toBe("");
-
-    resolveLateTurn?.(
-      new Response(JSON.stringify(discussionWithFirstTurn), { status: 200 }),
-    );
-    await waitFor(() => expect(screen.queryByText(messageContent)).toBeNull());
-    expect(screen.getByText("Discussion stopped.")).toBeTruthy();
-  });
-
-  it("keeps Stop functional when the authoritative refresh reports a server-generating Discussion", async () => {
-    const stoppedDiscussion = {
-      ...initialDiscussion,
-      status: "stopped",
-      terminalReason: "stop",
-    };
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(initialDiscussion), { status: 201 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            error: {
-              code: "GENERATION_FAILED",
-              message: "The next Turn could not be generated safely.",
-              action: "Retry this Turn with the same request identity.",
-              retryable: true,
-            },
-          }),
-          { status: 502 },
-        ),
-      )
-      .mockResolvedValueOnce(
-        // The authoritative state says the server is still generating.
-        new Response(
-          JSON.stringify({ ...initialDiscussion, status: "generating" }),
-          { status: 200 },
-        ),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(stoppedDiscussion), { status: 200 }),
-      );
-    vi.stubGlobal("fetch", fetchMock);
-    vi.stubGlobal("crypto", { randomUUID: () => requestId });
-    const user = userEvent.setup();
-
-    render(<Home />);
-    await user.type(
-      screen.getByRole("textbox", { name: "Discussion Topic" }),
-      topic,
-    );
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-
-    const stop = await screen.findByRole("button", { name: "Stop Discussion" });
-    expect(screen.getByRole("status").textContent).toContain(
-      "Generating the next Turn",
-    );
-    await user.click(stop);
-
-    expect(await screen.findByText("Discussion stopped.")).toBeTruthy();
-    expect(
-      fetchMock.mock.calls.some(
-        (call) => call[0] === `/api/discussions/${initialDiscussion.id}/stop`,
-      ),
-    ).toBe(true);
-  });
-
-  it("refreshes authoritative timeout state and starts fresh without stale state", async () => {
-    const timedOutDiscussion = {
-      ...initialDiscussion,
-      status: "failed",
-      terminalReason: "timeout",
-    };
-    const secondTopic = "Should libraries stay open later?";
-    const secondInitial = {
-      ...initialDiscussion,
-      id: "66666666-6666-4666-8666-666666666666",
-      topic: secondTopic,
-    };
-    const generatedIds = [
-      requestId,
-      "77777777-7777-4777-8777-777777777777",
-    ];
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(initialDiscussion), { status: 201 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            error: {
-              code: "GENERATION_TIMEOUT",
-              message: "The next Turn reached the server generation timeout.",
-              action: "Start a new Discussion and try again later.",
-              retryable: false,
-            },
-          }),
-          { status: 504 },
-        ),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(timedOutDiscussion), { status: 200 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(secondInitial), { status: 201 }),
-      )
-      .mockReturnValueOnce(new Promise<Response>(() => undefined));
-    vi.stubGlobal("fetch", fetchMock);
-    vi.stubGlobal("crypto", {
-      randomUUID: () => generatedIds.shift(),
-    });
-    const user = userEvent.setup();
-
-    render(<Home />);
-    const topicControl = screen.getByRole("textbox", {
-      name: "Discussion Topic",
-    });
-    await user.type(topicControl, topic);
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-
-    expect(await screen.findByText("Discussion timed out.")).toBeTruthy();
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
-    expect(fetchMock.mock.calls.slice(0, 3).map((call) => call[0])).toEqual([
-      "/api/discussions",
-      `/api/discussions/${initialDiscussion.id}`,
-      `/api/discussions/${initialDiscussion.id}`,
-    ]);
-    expect(fetchMock.mock.calls[2]?.[1]).toMatchObject({ method: "GET" });
-    expect(screen.getByRole("alert").textContent).toContain(
-      "The next Turn reached the server generation timeout. Start a new Discussion and try again later.",
-    );
-    expect(screen.queryByRole("button", { name: "Stop Discussion" })).toBeNull();
-    expect(
-      screen.getByRole("button", { name: "Start Discussion" }).hasAttribute(
-        "disabled",
-      ),
-    ).toBe(false);
-
-    await user.clear(topicControl);
-    await user.type(topicControl, secondTopic);
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-
-    expect(
-      await screen.findByRole("heading", { name: secondTopic, level: 2 }),
-    ).toBeTruthy();
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
-    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
-      "/api/discussions",
-      `/api/discussions/${initialDiscussion.id}`,
-      `/api/discussions/${initialDiscussion.id}`,
-      "/api/discussions",
-      `/api/discussions/${secondInitial.id}`,
-    ]);
-    expect(screen.queryByText("Discussion timed out.")).toBeNull();
-    expect(screen.getByLabelText("Turn progress").textContent).toContain(
-      "0 / 12",
-    );
-    expect(screen.getByText("No Turns yet. The Transcript is empty.")).toBeTruthy();
-  });
-
-  it("preserves timeout guidance when authoritative refresh fails", async () => {
-    const secondTopic = "Should libraries stay open later?";
-    const secondInitial = {
-      ...initialDiscussion,
-      id: "99999999-9999-4999-8999-999999999999",
-      topic: secondTopic,
-    };
-    const generatedIds = [
-      requestId,
-      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-    ];
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(initialDiscussion), { status: 201 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            error: {
-              code: "GENERATION_TIMEOUT",
-              message: "The next Turn reached the server generation timeout.",
-              action: "Start a new Discussion and try again later.",
-              retryable: false,
-            },
-          }),
-          { status: 504 },
-        ),
-      )
-      .mockResolvedValueOnce(new Response(null, { status: 500 }))
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(secondInitial), { status: 201 }),
-      )
-      .mockReturnValueOnce(new Promise<Response>(() => undefined));
-    vi.stubGlobal("fetch", fetchMock);
-    vi.stubGlobal("crypto", { randomUUID: () => generatedIds.shift() });
-    const user = userEvent.setup();
-
-    render(<Home />);
-    const topicControl = screen.getByRole("textbox", {
-      name: "Discussion Topic",
-    });
-    await user.type(topicControl, topic);
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
-    expect(screen.getByRole("alert").textContent).toContain(
-      "The next Turn reached the server generation timeout. Start a new Discussion and try again later.",
-    );
-    expect(screen.queryByText("Discussion timed out.")).toBeNull();
-    expect(screen.getByRole("status").textContent).toContain(
-      "Discussion failed.",
-    );
-    expect(
-      screen.getByRole("button", { name: "Start Discussion" }).hasAttribute(
-        "disabled",
-      ),
-    ).toBe(false);
-
-    await user.clear(topicControl);
-    await user.type(topicControl, secondTopic);
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-
-    expect(
-      await screen.findByRole("heading", { name: secondTopic, level: 2 }),
-    ).toBeTruthy();
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
-    expect(screen.queryByText("Discussion timed out.")).toBeNull();
-    expect(screen.getByRole("alert").textContent).toBe("");
-  });
-
-  it("ignores a stale timeout refresh after a fresh Discussion starts", async () => {
-    const timedOutDiscussion = {
-      ...initialDiscussion,
-      status: "failed",
-      terminalReason: "timeout",
-    };
-    const secondTopic = "Should libraries stay open later?";
-    const secondInitial = {
-      ...initialDiscussion,
-      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-      topic: secondTopic,
-    };
-    const generatedIds = [
-      requestId,
-      "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-    ];
-    let resolveTimeoutRefresh: ((response: Response) => void) | undefined;
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(initialDiscussion), { status: 201 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            error: {
-              code: "GENERATION_TIMEOUT",
-              message: "The next Turn reached the server generation timeout.",
-              action: "Start a new Discussion and try again later.",
-              retryable: false,
-            },
-          }),
-          { status: 504 },
-        ),
-      )
-      .mockReturnValueOnce(
-        new Promise<Response>((resolve) => {
-          resolveTimeoutRefresh = resolve;
-        }),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(secondInitial), { status: 201 }),
-      )
-      .mockReturnValueOnce(new Promise<Response>(() => undefined));
-    vi.stubGlobal("fetch", fetchMock);
-    vi.stubGlobal("crypto", { randomUUID: () => generatedIds.shift() });
-    const user = userEvent.setup();
-
-    render(<Home />);
-    const topicControl = screen.getByRole("textbox", {
-      name: "Discussion Topic",
-    });
-    await user.type(topicControl, topic);
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
-    const refreshSignal = fetchMock.mock.calls[2]?.[1]?.signal as
-      | AbortSignal
-      | undefined;
-    expect(refreshSignal?.aborted).toBe(false);
-
-    await user.clear(topicControl);
-    await user.type(topicControl, secondTopic);
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-
-    expect(
-      await screen.findByRole("heading", { name: secondTopic, level: 2 }),
-    ).toBeTruthy();
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
-    expect(refreshSignal?.aborted).toBe(true);
-
-    resolveTimeoutRefresh?.(
-      new Response(JSON.stringify(timedOutDiscussion), { status: 200 }),
-    );
-    await waitFor(() =>
-      expect(
-        screen.getByRole("heading", { name: secondTopic, level: 2 }),
-      ).toBeTruthy(),
-    );
-    expect(screen.queryByText("Discussion timed out.")).toBeNull();
-    expect(screen.getByRole("alert").textContent).toBe("");
-  });
-
-  it("rejects an excessively long Topic before making a request", async () => {
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
-    const user = userEvent.setup();
-    render(<Home />);
-
-    const topicControl = screen.getByRole("textbox", {
-      name: "Discussion Topic",
-    });
-    await user.type(topicControl, "x".repeat(241));
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(screen.getByRole("alert").textContent).toContain(
-      "240 characters or fewer",
-    );
-  });
-
-  it("offers a fresh-Discussion action after completion that resets Topic, Transcript, progress, errors, and request identity", async () => {
-    const secondTopic = "Should libraries stay open later?";
-    const secondDiscussionId = "66666666-6666-4666-8666-666666666666";
-    const requestIds = [
-      requestId,
-      "77777777-7777-4777-8777-777777777777",
-    ];
-    const firstInitial = { ...initialDiscussion, turnLimit: 1 };
-    const firstCompleted = {
-      ...discussionWithFirstTurn,
-      status: "completed",
-      turnLimit: 1,
-    };
-    const secondInitial = {
-      ...initialDiscussion,
-      id: secondDiscussionId,
-      topic: secondTopic,
-      turnLimit: 1,
-    };
-    const secondContent = "Later hours improve access for working residents.";
-    const secondCompleted = {
-      ...secondInitial,
-      status: "completed",
-      turnCount: 1,
-      transcript: [
-        {
-          ...discussionWithFirstTurn.transcript[0],
-          id: "88888888-8888-4888-8888-888888888888",
-          content: secondContent,
-          generation: {
-            ...discussionWithFirstTurn.transcript[0].generation,
-            requestId: requestIds[1],
-          },
-        },
-      ],
-    };
-    let requestIndex = 0;
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(firstInitial), { status: 201 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(firstCompleted), { status: 200 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(secondInitial), { status: 201 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(secondCompleted), { status: 200 }),
-      );
-    vi.stubGlobal("fetch", fetchMock);
-    vi.stubGlobal("crypto", {
-      randomUUID: () => requestIds[requestIndex++],
-    });
-    const user = userEvent.setup();
-
-    render(<Home />);
-    const topicControl = screen.getByRole("textbox", {
-      name: "Discussion Topic",
-    });
-    await user.type(topicControl, topic);
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-    expect(await screen.findByText("Discussion completed.")).toBeTruthy();
-    expect(screen.getByLabelText("Turn progress").textContent).toContain(
-      "1 / 1",
-    );
-
-    await user.click(
-      screen.getByRole("button", { name: "Start a New Discussion" }),
-    );
-
-    expect(screen.getByText(/No active Discussion/)).toBeTruthy();
-    expect((topicControl as HTMLTextAreaElement).value).toBe("");
-    expect(document.activeElement).toBe(topicControl);
-    expect(screen.queryByText(messageContent)).toBeNull();
-    expect(screen.queryByText("Discussion completed.")).toBeNull();
-    expect(screen.getByRole("alert").textContent).toBe("");
-    expect(
-      screen.queryByRole("button", { name: "Start a New Discussion" }),
-    ).toBeNull();
-
-    await user.type(topicControl, secondTopic);
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-
-    expect(
-      await screen.findByRole("heading", { name: secondTopic, level: 2 }),
-    ).toBeTruthy();
-    expect(await screen.findByText(secondContent)).toBeTruthy();
-    expect(screen.queryByText(messageContent)).toBeNull();
-    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
-      "/api/discussions",
-      `/api/discussions/${initialDiscussion.id}`,
-      "/api/discussions",
-      `/api/discussions/${secondDiscussionId}`,
-    ]);
-  });
-
-  it("offers a fresh-Discussion action after Stop that resets Topic, Transcript, progress, and errors", async () => {
-    const stoppedDiscussion = {
-      ...initialDiscussion,
-      status: "stopped",
-      terminalReason: "stop",
-    };
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(initialDiscussion), { status: 201 }),
-      )
-      .mockReturnValueOnce(new Promise<Response>(() => undefined))
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(stoppedDiscussion), { status: 200 }),
-      );
-    vi.stubGlobal("fetch", fetchMock);
-    vi.stubGlobal("crypto", { randomUUID: () => requestId });
-    const user = userEvent.setup();
-
-    render(<Home />);
-    const topicControl = screen.getByRole("textbox", {
-      name: "Discussion Topic",
-    });
-    await user.type(topicControl, topic);
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    await user.click(screen.getByRole("button", { name: "Stop Discussion" }));
-    expect(await screen.findByText("Discussion stopped.")).toBeTruthy();
-
-    await user.click(
-      screen.getByRole("button", { name: "Start a New Discussion" }),
-    );
-
-    expect(screen.getByText(/No active Discussion/)).toBeTruthy();
-    expect((topicControl as HTMLTextAreaElement).value).toBe("");
-    expect(screen.queryByText("Discussion stopped.")).toBeNull();
-    expect(screen.getByRole("alert").textContent).toBe("");
-    expect(screen.queryByRole("button", { name: "Stop Discussion" })).toBeNull();
-    expect(
-      screen.queryByRole("button", { name: "Start a New Discussion" }),
-    ).toBeNull();
-  });
-
-  it("prevents duplicate Start submissions from rapid double-clicks", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(initialDiscussion), { status: 201 }),
-      )
-      .mockReturnValueOnce(new Promise<Response>(() => undefined));
-    vi.stubGlobal("fetch", fetchMock);
-    vi.stubGlobal("crypto", { randomUUID: () => requestId });
-    const user = userEvent.setup();
-
-    render(<Home />);
-    await user.type(
-      screen.getByRole("textbox", { name: "Discussion Topic" }),
-      topic,
-    );
-    const start = screen.getByRole("button", { name: "Start Discussion" });
-    fireEvent.click(start);
-    fireEvent.click(start);
-
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    expect(
-      fetchMock.mock.calls.filter((call) => call[0] === "/api/discussions")
-        .length,
-    ).toBe(1);
-  });
-
-  it("prevents duplicate Stop requests from rapid double-clicks", async () => {
-    const stoppedDiscussion = {
-      ...initialDiscussion,
-      status: "stopped",
-      terminalReason: "stop",
-    };
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(initialDiscussion), { status: 201 }),
-      )
-      .mockReturnValueOnce(new Promise<Response>(() => undefined))
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(stoppedDiscussion), { status: 200 }),
-      );
-    vi.stubGlobal("fetch", fetchMock);
-    vi.stubGlobal("crypto", { randomUUID: () => requestId });
-    const user = userEvent.setup();
-
-    render(<Home />);
-    await user.type(
-      screen.getByRole("textbox", { name: "Discussion Topic" }),
-      topic,
-    );
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    const stop = screen.getByRole("button", { name: "Stop Discussion" });
-    fireEvent.click(stop);
-    fireEvent.click(stop);
-
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
-    expect(await screen.findByText("Discussion stopped.")).toBeTruthy();
-    expect(
-      fetchMock.mock.calls.filter((call) =>
-        String(call[0]).endsWith("/stop"),
-      ).length,
-    ).toBe(1);
   });
 
   it("prevents duplicate Retry submissions from rapid double-clicks", async () => {
@@ -1192,54 +635,31 @@ describe("participant-visible Discussion start", () => {
     };
     const fetchMock = vi
       .fn()
+      .mockResolvedValueOnce(jsonResponse(boundedInitial))
       .mockResolvedValueOnce(
-        new Response(JSON.stringify(boundedInitial), { status: 201 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            error: {
-              code: "GENERATION_FAILED",
-              message: "The next Turn could not be generated safely.",
-              action: "Retry this Turn with the same request identity.",
-              retryable: true,
-            },
-          }),
-          { status: 502 },
+        errorResponse(
+          502,
+          "GENERATION_FAILED",
+          "The next Turn could not be generated safely.",
+          {},
+          "Retry this Turn with the same request identity.",
         ),
       )
-      .mockResolvedValueOnce(new Response(JSON.stringify(failed), { status: 200 }))
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(completed), { status: 200 }),
-      );
+      .mockResolvedValueOnce(jsonResponse(failed))
+      .mockResolvedValueOnce(jsonResponse(completed));
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("crypto", { randomUUID: () => requestId });
-    const user = userEvent.setup();
 
-    render(<Home />);
-    await user.type(
-      screen.getByRole("textbox", { name: "Discussion Topic" }),
-      topic,
-    );
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-
+    renderHydrated();
     const retry = await screen.findByRole("button", { name: "Retry Turn" });
     fireEvent.click(retry);
     fireEvent.click(retry);
 
     expect(await screen.findByText("Discussion completed.")).toBeTruthy();
-    const turnPosts = fetchMock.mock.calls.filter(
-      (call) =>
-        call[0] === `/api/discussions/${initialDiscussion.id}` &&
-        call[1]?.method === "POST",
-    );
-    expect(turnPosts.length).toBe(2);
-    expect(
-      turnPosts.map((call) =>
-        NextTurnRequestSchema.parse(JSON.parse(String(call[1]?.body)))
-          .requestId,
-      ),
-    ).toEqual([requestId, requestId]);
+    expect(turnPosts(fetchMock).length).toBe(2);
+    expect(turnPosts(fetchMock).map((call) =>
+      NextTurnRequestSchema.parse(postedBody(call)).requestId,
+    )).toEqual([requestId, requestId]);
   });
 
   it("shows a failed state without Retry for a non-retryable Turn failure and offers a fresh Discussion", async () => {
@@ -1251,34 +671,19 @@ describe("participant-visible Discussion start", () => {
     };
     const fetchMock = vi
       .fn()
+      .mockResolvedValueOnce(jsonResponse(boundedInitial))
       .mockResolvedValueOnce(
-        new Response(JSON.stringify(boundedInitial), { status: 201 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            error: {
-              code: "OUTPUT_LIMIT_EXCEEDED",
-              message: "The generated Turn exceeded the configured output limit.",
-              action: "Start a new Discussion or try again later.",
-              retryable: false,
-            },
-          }),
-          { status: 502 },
+        errorResponse(
+          502,
+          "OUTPUT_LIMIT_EXCEEDED",
+          "The generated Turn exceeded the configured output limit.",
+          { retryable: false },
         ),
       )
-      .mockResolvedValueOnce(new Response(JSON.stringify(failed), { status: 200 }));
+      .mockResolvedValueOnce(jsonResponse(failed));
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("crypto", { randomUUID: () => requestId });
-    const user = userEvent.setup();
-
-    render(<Home />);
-    await user.type(
-      screen.getByRole("textbox", { name: "Discussion Topic" }),
-      topic,
-    );
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-
+    renderHydrated();
     expect(await screen.findByText("Discussion failed.")).toBeTruthy();
     expect(screen.getByRole("alert").textContent).toContain(
       "The generated Turn exceeded the configured output limit.",
@@ -1290,42 +695,75 @@ describe("participant-visible Discussion start", () => {
     expect(screen.getByLabelText("Turn progress").textContent).toContain(
       "0 / 1",
     );
+    expect(screen.getByRole("heading", { name: topic, level: 2 })).toBeTruthy();
+  });
+
+  it("restores the Retry identity from the pending Turn entry and retries without minting a new one", async () => {
+    const boundedInitial = { ...initialDiscussion, turnLimit: 1 };
+    const failed = {
+      ...boundedInitial,
+      status: "failed",
+      terminalReason: null,
+    };
+    const completed = {
+      ...discussionWithFirstTurn,
+      status: "completed",
+      turnLimit: 1,
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(failed))
+      .mockResolvedValueOnce(jsonResponse(completed));
+    const randomUUID = vi.fn(() => "66666666-6666-4666-8666-666666666666");
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID });
+    seedPendingTurn();
+    renderHydrated();
+    const user = userEvent.setup();
+    const retry = await screen.findByRole("button", { name: "Retry Turn" });
+    await user.click(retry);
+
+    expect(await screen.findByText("Discussion completed.")).toBeTruthy();
+    expect(randomUUID).not.toHaveBeenCalled();
+    expect(turnPosts(fetchMock).map((call) =>
+      NextTurnRequestSchema.parse(postedBody(call)).requestId,
+    )).toEqual([requestId]);
+  });
+
+  it("offers no Retry for a retryable failed Discussion without a matching pending Turn identity", async () => {
+    const failed = {
+      ...initialDiscussion,
+      status: "failed",
+      terminalReason: null,
+    };
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(failed));
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderHydrated();
+    expect(await screen.findByText("Discussion failed.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry Turn" })).toBeNull();
     expect(
-      screen.getByRole("heading", { name: topic, level: 2 }),
+      screen.getByRole("button", { name: "Start a New Discussion" }),
     ).toBeTruthy();
   });
 
   it("uses stable ownership-loss copy and offers a fresh Discussion when the server no longer owns the Discussion", async () => {
     const fetchMock = vi
       .fn()
+      .mockResolvedValueOnce(jsonResponse(initialDiscussion))
       .mockResolvedValueOnce(
-        new Response(JSON.stringify(initialDiscussion), { status: 201 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            error: {
-              code: "DISCUSSION_NOT_FOUND",
-              message: "This Discussion is not available in the current session.",
-              action: "Start a new Discussion in this session or return to the session that created it.",
-              retryable: false,
-            },
-          }),
-          { status: 404 },
+        errorResponse(
+          404,
+          "DISCUSSION_NOT_FOUND",
+          "This Discussion is not available in the current session.",
+          { retryable: false },
         ),
       )
       .mockResolvedValueOnce(new Response(null, { status: 404 }));
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("crypto", { randomUUID: () => requestId });
-    const user = userEvent.setup();
 
-    render(<Home />);
-    await user.type(
-      screen.getByRole("textbox", { name: "Discussion Topic" }),
-      topic,
-    );
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-
+    renderHydrated();
     expect(await screen.findByText("Discussion failed.")).toBeTruthy();
     expect(screen.getByRole("alert").textContent).toContain(
       "This Discussion is not available in the current session.",
@@ -1345,37 +783,20 @@ describe("participant-visible Discussion start", () => {
     };
     const fetchMock = vi
       .fn()
+      .mockResolvedValueOnce(jsonResponse(boundedInitial))
       .mockResolvedValueOnce(
-        new Response(JSON.stringify(boundedInitial), { status: 201 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            error: {
-              code: "RATE_LIMITED",
-              message: "Too many requests from this address or session. Waiting is required.",
-              action: "Wait for the retry window to pass, then try again.",
-              retryable: true,
-              retryAfterSeconds: 30,
-            },
-          }),
-          { status: 429 },
+        errorResponse(
+          429,
+          "RATE_LIMITED",
+          "Too many requests from this address or session. Waiting is required.",
+          { retryable: true, retryAfterSeconds: 30 },
         ),
       )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(completed), { status: 200 }),
-      );
+      .mockResolvedValueOnce(jsonResponse(completed));
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("crypto", { randomUUID: () => requestId });
+    renderHydrated();
     const user = userEvent.setup();
-
-    render(<Home />);
-    await user.type(
-      screen.getByRole("textbox", { name: "Discussion Topic" }),
-      topic,
-    );
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-
     const retry = await screen.findByRole("button", { name: "Retry Turn" });
     expect(screen.getByRole("alert").textContent).toContain(
       "You can retry in about 30 seconds.",
@@ -1383,75 +804,27 @@ describe("participant-visible Discussion start", () => {
     expect(screen.getByRole("status").textContent).toContain(
       "Ready for the next Turn.",
     );
-    expect(
-      fetchMock.mock.calls.some((call) => call[1]?.method === "GET"),
-    ).toBe(false);
+    // The wait family never triggers an authoritative refresh: exactly the
+    // hydration GET and the Turn POST.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
 
     await user.click(retry);
     expect(await screen.findByText("Discussion completed.")).toBeTruthy();
-    expect(fetchMock.mock.calls.slice(1).map((call) =>
-      NextTurnRequestSchema.parse(JSON.parse(String(call[1]?.body))).requestId,
+    expect(turnPosts(fetchMock).map((call) =>
+      NextTurnRequestSchema.parse(postedBody(call)).requestId,
     )).toEqual([requestId, requestId]);
-  });
-
-  it("directs Topic validation and policy errors to the Topic control", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            error: {
-              code: "TOPIC_BLOCKED",
-              message: "This Topic requests advocacy or praise that the Discussion Policy does not permit.",
-              action: "Choose a Topic that critically examines prevention, history, consequences, or human rights without praising extremists or advocating harm.",
-              retryable: false,
-            },
-          }),
-          { status: 422 },
-        ),
-      );
-    vi.stubGlobal("fetch", fetchMock);
-    const user = userEvent.setup();
-
-    render(<Home />);
-    const topicControl = screen.getByRole("textbox", {
-      name: "Discussion Topic",
-    });
-    await user.type(topicControl, topic);
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-
-    expect(await screen.findByRole("alert")).toBeTruthy();
-    expect(screen.getByRole("alert").textContent).toContain(
-      "This Topic requests advocacy or praise",
-    );
-    expect(document.activeElement).toBe(topicControl);
-    expect(topicControl.getAttribute("aria-invalid")).toBe("true");
-    expect(screen.getByText(/No active Discussion/)).toBeTruthy();
   });
 
   it("uses stable fallback copy for malformed server data and offers a fresh Discussion", async () => {
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(initialDiscussion), { status: 201 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ unexpected: true }), { status: 200 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(initialDiscussion), { status: 200 }),
-      );
+      .mockResolvedValueOnce(jsonResponse(initialDiscussion))
+      .mockResolvedValueOnce(jsonResponse({ unexpected: true }))
+      .mockResolvedValueOnce(jsonResponse(initialDiscussion));
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("crypto", { randomUUID: () => requestId });
-    const user = userEvent.setup();
 
-    render(<Home />);
-    await user.type(
-      screen.getByRole("textbox", { name: "Discussion Topic" }),
-      topic,
-    );
-    await user.click(screen.getByRole("button", { name: "Start Discussion" }));
-
+    renderHydrated();
     expect(await screen.findByRole("alert")).toBeTruthy();
     expect(screen.getByRole("alert").textContent).toContain(
       "The server returned an unexpected response.",
@@ -1463,5 +836,597 @@ describe("participant-visible Discussion start", () => {
     expect(screen.getByRole("status").textContent).toContain(
       "Discussion failed.",
     );
+  });
+});
+
+describe("hydrated Discussion page controls", () => {
+  it("stops active generation, aborts its request, and ignores a late Turn response", async () => {
+    const stoppedDiscussion = {
+      ...initialDiscussion,
+      status: "stopped",
+      terminalReason: "stop",
+    };
+    let resolveLateTurn: ((response: Response) => void) | undefined;
+    let resolveStop: ((response: Response) => void) | undefined;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(initialDiscussion))
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveLateTurn = resolve;
+        }),
+      )
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveStop = resolve;
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID: () => requestId });
+    renderHydrated();
+    const user = userEvent.setup();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    const stop = screen.getByRole("button", { name: "Stop Discussion" });
+    expect(stop).toBeTruthy();
+    const turnSignal = fetchMock.mock.calls[1]?.[1]?.signal as
+      | AbortSignal
+      | undefined;
+    expect(turnSignal?.aborted).toBe(false);
+
+    await user.click(stop);
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(fetchMock.mock.calls[2]?.[0]).toBe(
+      `/api/discussions/${discussionId}/stop`,
+    );
+    expect(fetchMock.mock.calls[2]?.[1]).toMatchObject({ method: "POST" });
+    expect(turnSignal?.aborted).toBe(false);
+    expect(
+      screen
+        .getByRole("button", { name: "Stop Discussion" })
+        .hasAttribute("disabled"),
+    ).toBe(true);
+
+    resolveStop?.(jsonResponse(stoppedDiscussion));
+
+    expect(await screen.findByText("Discussion stopped.")).toBeTruthy();
+    expect(turnSignal?.aborted).toBe(true);
+    expect(screen.queryByRole("button", { name: "Stop Discussion" })).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Start a New Discussion" }),
+    ).toBeTruthy();
+
+    resolveLateTurn?.(jsonResponse(discussionWithFirstTurn));
+    await waitFor(() => expect(screen.queryByText(messageContent)).toBeNull());
+    expect(screen.getByLabelText("Turn progress").textContent).toContain(
+      "0 / 12",
+    );
+    expect(screen.getByText("Discussion stopped.")).toBeTruthy();
+  });
+
+  it("prevents duplicate Stop requests from rapid double-clicks", async () => {
+    const stoppedDiscussion = {
+      ...initialDiscussion,
+      status: "stopped",
+      terminalReason: "stop",
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(initialDiscussion))
+      .mockReturnValueOnce(new Promise<Response>(() => undefined))
+      .mockResolvedValueOnce(jsonResponse(stoppedDiscussion));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID: () => requestId });
+    renderHydrated();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const stop = screen.getByRole("button", { name: "Stop Discussion" });
+    fireEvent.click(stop);
+    fireEvent.click(stop);
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(await screen.findByText("Discussion stopped.")).toBeTruthy();
+    expect(
+      fetchMock.mock.calls.filter((call) =>
+        String(call[0]).endsWith("/stop"),
+      ).length,
+    ).toBe(1);
+  });
+
+  it("keeps generation attached after failed Stop and permits a successful retry", async () => {
+    const stoppedDiscussion = {
+      ...initialDiscussion,
+      status: "stopped",
+      terminalReason: "stop",
+    };
+    let resolveLateTurn: ((response: Response) => void) | undefined;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(initialDiscussion))
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveLateTurn = resolve;
+        }),
+      )
+      .mockResolvedValueOnce(
+        errorResponse(
+          500,
+          "INVALID_RESPONSE",
+          "The Discussion could not be stopped safely.",
+          {},
+          "Read the current Discussion state before trying again.",
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ ...initialDiscussion, status: "generating" }),
+      )
+      .mockResolvedValueOnce(jsonResponse(stoppedDiscussion));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID: () => requestId });
+    renderHydrated();
+    const user = userEvent.setup();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const turnSignal = fetchMock.mock.calls[1]?.[1]?.signal as
+      | AbortSignal
+      | undefined;
+
+    await user.click(screen.getByRole("button", { name: "Stop Discussion" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    expect(screen.getByRole("alert").textContent).toContain(
+      "The Discussion could not be stopped safely. Read the current Discussion state before trying again.",
+    );
+    expect(turnSignal?.aborted).toBe(false);
+    expect(fetchMock.mock.calls[3]?.[0]).toBe(
+      `/api/discussions/${discussionId}`,
+    );
+    expect(fetchMock.mock.calls[3]?.[1]).toMatchObject({ method: "GET" });
+    const retryStop = screen.getByRole("button", { name: "Stop Discussion" });
+    expect(retryStop.hasAttribute("disabled")).toBe(false);
+
+    await user.click(retryStop);
+
+    expect(await screen.findByText("Discussion stopped.")).toBeTruthy();
+    expect(turnSignal?.aborted).toBe(true);
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      `/api/discussions/${discussionId}`,
+      `/api/discussions/${discussionId}`,
+      `/api/discussions/${discussionId}/stop`,
+      `/api/discussions/${discussionId}`,
+      `/api/discussions/${discussionId}/stop`,
+    ]);
+    expect(screen.getByRole("alert").textContent).toBe("");
+
+    resolveLateTurn?.(jsonResponse(discussionWithFirstTurn));
+    await waitFor(() => expect(screen.queryByText(messageContent)).toBeNull());
+    expect(screen.getByText("Discussion stopped.")).toBeTruthy();
+  });
+
+  it("keeps Stop functional when the authoritative refresh reports a server-generating Discussion", async () => {
+    const stoppedDiscussion = {
+      ...initialDiscussion,
+      status: "stopped",
+      terminalReason: "stop",
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(initialDiscussion))
+      .mockResolvedValueOnce(
+        errorResponse(
+          502,
+          "GENERATION_FAILED",
+          "The next Turn could not be generated safely.",
+          {},
+          "Retry this Turn with the same request identity.",
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ ...initialDiscussion, status: "generating" }),
+      )
+      .mockResolvedValueOnce(jsonResponse(stoppedDiscussion));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID: () => requestId });
+    renderHydrated();
+    const user = userEvent.setup();
+    const stop = await screen.findByRole("button", { name: "Stop Discussion" });
+    expect(screen.getByRole("status").textContent).toContain(
+      "Generating the next Turn",
+    );
+    await user.click(stop);
+
+    expect(await screen.findByText("Discussion stopped.")).toBeTruthy();
+    expect(
+      fetchMock.mock.calls.some(
+        (call) => call[0] === `/api/discussions/${discussionId}/stop`,
+      ),
+    ).toBe(true);
+  });
+
+  it("refreshes authoritative timeout state and navigates fresh without stale state", async () => {
+    const timedOutDiscussion = {
+      ...initialDiscussion,
+      status: "failed",
+      terminalReason: "timeout",
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(initialDiscussion))
+      .mockResolvedValueOnce(
+        errorResponse(
+          504,
+          "GENERATION_TIMEOUT",
+          "The next Turn reached the server generation timeout.",
+          { retryable: false },
+          "Start a new Discussion and try again later.",
+        ),
+      )
+      .mockResolvedValueOnce(jsonResponse(timedOutDiscussion));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID: () => requestId });
+    renderHydrated();
+    const user = userEvent.setup();
+    expect(await screen.findByText("Discussion timed out.")).toBeTruthy();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      `/api/discussions/${discussionId}`,
+      `/api/discussions/${discussionId}`,
+      `/api/discussions/${discussionId}`,
+    ]);
+    expect(fetchMock.mock.calls[2]?.[1]).toMatchObject({ method: "GET" });
+    expect(screen.getByRole("alert").textContent).toContain(
+      "The next Turn reached the server generation timeout. Start a new Discussion and try again later.",
+    );
+    expect(screen.queryByRole("button", { name: "Stop Discussion" })).toBeNull();
+    expect(screen.getByLabelText("Turn progress").textContent).toContain(
+      "0 / 12",
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "Start a New Discussion" }),
+    );
+    await waitFor(() =>
+      expect(pushMock).toHaveBeenCalledWith("/"),
+    );
+    expect(
+      window.sessionStorage.getItem(FOCUS_TOPIC_ON_CREATE_KEY),
+    ).toBe("1");
+    expect(screen.queryByText("Discussion timed out.")).toBeNull();
+  });
+
+  it("preserves timeout guidance when authoritative refresh fails", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(initialDiscussion))
+      .mockResolvedValueOnce(
+        errorResponse(
+          504,
+          "GENERATION_TIMEOUT",
+          "The next Turn reached the server generation timeout.",
+          { retryable: false },
+          "Start a new Discussion and try again later.",
+        ),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 500 }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID: () => requestId });
+
+    renderHydrated();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(screen.getByRole("alert").textContent).toContain(
+      "The next Turn reached the server generation timeout. Start a new Discussion and try again later.",
+    );
+    expect(screen.queryByText("Discussion timed out.")).toBeNull();
+    expect(screen.getByRole("status").textContent).toContain(
+      "Discussion failed.",
+    );
+    expect(
+      screen.getByRole("button", { name: "Start a New Discussion" }),
+    ).toBeTruthy();
+  });
+
+  it("ignores a stale timeout refresh after a fresh Discussion starts", async () => {
+    const timedOutDiscussion = {
+      ...initialDiscussion,
+      status: "failed",
+      terminalReason: "timeout",
+    };
+    let resolveTimeoutRefresh: ((response: Response) => void) | undefined;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(initialDiscussion))
+      .mockResolvedValueOnce(
+        errorResponse(
+          504,
+          "GENERATION_TIMEOUT",
+          "The next Turn reached the server generation timeout.",
+          { retryable: false },
+          "Start a new Discussion and try again later.",
+        ),
+      )
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveTimeoutRefresh = resolve;
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID: () => requestId });
+    renderHydrated();
+    const user = userEvent.setup();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    const refreshSignal = fetchMock.mock.calls[2]?.[1]?.signal as
+      | AbortSignal
+      | undefined;
+    expect(refreshSignal?.aborted).toBe(false);
+
+    await user.click(
+      screen.getByRole("button", { name: "Start a New Discussion" }),
+    );
+    await waitFor(() => expect(pushMock).toHaveBeenCalledWith("/"));
+    expect(refreshSignal?.aborted).toBe(true);
+
+    resolveTimeoutRefresh?.(jsonResponse(timedOutDiscussion));
+    await waitFor(() =>
+      expect(screen.queryByText("Discussion timed out.")).toBeNull(),
+    );
+    expect(screen.getByRole("alert").textContent).toBe("");
+  });
+
+  it("offers a fresh-Discussion action after completion that resets Topic, Transcript, progress, and errors", async () => {
+    const firstInitial = { ...initialDiscussion, turnLimit: 1 };
+    const firstCompleted = {
+      ...discussionWithFirstTurn,
+      status: "completed",
+      turnLimit: 1,
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(firstInitial))
+      .mockResolvedValueOnce(jsonResponse(firstCompleted));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID: () => requestId });
+    renderHydrated();
+    const user = userEvent.setup();
+    expect(await screen.findByText("Discussion completed.")).toBeTruthy();
+    expect(screen.getByLabelText("Turn progress").textContent).toContain(
+      "1 / 1",
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "Start a New Discussion" }),
+    );
+
+    await waitFor(() => expect(pushMock).toHaveBeenCalledWith("/"));
+    expect(
+      window.sessionStorage.getItem(FOCUS_TOPIC_ON_CREATE_KEY),
+    ).toBe("1");
+    expect(window.sessionStorage.getItem(PENDING_START_KEY)).toBeNull();
+    expect(screen.queryByText(messageContent)).toBeNull();
+    expect(screen.queryByText("Discussion completed.")).toBeNull();
+    expect(screen.getByRole("alert").textContent).toBe("");
+    expect(
+      screen.queryByRole("button", { name: "Start a New Discussion" }),
+    ).toBeNull();
+  });
+
+  it("offers a fresh-Discussion action after Stop that resets Topic, Transcript, progress, and errors", async () => {
+    const stoppedDiscussion = {
+      ...initialDiscussion,
+      status: "stopped",
+      terminalReason: "stop",
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(initialDiscussion))
+      .mockReturnValueOnce(new Promise<Response>(() => undefined))
+      .mockResolvedValueOnce(jsonResponse(stoppedDiscussion));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID: () => requestId });
+    renderHydrated();
+    const user = userEvent.setup();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByRole("button", { name: "Stop Discussion" }));
+    expect(await screen.findByText("Discussion stopped.")).toBeTruthy();
+
+    await user.click(
+      screen.getByRole("button", { name: "Start a New Discussion" }),
+    );
+
+    await waitFor(() => expect(pushMock).toHaveBeenCalledWith("/"));
+    expect(
+      window.sessionStorage.getItem(FOCUS_TOPIC_ON_CREATE_KEY),
+    ).toBe("1");
+    expect(screen.queryByText("Discussion stopped.")).toBeNull();
+    expect(screen.getByRole("alert").textContent).toBe("");
+    expect(screen.queryByRole("button", { name: "Stop Discussion" })).toBeNull();
+  });
+});
+
+describe("hydrated Discussion page addressability", () => {
+  it("shows the unavailable card for a 404 with no further requests", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(null, { status: 404 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderHydrated();
+    expect(
+      await screen.findByRole("heading", { name: "Discussion unavailable" }),
+    ).toBeTruthy();
+    expect(screen.getByText(/the URL alone does not grant access/)).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Start a New Discussion" }),
+    ).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the unavailable card for a 403 from a different session", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(null, { status: 403 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderHydrated();
+    expect(
+      await screen.findByRole("heading", { name: "Discussion unavailable" }),
+    ).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fetch for an invalid Discussion identifier", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderHydrated("not-a-uuid");
+    expect(
+      await screen.findByRole("heading", { name: "Discussion unavailable" }),
+    ).toBeTruthy();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("offers Retry Loading and Start a New Discussion after a transient hydration failure", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("network down"))
+      .mockResolvedValueOnce(jsonResponse(initialDiscussion))
+      .mockReturnValueOnce(new Promise<Response>(() => undefined));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", { randomUUID: () => requestId });
+    renderHydrated();
+    const user = userEvent.setup();
+    expect(
+      await screen.findByRole("heading", { name: "Could not load this Discussion" }),
+    ).toBeTruthy();
+    expect(
+      screen.getAllByText(/Check your connection and try again/).length,
+    ).toBeGreaterThan(0);
+
+    await user.click(screen.getByRole("button", { name: "Retry Loading" }));
+
+    expect(
+      await screen.findByRole("heading", { name: topic, level: 2 }),
+    ).toBeTruthy();
+    // Hydration GET, retry GET, and the Turn POST that the idle state starts.
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+  });
+
+  it("shows the transient failure card for a malformed 200 hydration response", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ unexpected: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderHydrated();
+    expect(
+      await screen.findByRole("heading", { name: "Could not load this Discussion" }),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Retry Loading" })).toBeTruthy();
+  });
+
+  it("polls a generating Discussion and never re-claims the Turn with a POST", async () => {
+    vi.useFakeTimers();
+    const generating = {
+      ...initialDiscussion,
+      status: "generating",
+    };
+    const completed = {
+      ...discussionWithFirstTurn,
+      status: "completed",
+      turnLimit: 1,
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(generating))
+      .mockResolvedValueOnce(jsonResponse(completed));
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderHydrated();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("heading", { name: topic, level: 2 })).toBeTruthy();
+    expect(screen.getByRole("status").textContent).toContain(
+      "Generating the next Turn",
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText("Discussion completed.")).toBeTruthy();
+    expect(
+      fetchMock.mock.calls.filter(
+        (call) => (call[1] as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("keeps observing a generating Discussion past a client-invented short deadline and only stops at the authoritative server bound", async () => {
+    // Regression guard for the hydration polling horizon: the browser must
+    // never stop observing an attempt the server can still legitimately
+    // consider active. The server hard bound is `HARD_GENERATION_TIMEOUT_MS`
+    // (300 s) plus the `RECOVERY_LEASE_GRACE_MS` margin (60 s), so a poll
+    // cap of 60 × 2 s (120 s) would be an earlier, invented deadline.
+    vi.useFakeTimers();
+    const generating = {
+      ...initialDiscussion,
+      status: "generating",
+    };
+    // Every poll must get a fresh Response; a shared instance would have a
+    // consumed body by the second read.
+    const fetchMock = vi.fn().mockImplementation(async () =>
+      jsonResponse(generating),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderHydrated();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Well past the old 120 s cap the page must still be polling (one GET
+    // per 2 s interval, no re-claiming POSTs).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(130_000);
+    });
+    expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(66);
+    expect(
+      fetchMock.mock.calls.filter(
+        (call) => (call[1] as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toHaveLength(0);
+
+    // The derived horizon (300 s + 60 s = 360 s at a 2 s interval = 180
+    // polls after the initial read) is reached only after the server's own
+    // hard bound; only then does the page hand control back to a reload.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(232_000);
+    });
+    expect(screen.getByRole("alert").textContent).toContain(
+      "This Discussion is still generating. Reload this page to see the latest Turns.",
+    );
+    expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(181);
+    expect(
+      fetchMock.mock.calls.filter(
+        (call) => (call[1] as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("reconciles a matched pending Start identity when the hydrated Topic matches", async () => {
+    vi.stubGlobal("crypto", { randomUUID: vi.fn().mockReturnValue(requestId) });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(initialDiscussion))
+      .mockReturnValueOnce(new Promise<Response>(() => undefined));
+    vi.stubGlobal("fetch", fetchMock);
+    seedPendingStart();
+
+    renderHydrated();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(storedPendingStart()).toBeNull();
   });
 });

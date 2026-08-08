@@ -104,6 +104,16 @@ export const DiscussionMessageSchema = z
 export const StartDiscussionRequestSchema = z
   .object({
     topic: DiscussionTopicSchema,
+    /**
+     * Stable client-generated identity for one logical Start operation.
+     * The server persists the (owner session, creation request identity)
+     * mapping durably, so retrying the same logical Start — after a lost
+     * response, a network failure, or a browser reload — replays the same
+     * Discussion instead of creating a duplicate. A genuinely new Start
+     * action must use a new identity. Deliberately distinct from the
+     * next-Turn `requestId` (different namespace and lifecycle operation).
+     */
+    creationRequestId: RequestIdentifierSchema,
   })
   .strict();
 
@@ -226,6 +236,7 @@ export const ProductErrorCodeSchema = z.enum([
   "GENERATION_CAPACITY_EXCEEDED",
   "SESSION_QUOTA_EXCEEDED",
   "RATE_LIMITED",
+  "START_REQUEST_CONFLICT",
   "INVALID_RESPONSE",
   "STORAGE_UNAVAILABLE",
 ]);

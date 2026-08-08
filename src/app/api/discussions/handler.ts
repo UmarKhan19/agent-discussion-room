@@ -3,6 +3,7 @@ import {
   DiscussionResponseSchema,
   ErrorResponseSchema,
   NextTurnRequestSchema,
+  RequestIdentifierSchema,
   StartDiscussionRequestSchema,
   TOPIC_MAX_LENGTH,
   type DiscussionState,
@@ -54,6 +55,7 @@ import {
 } from "@/discussion/discussion-runner";
 import {
   DiscussionPolicyBlockedError,
+  DiscussionStartConflictError,
   DiscussionStorageUnavailableError,
   type DiscussionService,
 } from "@/discussion/discussion-service";
@@ -206,18 +208,18 @@ function invalidStartRequest(body: unknown): ProductErrorInput {
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     return {
       code: "INVALID_REQUEST",
-      message: "The request must be a JSON object containing only a Topic.",
-      action: "Send an object in the form {\"topic\": \"Your Topic\"}.",
+      message: "The request must be a JSON object containing a Topic and a stable creation request identity.",
+      action: "Send an object in the form {\"topic\": \"Your Topic\", \"creationRequestId\": \"UUID\"}.",
     };
   }
 
   const record = body as Record<string, unknown>;
   const keys = Object.keys(record);
-  if (keys.some((key) => key !== "topic")) {
+  if (keys.some((key) => key !== "topic" && key !== "creationRequestId")) {
     return {
       code: "INVALID_REQUEST",
-      message: "A new Discussion accepts only a Topic; Speaker and Transcript are server-owned.",
-      action: "Remove Speaker, messages, Transcript, and other extra fields, then submit only the Topic.",
+      message: "A new Discussion accepts only a Topic and a stable creation request identity; Speaker and Transcript are server-owned.",
+      action: "Remove every field except topic and creationRequestId, then try again.",
     };
   }
 
@@ -242,6 +244,22 @@ function invalidStartRequest(body: unknown): ProductErrorInput {
       code: "TOPIC_REQUIRED",
       message: "Topic cannot be empty.",
       action: "Enter a Discussion Topic before starting.",
+    };
+  }
+
+  if (typeof record.creationRequestId !== "string") {
+    return {
+      code: "INVALID_REQUEST",
+      message: "creationRequestId must be a UUID string.",
+      action: "Create one stable UUID for this logical Start request and reuse it for retries.",
+    };
+  }
+
+  if (!RequestIdentifierSchema.safeParse(record.creationRequestId).success) {
+    return {
+      code: "INVALID_REQUEST",
+      message: "creationRequestId must be a UUID string.",
+      action: "Create one stable UUID for this logical Start request and reuse it for retries.",
     };
   }
 
@@ -443,11 +461,13 @@ export function createDiscussionHttpHandlers(
       if (!parsedRequest.success) {
         return errorResponse(telemetry, 400, invalidStartRequest(body), meta);
       }
+      meta.requestId = parsedRequest.data.creationRequestId;
 
       try {
         const discussion = await service.start(
           session.id,
           parsedRequest.data.topic,
+          parsedRequest.data.creationRequestId,
         );
         meta.discussionId = discussion.id;
         return discussionResponse(telemetry, discussion, 201, meta, session.setCookie);
@@ -464,6 +484,19 @@ export function createDiscussionHttpHandlers(
               message: "This Topic requests advocacy or praise that the Discussion Policy does not permit.",
               action: SAFE_TOPIC_ALTERNATIVE,
               category: error.outcome.category,
+            },
+            meta,
+            session.setCookie,
+          );
+        }
+        if (error instanceof DiscussionStartConflictError) {
+          return errorResponse(
+            telemetry,
+            409,
+            {
+              code: "START_REQUEST_CONFLICT",
+              message: "This Start request was already used to create a different Discussion in this session.",
+              action: "Start a new Discussion with a fresh request identity.",
             },
             meta,
             session.setCookie,

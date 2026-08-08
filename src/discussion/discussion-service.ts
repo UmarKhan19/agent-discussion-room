@@ -58,6 +58,8 @@ interface OwnedDiscussion {
   ownerSessionId: string;
   state: DiscussionState;
   requests: Map<string, TurnRequestRecord>;
+  /** Durable identity of the Start request that created this Discussion; null for legacy rows. */
+  creationRequestId: string | null;
 }
 
 export type ClaimTurnResult =
@@ -95,8 +97,24 @@ export type RequestStatusResult =
   | { kind: "failed"; retryable: boolean }
   | { kind: "unknown" };
 
+export type CreateDiscussionResult =
+  | { kind: "created" }
+  | { kind: "replayed"; discussion: DiscussionState };
+
 export interface DiscussionStore {
-  create(ownerSessionId: string, discussion: DiscussionState): Promise<void>;
+  /**
+   * Persists a new Discussion. When `creationRequestId` is provided, the
+   * (owner session, creation request identity) pair is the idempotency key:
+   * a second create for an already-persisted pair replays the original
+   * Discussion instead of inserting a duplicate (database-enforced, so it
+   * holds across instances and restarts). Null performs a plain create for
+   * legacy/test paths.
+   */
+  create(
+    ownerSessionId: string,
+    discussion: DiscussionState,
+    creationRequestId?: string | null,
+  ): Promise<CreateDiscussionResult>;
   readOwned(
     ownerSessionId: string,
     discussionId: string,
@@ -234,12 +252,33 @@ function isCurrentAttempt(
 export class InMemoryDiscussionStore implements DiscussionStore {
   private readonly discussions = new Map<string, OwnedDiscussion>();
 
-  async create(ownerSessionId: string, discussion: DiscussionState): Promise<void> {
+  async create(
+    ownerSessionId: string,
+    discussion: DiscussionState,
+    creationRequestId?: string | null,
+  ): Promise<CreateDiscussionResult> {
+    const sessionId = SessionIdentifierSchema.parse(ownerSessionId);
+    if (creationRequestId !== undefined && creationRequestId !== null) {
+      const requestId = RequestIdentifierSchema.parse(creationRequestId);
+      for (const stored of this.discussions.values()) {
+        if (
+          stored.ownerSessionId === sessionId &&
+          stored.creationRequestId === requestId
+        ) {
+          return {
+            kind: "replayed",
+            discussion: copyDiscussion(stored.state),
+          };
+        }
+      }
+    }
     this.discussions.set(discussion.id, {
-      ownerSessionId: SessionIdentifierSchema.parse(ownerSessionId),
+      ownerSessionId: sessionId,
       state: copyDiscussion(discussion),
       requests: new Map(),
+      creationRequestId: creationRequestId ?? null,
     });
+    return { kind: "created" };
   }
 
   async readOwned(
@@ -493,6 +532,20 @@ export class DiscussionPolicyBlockedError extends Error {
   }
 }
 
+/**
+ * A Start request identity was already used to create a different
+ * Discussion in the same session. The persisted mapping is authoritative,
+ * so the reused identity cannot silently create a second Discussion for a
+ * semantically different payload; the participant must start with a fresh
+ * identity instead.
+ */
+export class DiscussionStartConflictError extends Error {
+  constructor() {
+    super("Start request identity was already used with a different Topic");
+    this.name = "DiscussionStartConflictError";
+  }
+}
+
 export interface DiscussionServiceOptions {
   store?: DiscussionStore;
   policy?: DiscussionPolicy;
@@ -528,9 +581,11 @@ export class DiscussionService {
   async start(
     ownerSessionId: string,
     untrustedTopic: unknown,
+    creationRequestId: string,
   ): Promise<DiscussionState> {
     const sessionId = SessionIdentifierSchema.parse(ownerSessionId);
     const topic: DiscussionTopic = DiscussionTopicSchema.parse(untrustedTopic);
+    const requestId = RequestIdentifierSchema.parse(creationRequestId);
     const policyOutcome = this.policy.evaluate(topic);
 
     if (policyOutcome.decision === "blocked") {
@@ -551,7 +606,21 @@ export class DiscussionService {
       transcript: [],
     });
 
-    await this.store.create(sessionId, discussion);
+    const result = await this.store.create(
+      sessionId,
+      discussion,
+      requestId,
+    );
+    if (result.kind === "replayed") {
+      // The idempotency key was already used in this session. The stored
+      // mapping is authoritative: an exact retry (same Topic) replays the
+      // original Discussion, while a reused identity with a different Topic
+      // is a conflict, never a silently created second Discussion.
+      if (result.discussion.topic !== topic) {
+        throw new DiscussionStartConflictError();
+      }
+      return copyDiscussion(result.discussion);
+    }
     return copyDiscussion(discussion);
   }
 

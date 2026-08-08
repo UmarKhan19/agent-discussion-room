@@ -301,7 +301,7 @@ for (const colorScheme of ["light", "dark"] as const) {
     );
     await startDiscussion(page, topic);
     await expect(lifecycleStatus(page)).toHaveText("Discussion completed.");
-    await expect(startButton(page)).toBeVisible();
+    await expect(newDiscussionButton(page)).toBeVisible();
   });
 }
 

@@ -37,6 +37,19 @@ explicitly changed.
 
 ## Additional current limits
 
+- **A retryable failed Discussion is only retryable from the browser that
+  saw the failure.** Retry restores the next-Turn request identity from a
+  per-tab `sessionStorage` entry. After a reload that loses that entry (or
+  in a different tab/device), a failed-but-retryable Discussion renders
+  without the Retry control — the participant can still read the state and
+  start a fresh Discussion. The persisted state itself is never lost; only
+  the same-identity retry affordance is browser-scoped by design.
+- **Pending Start/Turn identities are per-tab `sessionStorage`.** The
+  idempotent-Start identity and the pending-Turn identity survive reloads
+  of the same tab but not a cleared browser profile; the server-side
+  mapping is durable regardless (a retry with the original identity replays
+  the Discussion even after a restart).
+
 - **Rule-based policy, not a moderation model.** Input and output policy are
   deterministic, reviewable rule sets (see [docs/safety.md](docs/safety.md)).
   They reliably block the configured advocacy categories but cannot catch

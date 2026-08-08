@@ -4,7 +4,9 @@ A bounded, server-owned debate between a Supporter and an Opponent. A
 participant enters a permitted Discussion Topic, explicitly starts a
 Discussion, and watches alternating Turns until a finite completion — with
 Stop, Retry, and fresh-Discussion controls, durable storage, privacy-safe
-telemetry, and a deterministic credential-free test path.
+telemetry, and a deterministic credential-free test path. Every Discussion
+lives at a canonical, reload-safe URL (`/discussions/:id`), and the Start
+action is idempotent, so a lost response never creates an orphan.
 
 The server owns the entire Discussion lifecycle: Speaker order, Transcript,
 policy, budgets, and state transitions are never trusted to the browser.

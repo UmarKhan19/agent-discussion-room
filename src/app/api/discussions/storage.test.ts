@@ -15,6 +15,7 @@ import {
 import {
   DiscussionService,
   DiscussionStorageUnavailableError,
+  type CreateDiscussionResult,
   type DiscussionStore,
 } from "@/discussion/discussion-service";
 import { DiscussionRunner } from "@/discussion/discussion-runner";
@@ -51,6 +52,30 @@ function mutableClock(start: Date): {
   };
 }
 
+/**
+ * Test Starts predate the required `creationRequestId`; inject a unique one
+ * whenever a body carries a Topic but no identity, leaving malformed bodies
+ * untouched so validation tests keep their intent.
+ */
+let startRequestSequence = 0;
+function testCreationRequestId(): string {
+  startRequestSequence += 1;
+  return `aaaaaaaa-aaaa-4aaa-8aaa-${String(startRequestSequence).padStart(12, "0")}`;
+}
+
+function withDefaultCreationRequestId(body: unknown): unknown {
+  if (
+    typeof body === "object" &&
+    body !== null &&
+    !Array.isArray(body) &&
+    "topic" in body &&
+    !("creationRequestId" in body)
+  ) {
+    return { ...(body as Record<string, unknown>), creationRequestId: testCreationRequestId() };
+  }
+  return body;
+}
+
 function jsonRequest(
   body: unknown,
   cookie?: string,
@@ -62,7 +87,7 @@ function jsonRequest(
       "Content-Type": "application/json",
       ...(cookie ? { Cookie: cookie } : {}),
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(withDefaultCreationRequestId(body)),
   });
 }
 
@@ -99,9 +124,13 @@ class FaultStore implements DiscussionStore {
     this.faults = new Set();
   }
 
-  create(ownerSessionId: string, discussion: DiscussionState): Promise<void> {
+  create(
+    ownerSessionId: string,
+    discussion: DiscussionState,
+    creationRequestId?: string | null,
+  ): Promise<CreateDiscussionResult> {
     this.assertFault("create");
-    return this.inner.create(ownerSessionId, discussion);
+    return this.inner.create(ownerSessionId, discussion, creationRequestId);
   }
   readOwned(ownerSessionId: string, discussionId: string): Promise<DiscussionState | null> {
     this.assertFault("readOwned");

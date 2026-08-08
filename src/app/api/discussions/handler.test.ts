@@ -4,7 +4,7 @@ import {
   DEFAULT_MAX_OUTPUT_TOKENS,
   type DiscussionBudgets,
 } from "@/discussion/budgets";
-import { DiscussionStateSchema, ErrorResponseSchema } from "@/discussion/contracts";
+import { DiscussionResponseSchema, DiscussionStateSchema, ErrorResponseSchema } from "@/discussion/contracts";
 import { DiscussionRunner } from "@/discussion/discussion-runner";
 import {
   DiscussionGenerationError,
@@ -30,6 +30,7 @@ import { createDiscussionHttpHandlers, type DiscussionHttpProtection } from "./h
 
 const now = new Date("2026-08-02T12:00:00.000Z");
 const discussionId = "11111111-1111-4111-8111-111111111111";
+const secondDiscussionId = "66666666-6666-4666-8666-666666666666";
 const requestId = "22222222-2222-4222-8222-222222222222";
 const secondRequestId = "44444444-4444-4444-8444-444444444444";
 const messageId = "33333333-3333-4333-8333-333333333333";
@@ -60,6 +61,35 @@ const generatedTurn = {
   },
 };
 
+/**
+ * Unique deterministic Start identity per call, so every test Start is a
+ * distinct logical action (idempotency is asserted explicitly where it
+ * matters). Matches `RequestIdentifierSchema`'s UUID shape.
+ */
+let startRequestSequence = 0;
+function testCreationRequestId(): string {
+  startRequestSequence += 1;
+  return `aaaaaaaa-aaaa-4aaa-8aaa-${String(startRequestSequence).padStart(12, "0")}`;
+}
+
+/**
+ * Test Starts predate the required `creationRequestId`; inject a unique one
+ * whenever a body carries a Topic but no identity, leaving malformed bodies
+ * untouched so validation tests keep their intent.
+ */
+function withDefaultCreationRequestId(body: unknown): unknown {
+  if (
+    typeof body === "object" &&
+    body !== null &&
+    !Array.isArray(body) &&
+    "topic" in body &&
+    !("creationRequestId" in body)
+  ) {
+    return { ...(body as Record<string, unknown>), creationRequestId: testCreationRequestId() };
+  }
+  return body;
+}
+
 function jsonRequest(
   body: unknown,
   cookie?: string,
@@ -74,7 +104,7 @@ function jsonRequest(
       ...(cookie ? { Cookie: cookie } : {}),
       ...extraHeaders,
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(withDefaultCreationRequestId(body)),
     signal,
   });
 }
@@ -218,6 +248,149 @@ describe("Discussion HTTP interface", () => {
       transcript: [],
     });
     expect(idCalls).toBe(1);
+  });
+
+  describe("idempotent Start", () => {
+    const creationRequestId = "77777777-7777-4777-8777-777777777777";
+    const otherCreationRequestId = "88888888-8888-4888-8888-888888888888";
+
+    it("replays the same Discussion for an exact Start retry with the same creation request identity", async () => {
+      const first = await handlers.post(
+        jsonRequest({ topic: "A permitted Topic", creationRequestId }),
+      );
+      expect(first.status).toBe(201);
+      const firstPayload = DiscussionResponseSchema.parse(
+        await first.json(),
+      );
+      expect(idCalls).toBe(1);
+
+      // The exact retry — same identity, same Topic, same session — replays
+      // the original Discussion instead of creating an orphan.
+      const retry = await handlers.post(
+        jsonRequest(
+          { topic: "A permitted Topic", creationRequestId },
+          cookiePair(first),
+        ),
+      );
+      expect(retry.status).toBe(201);
+      expect(DiscussionResponseSchema.parse(await retry.json())).toEqual(
+        firstPayload,
+      );
+      // A fresh id is minted before the store check but discarded on the
+      // replay path: the second Discussion identifier is the stored one.
+      expect(idCalls).toBe(2);
+    });
+
+    it("rejects a reused creation request identity with a different Topic as a conflict", async () => {
+      const created = await handlers.post(
+        jsonRequest({ topic: "A permitted Topic", creationRequestId }),
+      );
+      expect(created.status).toBe(201);
+
+      const conflict = await handlers.post(
+        jsonRequest(
+          { topic: "A different permitted Topic", creationRequestId },
+          cookiePair(created),
+        ),
+      );
+      expect(conflict.status).toBe(409);
+      const payload = ErrorResponseSchema.parse(await conflict.json());
+      expect(payload.error.code).toBe("START_REQUEST_CONFLICT");
+      expect(payload.error.message).toContain("already used");
+      expect(payload.error.action.length).toBeGreaterThan(10);
+      // The conflict surfaces after the store replays the original mapping
+      // (with a freshly minted, discarded id) — never a second Discussion.
+      expect(idCalls).toBe(2);
+    });
+
+    it("creates separate Discussions for distinct creation request identities in one session", async () => {
+      configureService(undefined, () => {
+        idCalls += 1;
+        return idCalls === 1 ? discussionId : secondDiscussionId;
+      });
+      useFake([{ type: "success", result: generatedTurn }]);
+      const first = await handlers.post(
+        jsonRequest({ topic: "A permitted Topic", creationRequestId }),
+      );
+      const second = await handlers.post(
+        jsonRequest(
+          {
+            topic: "A second permitted Topic",
+            creationRequestId: otherCreationRequestId,
+          },
+          cookiePair(first),
+        ),
+      );
+      expect(first.status).toBe(201);
+      expect(second.status).toBe(201);
+      const firstPayload = DiscussionResponseSchema.parse(await first.json());
+      const secondPayload = DiscussionResponseSchema.parse(await second.json());
+      expect(firstPayload.id).not.toBe(secondPayload.id);
+      expect(firstPayload.topic).toBe("A permitted Topic");
+      expect(secondPayload.topic).toBe("A second permitted Topic");
+    });
+
+    it("never replays another session's Discussion for a reused creation request identity", async () => {
+      configureService(undefined, () => {
+        idCalls += 1;
+        return idCalls === 1 ? discussionId : secondDiscussionId;
+      });
+      useFake([{ type: "success", result: generatedTurn }]);
+      const first = await handlers.post(
+        jsonRequest({ topic: "A permitted Topic", creationRequestId }),
+      );
+      const ownerCookie = cookiePair(first);
+
+      // A different session reusing the same identity is a new logical
+      // Start: idempotency is scoped to the owner session.
+      const second = await handlers.post(
+        jsonRequest({ topic: "A second permitted Topic", creationRequestId }),
+      );
+      expect(second.status).toBe(201);
+      const firstPayload = DiscussionResponseSchema.parse(await first.json());
+      const secondPayload = DiscussionResponseSchema.parse(await second.json());
+      expect(secondPayload.id).not.toBe(firstPayload.id);
+
+      // The first session still owns only its own Discussion, and the
+      // unrelated session cannot read it.
+      const owned = await handlers.get(
+        new Request(`http://localhost/api/discussions/${firstPayload.id}`, {
+          headers: { Cookie: ownerCookie },
+        }),
+        firstPayload.id,
+      );
+      expect(owned.status).toBe(200);
+      const denied = await handlers.get(
+        new Request(`http://localhost/api/discussions/${firstPayload.id}`),
+        firstPayload.id,
+      );
+      expect(denied.status).toBe(404);
+    });
+
+    it("rejects a Start without a creation request identity", async () => {
+      const raw = await handlers.post(
+        new Request("http://localhost/api/discussions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ topic: "A permitted Topic" }),
+        }),
+      );
+      expect(raw.status).toBe(400);
+      expect(
+        ErrorResponseSchema.parse(await raw.json()).error.code,
+      ).toBe("INVALID_REQUEST");
+    });
+
+    it("rejects a Start whose creation request identity is not a UUID", async () => {
+      const response = await handlers.post(
+        jsonRequest({ topic: "A permitted Topic", creationRequestId: "not-a-uuid" }),
+      );
+      expect(response.status).toBe(400);
+      const payload = ErrorResponseSchema.parse(await response.json());
+      expect(payload.error.code).toBe("INVALID_REQUEST");
+      expect(payload.error.message).toContain("UUID");
+      expect(idCalls).toBe(0);
+    });
   });
 
   it.each([
@@ -1482,7 +1655,10 @@ describe("Discussion HTTP interface", () => {
       new Request("http://localhost/api/discussions", {
         method: "POST",
         headers: { "Content-Type": "application/json; charset=utf-8" },
-        body: JSON.stringify({ topic: "A permitted Topic" }),
+        body: JSON.stringify({
+          topic: "A permitted Topic",
+          creationRequestId: testCreationRequestId(),
+        }),
       }),
     );
 
@@ -1747,7 +1923,9 @@ describe("Discussion HTTP interface", () => {
   });
 
   it("rejects oversized next-Turn and Stop traffic before generation", async () => {
-    useProtectedHandlers({ maxBodyBytes: 48 });
+    // Wide enough for a valid Start (Topic + creation request identity) but
+    // tight enough that padded Turn and Stop bodies are rejected by size.
+    useProtectedHandlers({ maxBodyBytes: 96 });
     const created = await handlers.post(
       jsonRequest({ topic: "A permitted Topic" }),
     );
@@ -1755,7 +1933,7 @@ describe("Discussion HTTP interface", () => {
 
     const oversizedTurn = await handlers.postTurn(
       jsonRequest(
-        { requestId },
+        { requestId, padding: "x".repeat(64) },
         ownerCookie,
         `http://localhost/api/discussions/${discussionId}`,
       ),
