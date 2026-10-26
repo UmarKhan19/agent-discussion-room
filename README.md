@@ -77,6 +77,32 @@ Live provider generation requires a real credential (`OPENCODE_API_KEY`);
 that is an opt-in manual verification, never part of the automated suite
 (see [docs/deployment.md](docs/deployment.md)).
 
+## State, retries, and operating limits
+
+In production, libSQL stores each Discussion's owner, validated state and
+messages, plus request identities used to replay Starts and Turns. Store
+mutations use write transactions, and generation attempts carry leases. If a
+process disappears mid-generation, recovery waits until the lease expires
+(generation timeout plus 60 seconds), then makes that same Turn retryable;
+attempt-aware commits reject late results. See the
+[store implementation](src/discussion/libsql-discussion-store.ts) and its
+[recovery and concurrency tests](src/discussion/libsql-discussion-store.test.ts).
+
+Sessions are anonymous and cookie-owned. The browser cookie has a 30-day
+Max-Age, but the server verifies its signature without checking a signed
+expiry. There is no account recovery or built-in Discussion purge: losing the
+cookie loses access, and stored rows remain until an operator deletes them.
+Rate limits, generation quota, and concurrency limits are process-local, so
+they reset on restart and are not shared across instances. A local `file:`
+database is single-instance; multiple instances require a shared remote
+libSQL store and reasonably synchronized clocks. These limits mean the code
+does not establish production operation or global abuse controls. See
+[deployment requirements](docs/deployment.md) and
+[known limitations](docs/known-limitations.md).
+
+The generated debate and synthesis are not fact-checked. Policy and output
+limits do not establish factual accuracy.
+
 ## Documentation index
 
 | Document | Contents |
