@@ -100,8 +100,8 @@ patched `compression` release.
 
 There are no active exceptions. The former
 [`GHSA-866g-f22w-33x8`](https://github.com/advisories/GHSA-866g-f22w-33x8)
-entry was stale: the lockfile maps Mastra's `provider-utils-v5` alias to the
-npm package `@ai-sdk/provider-utils@3.0.30`. The advisory affects the v3
-package below `3.0.28`, so `3.0.30` is outside the affected range. The alias
-suffix identifies the provider protocol generation, not the package's major
-version. Do not override Mastra's alias.
+entry was stale against the earlier lockfile: Mastra's `provider-utils-v5`
+alias then resolved to npm package `@ai-sdk/provider-utils@3.0.30`. The
+advisory affects the v3 package below `3.0.28`, so `3.0.30` was outside the
+affected range. The alias suffix identifies the provider protocol generation,
+not the package's major version. Do not override Mastra's alias.

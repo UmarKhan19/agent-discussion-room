@@ -29,17 +29,9 @@ or a recorded exception has **passed its expiry**. Exceptions are strict
 records — never a blanket ignore — each stating package, advisory (GHSA
 id), impact, owner, mitigation, and expiry.
 
-### Current exception
-
-| Package | Advisory | Severity | Expires | Owner |
-| --- | --- | --- | --- | --- |
-| `@ai-sdk/provider-utils` | [GHSA-866g-f22w-33x8](https://github.com/advisories/GHSA-866g-f22w-33x8) | low | 2026-11-30 | Discussion Room maintainers |
-
-The impact analysis and the mitigation contract (upgrade `@mastra/core`
-as soon as it ships the patched alias, then delete the exception; do not
-override the alias; re-run `bun run audit` after every upgrade) are
-recorded in [docs/verification.md](docs/verification.md) — treat that file
-as the source of truth when re-reviewing before the expiry.
+For current dependency audit findings and active exceptions, see the
+[dependency audit gate and exception records](verification.md#dependency-audit-gate)
+in the verification guide.
 
 ## Provider integration testing
 
