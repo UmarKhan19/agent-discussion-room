@@ -13,6 +13,30 @@ policy, budgets, and state transitions are never trusted to the browser.
 See [docs/architecture.md](docs/architecture.md) for the domain vocabulary
 and system design.
 
+## Lifecycle and operating boundaries
+
+- Each Discussion belongs to an anonymous signed browser session. There are
+  no accounts or recovery flow; losing the session cookie loses access. The
+  cookie expires in the browser after 30 days, but its signed token has no
+  server-checked expiry, so cookie expiry is not a revocation boundary.
+- Production Discussions and request identities live in libSQL. Start and
+  Turn requests are idempotent; write transactions serialize claims and
+  commits. Retryable failures reuse a Turn, while expired generation leases
+  make abandoned attempts recoverable. Recovery waits for the lease to
+  expire (generation timeout plus 60 seconds), and a stale attempt cannot
+  commit afterward.
+- A local `file:` database supports one application instance. Multiple
+  instances can share a remote libSQL database, but rate limits, quotas, and
+  generation-capacity limits remain per-process; lease recovery also assumes
+  reasonably synchronized clocks.
+- Discussion data stays in the database until an operator deletes it. There
+  is no built-in retention purge, and backups and deletion are operator-owned.
+  Generated arguments and synthesis pass policy checks, not factual
+  verification.
+
+See [docs/operations.md](docs/operations.md) and
+[docs/known-limitations.md](docs/known-limitations.md) for operational detail.
+
 ## Requirements
 
 | Requirement | Version | Notes |
