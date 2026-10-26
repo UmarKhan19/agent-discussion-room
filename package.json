@@ -61,5 +61,8 @@
   "trustedDependencies": [
     "sharp",
     "unrs-resolver"
-  ]
+  ],
+  "overrides": {
+    "compression": "1.8.2"
+  }
 }

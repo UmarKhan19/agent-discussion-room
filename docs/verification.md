@@ -87,6 +87,15 @@ Exceptions are strict records, never a blanket ignore. Each entry states:
 | `mitigation` | the concrete upgrade/action that removes the exception |
 | `expires` | `YYYY-MM-DD`; the gate fails after this day |
 
+`package.json` pins the transitive `compression` dependency to patched
+`1.8.2` for the advisory
+[`GHSA-vc2v-76pw-4v95`](https://github.com/advisories/GHSA-vc2v-76pw-4v95).
+`serve@14.2.6` requires exact `1.8.1` and has no patched parent release;
+the upstream patch preserves the middleware API, and local HTTP checks
+confirmed gzip, identity, and HEAD behavior. This is a real dependency
+upgrade, not an audit exception. Remove the override once `serve` uses a
+patched `compression` release.
+
 ### Current exceptions
 
 There are no active exceptions. The former
