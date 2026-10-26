@@ -32,10 +32,10 @@
     "@mastra/loggers": "^1.2.0",
     "@mastra/observability": "^1.16.5",
     "mastra": "^1.23.0",
-    "next": "16.3.0",
+    "next": "16.4.3",
     "react": "19.2.4",
     "react-dom": "19.2.4",
-    "zod": "^4.4.3"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@ai-hero/sandcastle": "0.12.0",
@@ -48,11 +48,11 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "eslint": "^9.39.5",
-    "eslint-config-next": "16.3.0",
+    "eslint-config-next": "16.4.3",
     "jsdom": "^30.0.1",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.12"
   },
   "ignoreScripts": [
     "sharp",

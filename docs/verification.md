@@ -87,17 +87,12 @@ Exceptions are strict records, never a blanket ignore. Each entry states:
 | `mitigation` | the concrete upgrade/action that removes the exception |
 | `expires` | `YYYY-MM-DD`; the gate fails after this day |
 
-### Current exception
+### Current exceptions
 
-| Package | Advisory | Severity | Expires | Owner |
-| --- | --- | --- | --- | --- |
-| `@ai-sdk/provider-utils` | [GHSA-866g-f22w-33x8](https://github.com/advisories/GHSA-866g-f22w-33x8) | low | 2026-11-30 | Discussion Room maintainers |
-
-`@mastra/core` pins the affected `@ai-sdk/provider-utils@3.0.30` alias
-exactly for the provider 2.0.3 protocol; the advisory (uncontrolled resource
-consumption, CWE-400) has no identified exposure here because every request
-is validated and bounded by the Discussion Room's own contracts, rate
-limits, and budgets before it reaches the agent runtime. The mitigation is
-to upgrade `@mastra/core` as soon as it ships the patched alias, then delete
-the exception. Do not override the alias: Mastra pins it to the exact
-provider protocol version.
+There are no active exceptions. The former
+[`GHSA-866g-f22w-33x8`](https://github.com/advisories/GHSA-866g-f22w-33x8)
+entry was stale: the lockfile maps Mastra's `provider-utils-v5` alias to the
+npm package `@ai-sdk/provider-utils@3.0.30`. The advisory affects the v3
+package below `3.0.28`, so `3.0.30` is outside the affected range. The alias
+suffix identifies the provider protocol generation, not the package's major
+version. Do not override Mastra's alias.

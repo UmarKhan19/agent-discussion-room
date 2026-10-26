@@ -1,10 +1,1 @@
-[
-  {
-    "package": "@ai-sdk/provider-utils",
-    "advisory": "GHSA-866g-f22w-33x8",
-    "impact": "Uncontrolled resource consumption (CWE-400, CVSS 4.3, low) in @ai-sdk/provider-utils <=3.0.97. The affected copy is the @ai-sdk/provider-utils@3.0.30 alias pinned exactly by @mastra/core for the provider 2.0.3 protocol; it is a formatting/telemetry helper in the Mastra agent runtime, not a network parser. Every request reaching it is already bounded and validated by the Discussion Room's own Zod contracts, payload limits, rate limits, and generation budgets, so no attacker-controlled input reaches this helper unchecked. No participant- or operator-facing impact identified.",
-    "owner": "Discussion Room maintainers",
-    "mitigation": "Upgrade @mastra/core as soon as it ships @ai-sdk/provider-utils > 3.0.97 for its v5 alias, then delete this exception. Do not override the alias: Mastra pins it to the exact provider protocol version. Re-run bun run audit after every @mastra/core upgrade.",
-    "expires": "2026-11-30"
-  }
-]
+[]
