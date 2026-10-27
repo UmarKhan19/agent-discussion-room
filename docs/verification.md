@@ -87,17 +87,21 @@ Exceptions are strict records, never a blanket ignore. Each entry states:
 | `mitigation` | the concrete upgrade/action that removes the exception |
 | `expires` | `YYYY-MM-DD`; the gate fails after this day |
 
-### Current exception
+`package.json` pins the transitive `compression` dependency to patched
+`1.8.2` for the advisory
+[`GHSA-vc2v-76pw-4v95`](https://github.com/advisories/GHSA-vc2v-76pw-4v95).
+`serve@14.2.6` requires exact `1.8.1` and has no patched parent release;
+the upstream patch preserves the middleware API, and local HTTP checks
+confirmed gzip, identity, and HEAD behavior. This is a real dependency
+upgrade, not an audit exception. Remove the override once `serve` uses a
+patched `compression` release.
 
-| Package | Advisory | Severity | Expires | Owner |
-| --- | --- | --- | --- | --- |
-| `@ai-sdk/provider-utils` | [GHSA-866g-f22w-33x8](https://github.com/advisories/GHSA-866g-f22w-33x8) | low | 2026-11-30 | Discussion Room maintainers |
+### Current exceptions
 
-`@mastra/core` pins the affected `@ai-sdk/provider-utils@3.0.30` alias
-exactly for the provider 2.0.3 protocol; the advisory (uncontrolled resource
-consumption, CWE-400) has no identified exposure here because every request
-is validated and bounded by the Discussion Room's own contracts, rate
-limits, and budgets before it reaches the agent runtime. The mitigation is
-to upgrade `@mastra/core` as soon as it ships the patched alias, then delete
-the exception. Do not override the alias: Mastra pins it to the exact
-provider protocol version.
+There are no active exceptions. The former
+[`GHSA-866g-f22w-33x8`](https://github.com/advisories/GHSA-866g-f22w-33x8)
+entry was stale against the earlier lockfile: Mastra's `provider-utils-v5`
+alias then resolved to npm package `@ai-sdk/provider-utils@3.0.30`. The
+advisory affects the v3 package below `3.0.28`, so `3.0.30` was outside the
+affected range. The alias suffix identifies the provider protocol generation,
+not the package's major version. Do not override Mastra's alias.
